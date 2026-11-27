@@ -79,12 +79,13 @@ func NewServer(psk, tunnelPath string, allowPrivate, enableAdblock bool, decoyUR
 		}
 	}
 
+	dnsCache := adns.NewCache(60 * time.Second)
 	s := &Server{
 		psk:        []byte(psk),
 		path:       tunnelPath,
 		h2Path:     strings.TrimSuffix(tunnelPath, "/") + "/h2",
-		guard:      &netguard.Guard{AllowPrivate: allowPrivate},
-		dnsCache:   adns.NewCache(60 * time.Second),
+		guard:      &netguard.Guard{AllowPrivate: allowPrivate, LookupFn: dnsCache.LookupIP},
+		dnsCache:   dnsCache,
 		blocker:    adblock.New(enableAdblock),
 		decoyProxy: proxy,
 		upgrader: websocket.Upgrader{

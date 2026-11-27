@@ -20,9 +20,9 @@ import (
 const (
 	StreamChunkSize       = 32 * 1024
 	DefaultMaxPad         = 24
-	InitialStreamWindow   = 1 << 20   // 1 MB per-stream flow control window
-	WindowUpdateThreshold = 256 << 10 // Send WINDOW_UPDATE every 256 KB drained
-	MaxStreamBuffer       = 2 << 20   // 2 MB hard cap per stream ring buffer
+	InitialStreamWindow   = 4 << 20   // 4 MB per-stream flow control window (uncaps high-BDP 100+ Mbps)
+	WindowUpdateThreshold = 512 << 10 // Send WINDOW_UPDATE every 512 KB drained
+	MaxStreamBuffer       = 6 << 20   // 6 MB hard cap per stream ring buffer
 )
 
 var (
@@ -651,11 +651,15 @@ func (st *Stream) Write(p []byte) (int, error) {
 		st.sendWindow -= int64(len(chunk))
 		st.winMu.Unlock()
 
+		pad := st.sess.MaxPad
+		if len(chunk) >= 1024 {
+			pad = 0 // Skip crypto/rand padding on bulk data chunks for max throughput & low phone CPU
+		}
 		err := st.sess.sendFrame(&proto.Frame{
 			Type:     proto.FrameStreamData,
 			StreamID: st.ID,
 			Payload:  chunk,
-		}, st.sess.MaxPad)
+		}, pad)
 		if err != nil {
 			return total, err
 		}

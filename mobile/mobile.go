@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
 
+	"github.com/aether-vpn/aether/core/adblock"
 	"github.com/aether-vpn/aether/core/carrier"
 	"github.com/aether-vpn/aether/core/proto"
 	"github.com/aether-vpn/aether/core/session"
@@ -115,8 +116,8 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 	}
 	startCancel()
 
-	// Build tuned gVisor userspace TCP/IP stack (SACK enabled, 256 KB window, zero-lag)
-	linkEP := channel.New(1024, uint32(mtu), "")
+	// Build high-BDP tuned gVisor userspace TCP/IP stack (CUBIC + SACK + 2MB/4MB windows)
+	linkEP := channel.New(2048, uint32(mtu), "")
 	s := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
@@ -124,6 +125,14 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 
 	sack := tcpip.TCPSACKEnabled(true)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sack)
+	cc := tcpip.CongestionControlOption("cubic")
+	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &cc)
+	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 64 * 1024, Default: 1 << 20, Max: 4 << 20}
+	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcvBuf)
+	sndBuf := tcpip.TCPSendBufferSizeRangeOption{Min: 64 * 1024, Default: 1 << 20, Max: 4 << 20}
+	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sndBuf)
+
+	localBlocker := adblock.New(true)
 
 	if err := s.CreateNIC(nicID, linkEP); err != nil {
 		_ = mgr.Close()
@@ -136,8 +145,8 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 		{Destination: header.IPv6EmptySubnet, NIC: nicID},
 	})
 
-	// Forward all TCP connections using 0-RTT OpenStream + 256 KB gVisor receive window
-	tcpFwd := tcp.NewForwarder(s, 256*1024, 512, func(r *tcp.ForwarderRequest) {
+	// Forward all TCP connections using 0-RTT OpenStream + 2 MB gVisor receive window (uncaps 15 Mbps BDP ceiling!)
+	tcpFwd := tcp.NewForwarder(s, 2<<20, 1024, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
 		var wq waiter.Queue
 		ep, err := r.CreateEndpoint(&wq)
@@ -209,6 +218,15 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 				n, err := localUDP.Read(buf)
 				if err != nil {
 					return
+				}
+				// 0ms local on-phone DNS AdBlock: answer NXDOMAIN locally without round-trip to Singapore!
+				if dstPort == 53 {
+					if qname, ok := adblock.ExtractDNSQueryName(buf[:n]); ok && localBlocker.IsBlocked(qname) {
+						if nx := adblock.BuildNXDomain(buf[:n]); nx != nil {
+							_, _ = localUDP.Write(nx)
+						}
+						continue
+					}
 				}
 				_ = mgr.SendUDP(flowID, dstHost, dstPort, buf[:n])
 			}

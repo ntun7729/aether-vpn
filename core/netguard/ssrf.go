@@ -16,6 +16,7 @@ var ErrBlockedAddress = errors.New("aether/netguard: destination address is bloc
 type Guard struct {
 	AllowPrivate bool
 	Resolver     *net.Resolver
+	LookupFn     func(ctx context.Context, host string) ([]net.IP, error)
 }
 
 // IsBlockedIP returns true if the IP is loopback, private, link-local, multicast, or unspecified.
@@ -54,26 +55,39 @@ func (g *Guard) ResolveAndValidate(ctx context.Context, host string) (net.IP, er
 		return ip, nil
 	}
 
-	resolver := g.Resolver
-	if resolver == nil {
-		resolver = net.DefaultResolver
+	var rawIPs []net.IP
+	if g.LookupFn != nil {
+		var err error
+		rawIPs, err = g.LookupFn(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		resolver := g.Resolver
+		if resolver == nil {
+			resolver = net.DefaultResolver
+		}
+		ips, err := resolver.LookupIPAddr(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		rawIPs = make([]net.IP, 0, len(ips))
+		for _, ipa := range ips {
+			rawIPs = append(rawIPs, ipa.IP)
+		}
 	}
-	ips, err := resolver.LookupIPAddr(ctx, host)
-	if err != nil {
-		return nil, err
-	}
-	if len(ips) == 0 {
+	if len(rawIPs) == 0 {
 		return nil, fmt.Errorf("no IP addresses found for %s", host)
 	}
 
 	// Prefer IPv4 first, validate every returned IP against SSRF.
 	var chosen net.IP
-	for _, ipa := range ips {
-		if !g.AllowPrivate && IsBlockedIP(ipa.IP) {
-			return nil, fmt.Errorf("%w: %s -> %s", ErrBlockedAddress, host, ipa.IP.String())
+	for _, ip := range rawIPs {
+		if !g.AllowPrivate && IsBlockedIP(ip) {
+			return nil, fmt.Errorf("%w: %s -> %s", ErrBlockedAddress, host, ip.String())
 		}
-		if chosen == nil || (chosen.To4() == nil && ipa.IP.To4() != nil) {
-			chosen = ipa.IP
+		if chosen == nil || (chosen.To4() == nil && ip.To4() != nil) {
+			chosen = ip
 		}
 	}
 	return chosen, nil

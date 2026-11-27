@@ -58,7 +58,9 @@ class AetherVpnService : VpnService() {
                 .setSession("AetherVPN")
                 .setMtu(MTU)
                 .addAddress("10.88.0.2", 30)
+                .addAddress("fd00:ae7e::2", 126)
                 .addRoute("0.0.0.0", 0)
+                .addRoute("::", 0)
                 .addDnsServer("1.1.1.1")
                 .addDnsServer("8.8.8.8")
                 .addDisallowedApplication(packageName)
@@ -69,6 +71,8 @@ class AetherVpnService : VpnService() {
                     builder.excludeRoute(IpPrefix(InetAddress.getByName("10.0.0.0"), 8))
                     builder.excludeRoute(IpPrefix(InetAddress.getByName("172.16.0.0"), 12))
                     builder.excludeRoute(IpPrefix(InetAddress.getByName("192.168.0.0"), 16))
+                    builder.excludeRoute(IpPrefix(InetAddress.getByName("fc00::"), 7))
+                    builder.excludeRoute(IpPrefix(InetAddress.getByName("fe80::"), 10))
                 } catch (_: Exception) {
                 }
             }
