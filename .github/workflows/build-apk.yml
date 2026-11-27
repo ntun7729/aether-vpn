@@ -42,6 +42,8 @@ jobs:
           export PATH="$HOME/go/bin:$PATH"
           mkdir -p android/app/libs
           cd mobile
+          go get gvisor.dev/gvisor@go
+          go get golang.org/x/mobile/bind@latest
           go mod tidy
           gomobile bind -v -androidapi 26 -target=android/arm64,android/arm -o ../android/app/libs/aether.aar .
 
