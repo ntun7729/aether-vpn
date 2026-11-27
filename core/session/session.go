@@ -18,12 +18,20 @@ import (
 )
 
 const (
-	StreamChunkSize       = 32 * 1024
+	StreamChunkSize       = 60 * 1024 // 60 KB bulk chunks (cuts syscalls & AEAD calls in half!)
 	DefaultMaxPad         = 24
 	InitialStreamWindow   = 4 << 20   // 4 MB per-stream flow control window (uncaps high-BDP 100+ Mbps)
 	WindowUpdateThreshold = 512 << 10 // Send WINDOW_UPDATE every 512 KB drained
 	MaxStreamBuffer       = 6 << 20   // 6 MB hard cap per stream ring buffer
 )
+
+// CopyBufPool provides reusable 64 KB buffers for io.CopyBuffer across server & mobile.
+var CopyBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 64*1024)
+		return &b
+	},
+}
 
 var (
 	ErrSessionClosed = errors.New("aether/session: session closed")
@@ -261,7 +269,7 @@ func (s *Session) removeCarrier(c carrier.Conn) {
 	_ = c.Close()
 }
 
-// pickCarrierForStream pins a stream to one carrier (zero cross-stream HoL blocking!).
+// pickCarrierForStream pins a stream to one healthy carrier (skipping degraded carriers).
 func (s *Session) pickCarrierForStream(streamID uint32) carrier.Conn {
 	s.carrierMu.RLock()
 	defer s.carrierMu.RUnlock()
@@ -269,11 +277,18 @@ func (s *Session) pickCarrierForStream(streamID uint32) carrier.Conn {
 	if n == 0 {
 		return nil
 	}
+	start := uint64(streamID) % uint64(n)
 	if streamID == 0 {
-		idx := s.udpIdx.Add(1) % uint64(n)
-		return s.carriers[idx]
+		start = s.udpIdx.Add(1) % uint64(n)
 	}
-	return s.carriers[uint64(streamID)%uint64(n)]
+	// Prefer a non-degraded carrier starting from the stream's pinned slot
+	for offset := 0; offset < n; offset++ {
+		c := s.carriers[(start+uint64(offset))%uint64(n)]
+		if !c.Degraded() {
+			return c
+		}
+	}
+	return s.carriers[start]
 }
 
 func (s *Session) sendFrame(f *proto.Frame, pad int) error {
@@ -285,6 +300,13 @@ func (s *Session) sendFrame(f *proto.Frame, pad int) error {
 		return err
 	}
 	wire := s.Cipher.Seal(raw)
+	// Only non-stream-ordered frames (Ping/Pong/WindowUpdate/UDP/Rst) use the high-priority lane
+	// so StreamOpen -> StreamData -> StreamFin ALWAYS preserve strict FIFO order!
+	highPriority := f.Type == proto.FramePing ||
+		f.Type == proto.FramePong ||
+		f.Type == proto.FrameWindowUpdate ||
+		f.Type == proto.FrameUDPPacket ||
+		f.Type == proto.FrameStreamRst
 
 	for attempt := 0; attempt < 3; attempt++ {
 		c := s.pickCarrierForStream(f.StreamID)
@@ -298,7 +320,7 @@ func (s *Session) sendFrame(f *proto.Frame, pad int) error {
 				return ErrSessionClosed
 			}
 		}
-		if err := c.WritePacket(wire); err != nil {
+		if err := c.WritePacketPriority(wire, highPriority); err != nil {
 			s.removeCarrier(c)
 			continue
 		}

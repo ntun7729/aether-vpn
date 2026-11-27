@@ -2,7 +2,10 @@ package dns
 
 import (
 	"context"
+	"encoding/binary"
+	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -55,7 +58,6 @@ func (c *Cache) LookupIP(ctx context.Context, host string) ([]net.IP, error) {
 
 	c.mu.Lock()
 	if len(c.entries) > 4096 {
-		// Simple bounded eviction
 		for k, v := range c.entries {
 			if now.After(v.expiresAt) {
 				delete(c.entries, k)
@@ -66,4 +68,101 @@ func (c *Cache) LookupIP(ctx context.Context, host string) ([]net.IP, error) {
 	c.mu.Unlock()
 
 	return ips, nil
+}
+
+type udpDNSEntry struct {
+	raw       []byte
+	expiresAt time.Time
+}
+
+// UDPCache caches raw UDP DNS wire responses (including AdGuard's blocked responses)
+// so repeat queries return in <0.1ms with rewritten 2-byte Transaction IDs.
+type UDPCache struct {
+	mu      sync.RWMutex
+	entries map[string]udpDNSEntry
+	ttl     time.Duration
+}
+
+func NewUDPCache(ttl time.Duration) *UDPCache {
+	if ttl <= 0 {
+		ttl = 60 * time.Second
+	}
+	return &UDPCache{
+		entries: make(map[string]udpDNSEntry),
+		ttl:     ttl,
+	}
+}
+
+// QueryKey extracts "qname|qtype" from a standard UDP DNS query packet.
+func QueryKey(pkt []byte) (string, bool) {
+	if len(pkt) < 17 {
+		return "", false
+	}
+	// QR must be 0 (query) and QDCOUNT == 1
+	if pkt[2]&0x80 != 0 || binary.BigEndian.Uint16(pkt[4:6]) != 1 {
+		return "", false
+	}
+	pos := 12
+	var parts []string
+	for pos < len(pkt) {
+		l := int(pkt[pos])
+		if l == 0 {
+			pos++
+			break
+		}
+		if l&0xc0 != 0 || pos+1+l >= len(pkt) {
+			return "", false
+		}
+		parts = append(parts, strings.ToLower(string(pkt[pos+1:pos+1+l])))
+		pos += 1 + l
+	}
+	if len(parts) == 0 || pos+4 > len(pkt) {
+		return "", false
+	}
+	qtype := binary.BigEndian.Uint16(pkt[pos : pos+2])
+	return fmt.Sprintf("%s|%d", strings.Join(parts, "."), qtype), true
+}
+
+// Get returns a cached DNS response with its Transaction ID rewritten to match query.
+func (u *UDPCache) Get(query []byte) ([]byte, bool) {
+	key, ok := QueryKey(query)
+	if !ok {
+		return nil, false
+	}
+	now := time.Now()
+	u.mu.RLock()
+	ent, found := u.entries[key]
+	u.mu.RUnlock()
+	if !found || now.After(ent.expiresAt) {
+		return nil, false
+	}
+	out := make([]byte, len(ent.raw))
+	copy(out, ent.raw)
+	out[0] = query[0]
+	out[1] = query[1]
+	return out, true
+}
+
+// Put stores a raw DNS wire response under the query's key.
+func (u *UDPCache) Put(query, resp []byte) {
+	if len(resp) < 12 {
+		return
+	}
+	key, ok := QueryKey(query)
+	if !ok {
+		return
+	}
+	buf := make([]byte, len(resp))
+	copy(buf, resp)
+	now := time.Now()
+	u.mu.Lock()
+	if len(u.entries) > 4096 {
+		for k, v := range u.entries {
+			if now.After(v.expiresAt) {
+				delete(u.entries, k)
+			}
+		}
+	}
+	u.entries[key] = udpDNSEntry{raw: buf, expiresAt: now.Add(u.ttl)}
+	u.mu.Unlock()
 }

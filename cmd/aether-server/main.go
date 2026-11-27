@@ -31,13 +31,18 @@ import (
 	"github.com/aether-vpn/aether/core/session"
 )
 
-const decoyHTML = `<!doctype html>
+const (
+	decoyHTML = `<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><title>Edge Sync Service</title>
 <style>body{font-family:system-ui,sans-serif;max-width:600px;margin:80px auto;color:#222;line-height:1.6}code{background:#f3f4f6;padding:2px 6px;border-radius:4px}</style>
 </head>
 <body><h1>Edge Sync API</h1><p>Status: <code>operational</code></p><p>Realtime telemetry ingestion node.</p></body>
 </html>`
+
+	serverUDPIdleTTL = 65 * time.Second
+	maxServerUDP     = 256
+)
 
 type serverSession struct {
 	sess       *session.Session
@@ -53,20 +58,24 @@ type udpRelay struct {
 }
 
 type Server struct {
-	psk        []byte
-	path       string
-	h2Path     string
-	guard      *netguard.Guard
-	dnsCache   *adns.Cache
-	blocker    *adblock.Blocker
-	decoyProxy *httputil.ReverseProxy
-	upgrader   websocket.Upgrader
+	psk         []byte
+	path        string
+	h2Path      string
+	guard       *netguard.Guard
+	dnsCache    *adns.Cache
+	udpDNSCache *adns.UDPCache
+	upstreamDNS []string
+	blockDoT    bool
+	adblockSNI  bool
+	blocker     *adblock.Blocker
+	decoyProxy  *httputil.ReverseProxy
+	upgrader    websocket.Upgrader
 
 	mu       sync.Mutex
 	sessions map[[16]byte]*serverSession
 }
 
-func NewServer(psk, tunnelPath string, allowPrivate, enableAdblock bool, decoyURL string) *Server {
+func NewServer(psk, tunnelPath string, allowPrivate, adblockSNI, blockDoT bool, upstreamDNS []string, decoyURL string) *Server {
 	var proxy *httputil.ReverseProxy
 	if decoyURL != "" {
 		if u, err := url.Parse(decoyURL); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
@@ -81,13 +90,17 @@ func NewServer(psk, tunnelPath string, allowPrivate, enableAdblock bool, decoyUR
 
 	dnsCache := adns.NewCache(60 * time.Second)
 	s := &Server{
-		psk:        []byte(psk),
-		path:       tunnelPath,
-		h2Path:     strings.TrimSuffix(tunnelPath, "/") + "/h2",
-		guard:      &netguard.Guard{AllowPrivate: allowPrivate, LookupFn: dnsCache.LookupIP},
-		dnsCache:   dnsCache,
-		blocker:    adblock.New(enableAdblock),
-		decoyProxy: proxy,
+		psk:         []byte(psk),
+		path:        tunnelPath,
+		h2Path:      strings.TrimSuffix(tunnelPath, "/") + "/h2",
+		guard:       &netguard.Guard{AllowPrivate: allowPrivate, LookupFn: dnsCache.LookupIP},
+		dnsCache:    dnsCache,
+		udpDNSCache: adns.NewUDPCache(60 * time.Second),
+		upstreamDNS: upstreamDNS,
+		blockDoT:    blockDoT,
+		adblockSNI:  adblockSNI,
+		blocker:     adblock.New(adblockSNI),
+		decoyProxy:  proxy,
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:    64 * 1024,
 			WriteBufferSize:   64 * 1024,
@@ -134,7 +147,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Active-probe resistance: serve live decoy reverse proxy or static HTML
 	if s.decoyProxy != nil {
 		s.decoyProxy.ServeHTTP(w, r)
 		return
@@ -243,22 +255,26 @@ func (s *Server) serveCarrier(c carrier.Conn) {
 }
 
 func (s *Server) handleTCPStream(ctx context.Context, ss *serverSession, st *session.Stream, addr proto.Address) error {
-	if s.blocker.IsBlocked(addr.Host) {
-		return errors.New("blocked by adblock")
+	// Block DoT (port 853) so Android Private DNS cleanly uses AdGuard DNS over port 53
+	if s.blockDoT && addr.Port == 853 {
+		return errors.New("dot blocked")
 	}
 
-	// For Android TUN (which connects by raw IP on port 443), peek TLS ClientHello SNI
-	// before dialing outbound so ad/tracker domains are blocked with 0ms outbound traffic!
 	var firstChunk []byte
-	if s.blocker.Enabled() && addr.Port == 443 && net.ParseIP(addr.Host) != nil {
-		peekBuf := make([]byte, 2048)
-		n, err := st.Read(peekBuf)
-		if err != nil {
-			return err
+	if s.adblockSNI {
+		if s.blocker.IsBlocked(addr.Host) {
+			return errors.New("blocked by adblock")
 		}
-		firstChunk = peekBuf[:n]
-		if sni, ok := adblock.ExtractTLSSNI(firstChunk); ok && s.blocker.IsBlocked(sni) {
-			return errors.New("blocked by sni adblock")
+		if addr.Port == 443 && net.ParseIP(addr.Host) != nil {
+			peekBuf := make([]byte, 2048)
+			n, err := st.Read(peekBuf)
+			if err != nil {
+				return err
+			}
+			firstChunk = peekBuf[:n]
+			if sni, ok := adblock.ExtractTLSSNI(firstChunk); ok && s.blocker.IsBlocked(sni) {
+				return errors.New("blocked by sni adblock")
+			}
 		}
 	}
 
@@ -283,7 +299,9 @@ func (s *Server) handleTCPStream(ctx context.Context, ss *serverSession, st *ses
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(remote, st)
+		bufPtr := session.CopyBufPool.Get().(*[]byte)
+		defer session.CopyBufPool.Put(bufPtr)
+		_, _ = io.CopyBuffer(remote, st, *bufPtr)
 		if tc, ok := remote.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()
 		}
@@ -291,7 +309,9 @@ func (s *Server) handleTCPStream(ctx context.Context, ss *serverSession, st *ses
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(st, remote)
+		bufPtr := session.CopyBufPool.Get().(*[]byte)
+		defer session.CopyBufPool.Put(bufPtr)
+		_, _ = io.CopyBuffer(st, remote, *bufPtr)
 		_ = st.CloseWrite()
 	}()
 
@@ -301,15 +321,46 @@ func (s *Server) handleTCPStream(ctx context.Context, ss *serverSession, st *ses
 	return nil
 }
 
-func (s *Server) handleUDPPacket(ss *serverSession, flowID uint32, addr proto.Address, payload []byte) {
-	// Fast DNS ad/tracker blocking on UDP port 53 (returns NXDOMAIN immediately, 0ms latency!)
-	if addr.Port == 53 {
-		if qname, ok := adblock.ExtractDNSQueryName(payload); ok && s.blocker.IsBlocked(qname) {
-			if nx := adblock.BuildNXDomain(payload); nx != nil {
-				_ = ss.sess.SendUDP(flowID, addr.Host, addr.Port, nx)
-			}
-			return
+// resolveUDP53 serves cached DNS responses in <0.1ms and forwards misses to AdGuard DNS (94.140.14.14).
+func (s *Server) resolveUDP53(ss *serverSession, flowID uint32, origAddr proto.Address, query []byte) {
+	if cached, ok := s.udpDNSCache.Get(query); ok {
+		_ = ss.sess.SendUDP(flowID, origAddr.Host, origAddr.Port, cached)
+		return
+	}
+
+	for _, upstream := range s.upstreamDNS {
+		conn, err := net.DialTimeout("udp", upstream, 2*time.Second)
+		if err != nil {
+			continue
 		}
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+		if _, err := conn.Write(query); err != nil {
+			_ = conn.Close()
+			continue
+		}
+		resp := make([]byte, 4096)
+		n, err := conn.Read(resp)
+		_ = conn.Close()
+		if err != nil || n < 12 {
+			continue
+		}
+		s.udpDNSCache.Put(query, resp[:n])
+		_ = ss.sess.SendUDP(flowID, origAddr.Host, origAddr.Port, resp[:n])
+		return
+	}
+}
+
+func (s *Server) handleUDPPacket(ss *serverSession, flowID uint32, addr proto.Address, payload []byte) {
+	// Block DoQ (UDP 853) so Android uses AdGuard DNS cleanly
+	if s.blockDoT && addr.Port == 853 {
+		return
+	}
+
+	// Route all UDP port 53 DNS through AdGuard DNS + 60s response cache!
+	if addr.Port == 53 && len(s.upstreamDNS) > 0 {
+		qCopy := append([]byte(nil), payload...)
+		go s.resolveUDP53(ss, flowID, addr, qCopy)
+		return
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -322,7 +373,7 @@ func (s *Server) handleUDPPacket(ss *serverSession, flowID uint32, addr proto.Ad
 	ss.udpMu.Lock()
 	relay, ok := ss.udpFlows[flowID]
 	if !ok {
-		if len(ss.udpFlows) > 256 {
+		if len(ss.udpFlows) >= maxServerUDP {
 			ss.udpMu.Unlock()
 			return
 		}
@@ -358,7 +409,7 @@ func (s *Server) udpReadLoop(ctx context.Context, ss *serverSession, flowID uint
 			return
 		default:
 		}
-		_ = relay.conn.SetReadDeadline(time.Now().Add(45 * time.Second))
+		_ = relay.conn.SetReadDeadline(time.Now().Add(serverUDPIdleTTL))
 		n, src, err := relay.conn.ReadFromUDP(buf)
 		if err != nil {
 			return
@@ -403,6 +454,28 @@ func (s *Server) gcLoop() {
 	}
 }
 
+func parseUpstreams(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		// AdGuard DNS primary + secondary (100k+ ad/tracker domains)
+		return []string{"94.140.14.14:53", "94.140.15.15:53"}
+	}
+	if strings.EqualFold(strings.TrimSpace(raw), "off") {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		p := strings.TrimSpace(part)
+		if p == "" {
+			continue
+		}
+		if !strings.Contains(p, ":") {
+			p += ":53"
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
 func main() {
 	psk := os.Getenv("AETHER_PSK")
 	if psk == "" {
@@ -420,13 +493,15 @@ func main() {
 		tunnelPath = "/" + tunnelPath
 	}
 	allowPrivate, _ := strconv.ParseBool(os.Getenv("ALLOW_PRIVATE"))
-	enableAdblock := true
-	if v := os.Getenv("ADBLOCK"); v != "" {
-		enableAdblock, _ = strconv.ParseBool(v)
+	adblockSNI, _ := strconv.ParseBool(os.Getenv("ADBLOCK_SNI")) // Default false: AdGuard DNS handles blocking with 0 TCP hop
+	blockDoT := true
+	if v := os.Getenv("BLOCK_DOT"); v != "" {
+		blockDoT, _ = strconv.ParseBool(v)
 	}
+	upstreamDNS := parseUpstreams(os.Getenv("UPSTREAM_DNS"))
 	decoyURL := os.Getenv("DECOY_URL")
 
-	srv := NewServer(psk, tunnelPath, allowPrivate, enableAdblock, decoyURL)
+	srv := NewServer(psk, tunnelPath, allowPrivate, adblockSNI, blockDoT, upstreamDNS, decoyURL)
 	h2s := &http2.Server{}
 	httpSrv := &http.Server{
 		Addr:              "0.0.0.0:" + port,
@@ -435,7 +510,8 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("[aether-server] listening on 0.0.0.0:%s (ws=%s, h2=%s, adblock=%v)", port, tunnelPath, srv.h2Path, enableAdblock)
+		log.Printf("[aether-server] listening on 0.0.0.0:%s (ws=%s, h2=%s, dns=%v, block_dot=%v, sni_adblock=%v)",
+			port, tunnelPath, srv.h2Path, upstreamDNS, blockDoT, adblockSNI)
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("server error: %v", err)
 		}

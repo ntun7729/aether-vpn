@@ -43,9 +43,11 @@ type Conn interface {
 	CarrierID() uint64
 	GetEndpoint() Endpoint
 	WritePacket(data []byte) error
+	WritePacketPriority(data []byte, high bool) error
 	ReadPacket() ([]byte, error)
 	Close() error
 	IsClosed() bool
+	Degraded() bool
 }
 
 // Endpoint describes a server URL (Railway, Render, or Cloudflare Worker relay).
@@ -143,13 +145,18 @@ func DecodeServerHello(data []byte, sessionID [16]byte, psk []byte) (ServerHello
 	return h, nil
 }
 
-// Carrier wraps a single WebSocket connection with thread-safe binary packet I/O.
+// Carrier wraps a WebSocket connection with an async priority writer queue (zero bufferbloat)
+// and a 5-second Pong timeout for fast wake-from-sleep recovery.
 type Carrier struct {
 	ID       uint64
 	Endpoint Endpoint
 	conn     *websocket.Conn
-	writeMu  sync.Mutex
+	highCh   chan []byte
+	bulkCh   chan []byte
+	pongCh   chan struct{}
+	degraded atomic.Bool
 	closed   atomic.Bool
+	closeOne sync.Once
 	closeCh  chan struct{}
 }
 
@@ -157,47 +164,111 @@ var nextCarrierID atomic.Uint64
 
 func (c *Carrier) CarrierID() uint64     { return c.ID }
 func (c *Carrier) GetEndpoint() Endpoint { return c.Endpoint }
+func (c *Carrier) Degraded() bool        { return c.degraded.Load() }
 
-// WrapConn creates a Carrier around an established WebSocket connection and starts a 25s ping keepalive.
+// WrapConn creates a Carrier with async priority write lanes and 25s ping / 5s pong timeout.
 func WrapConn(conn *websocket.Conn, ep Endpoint) *Carrier {
 	conn.SetReadLimit(256 * 1024)
+	if tc, ok := conn.UnderlyingConn().(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+	}
 	c := &Carrier{
 		ID:       nextCarrierID.Add(1),
 		Endpoint: ep,
 		conn:     conn,
+		highCh:   make(chan []byte, 128),
+		bulkCh:   make(chan []byte, 256),
+		pongCh:   make(chan struct{}, 1),
 		closeCh:  make(chan struct{}),
 	}
 	conn.SetPongHandler(func(string) error {
 		_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+		c.degraded.Store(false)
+		select {
+		case c.pongCh <- struct{}{}:
+		default:
+		}
 		return nil
 	})
-	go func() {
-		ticker := time.NewTicker(25 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				if c.closed.Load() {
-					return
-				}
-				c.writeMu.Lock()
-				_ = c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-				err := c.conn.WriteMessage(websocket.PingMessage, nil)
-				c.writeMu.Unlock()
-				if err != nil {
-					_ = c.Close()
-					return
-				}
-			case <-c.closeCh:
-				return
-			}
-		}
-	}()
+
+	go c.writerLoop()
 	return c
 }
 
+func (c *Carrier) writerLoop() {
+	pingTicker := time.NewTicker(25 * time.Second)
+	defer pingTicker.Stop()
+
+	writeBin := func(data []byte) bool {
+		t0 := time.Now()
+		_ = c.conn.SetWriteDeadline(t0.Add(15 * time.Second))
+		if err := c.conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
+			_ = c.Close()
+			return false
+		}
+		// Mark degraded if a single WebSocket write stalls >1.5s
+		c.degraded.Store(time.Since(t0) > 1500*time.Millisecond)
+		return true
+	}
+
+	var pongTimer *time.Timer
+	var pongTimeout <-chan time.Time
+
+	for {
+		// Strict priority: always drain high-priority lane (DNS/QUIC/Ping/WindowUpdate/Open) first!
+		select {
+		case <-c.closeCh:
+			if pongTimer != nil {
+				pongTimer.Stop()
+			}
+			return
+		case data := <-c.highCh:
+			if !writeBin(data) {
+				return
+			}
+			continue
+		default:
+		}
+
+		select {
+		case <-c.closeCh:
+			if pongTimer != nil {
+				pongTimer.Stop()
+			}
+			return
+		case data := <-c.highCh:
+			if !writeBin(data) {
+				return
+			}
+		case data := <-c.bulkCh:
+			if !writeBin(data) {
+				return
+			}
+		case <-c.pongCh:
+			if pongTimer != nil {
+				pongTimer.Stop()
+				pongTimer = nil
+				pongTimeout = nil
+			}
+		case <-pongTimeout:
+			// No Pong within 5s -> zombie carrier after phone Doze/sleep; close immediately!
+			_ = c.Close()
+			return
+		case <-pingTicker.C:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				_ = c.Close()
+				return
+			}
+			if pongTimer == nil {
+				pongTimer = time.NewTimer(5 * time.Second)
+				pongTimeout = pongTimer.C
+			}
+		}
+	}
+}
+
 // Dial connects a carrier using Endpoint.Transport ("auto", "ws", or "h2").
-// In "auto" mode it prefers WebSocket (with uTLS Chrome fingerprint) and falls back to HTTP/2 streaming.
 func Dial(ctx context.Context, ep Endpoint, timeout time.Duration) (Conn, error) {
 	switch ep.Transport {
 	case "h2":
@@ -217,7 +288,7 @@ func Dial(ctx context.Context, ep Endpoint, timeout time.Duration) (Conn, error)
 	}
 }
 
-// DialWS connects a WebSocket carrier using uTLS Chrome ClientHello fingerprint (anti-DPI).
+// DialWS connects a WebSocket carrier using uTLS Chrome ClientHello fingerprint + TCP_NODELAY.
 func DialWS(ctx context.Context, ep Endpoint, timeout time.Duration) (*Carrier, error) {
 	u, err := url.Parse(ep.URL)
 	if err != nil {
@@ -248,7 +319,11 @@ func DialWS(ctx context.Context, ep Endpoint, timeout time.Duration) (*Carrier, 
 			if ep.ResolveIP != "" {
 				target = net.JoinHostPort(ep.ResolveIP, port)
 			}
-			return netDialer.DialContext(dctx, network, target)
+			conn, err := netDialer.DialContext(dctx, network, target)
+			if tc, ok := conn.(*net.TCPConn); ok {
+				_ = tc.SetNoDelay(true)
+			}
+			return conn, err
 		},
 		NetDialTLSContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
 			target := addr
@@ -259,7 +334,9 @@ func DialWS(ctx context.Context, ep Endpoint, timeout time.Duration) (*Carrier, 
 			if err != nil {
 				return nil, err
 			}
-			// Use uTLS Chrome fingerprint with ALPN forced to http/1.1 for WebSocket upgrade
+			if tc, ok := rawConn.(*net.TCPConn); ok {
+				_ = tc.SetNoDelay(true)
+			}
 			spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
 			if err != nil {
 				_ = rawConn.Close()
@@ -298,15 +375,30 @@ func DialWS(ctx context.Context, ep Endpoint, timeout time.Duration) (*Carrier, 
 	return WrapConn(conn, ep), nil
 }
 
-// WritePacket sends a single binary WebSocket message safely from any goroutine.
+// WritePacket enqueues a packet on the high-priority lane (used during handshake).
 func (c *Carrier) WritePacket(data []byte) error {
+	return c.WritePacketPriority(data, true)
+}
+
+// WritePacketPriority enqueues a binary packet onto the high-priority or bulk async writer lane.
+func (c *Carrier) WritePacketPriority(data []byte, high bool) error {
 	if c.closed.Load() {
 		return net.ErrClosed
 	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	_ = c.conn.SetWriteDeadline(time.Now().Add(20 * time.Second))
-	return c.conn.WriteMessage(websocket.BinaryMessage, data)
+	if high {
+		select {
+		case c.highCh <- data:
+			return nil
+		case <-c.closeCh:
+			return net.ErrClosed
+		}
+	}
+	select {
+	case c.bulkCh <- data:
+		return nil
+	case <-c.closeCh:
+		return net.ErrClosed
+	}
 }
 
 // ReadPacket reads the next binary WebSocket message.
@@ -323,13 +415,15 @@ func (c *Carrier) ReadPacket() ([]byte, error) {
 	}
 }
 
-// Close closes the underlying WebSocket connection.
+// Close closes the underlying WebSocket connection and stops the writer goroutine.
 func (c *Carrier) Close() error {
-	if c.closed.Swap(true) {
-		return nil
-	}
-	close(c.closeCh)
-	return c.conn.Close()
+	var err error
+	c.closeOne.Do(func() {
+		c.closed.Store(true)
+		close(c.closeCh)
+		err = c.conn.Close()
+	})
+	return err
 }
 
 // IsClosed returns true if the carrier has been closed.

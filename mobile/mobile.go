@@ -25,7 +25,6 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
 
-	"github.com/aether-vpn/aether/core/adblock"
 	"github.com/aether-vpn/aether/core/carrier"
 	"github.com/aether-vpn/aether/core/proto"
 	"github.com/aether-vpn/aether/core/session"
@@ -33,8 +32,8 @@ import (
 
 const (
 	nicID       tcpip.NICID = 1
-	maxUDPFlows             = 128
-	udpIdleTTL              = 15 * time.Second
+	maxUDPFlows             = 256              // Supports heavy pooled QUIC (Google/YouTube) + DNS
+	udpIdleTTL              = 65 * time.Second // Matches Google HTTP/3 QUIC pool keepalive (fixes ERR_QUIC_PROTOCOL_ERROR)
 )
 
 var udpBufPool = sync.Pool{
@@ -70,9 +69,9 @@ var (
 	active *vpnInstance
 )
 
-// StartVPN starts the Aether v2 multi-path VPN tunnel over an Android VpnService TUN fd.
-// Keeps full UDP (including QUIC/443) enabled while using tuned gVisor TCP + pooled buffers
-// to eliminate mobile CPU/GC lag.
+// StartVPN starts the Aether v2.2 multi-path VPN tunnel over an Android VpnService TUN fd.
+// Zero on-phone adblock overhead (AdGuard DNS runs on server), full QUIC support (65s idle TTL),
+// CUBIC + 2MB gVisor window, and 64KB pooled io.CopyBuffer.
 func StartVPN(tunFd int, mtu int, configJSON string) error {
 	instMu.Lock()
 	defer instMu.Unlock()
@@ -81,7 +80,7 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 		return errors.New("aether vpn is already running")
 	}
 	if mtu <= 0 {
-		mtu = 1400
+		mtu = 1280
 	}
 
 	var cfg MobileConfig
@@ -132,8 +131,6 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 	sndBuf := tcpip.TCPSendBufferSizeRangeOption{Min: 64 * 1024, Default: 1 << 20, Max: 4 << 20}
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sndBuf)
 
-	localBlocker := adblock.New(true)
-
 	if err := s.CreateNIC(nicID, linkEP); err != nil {
 		_ = mgr.Close()
 		return fmt.Errorf("create NIC failed: %v", err)
@@ -145,7 +142,7 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 		{Destination: header.IPv6EmptySubnet, NIC: nicID},
 	})
 
-	// Forward all TCP connections using 0-RTT OpenStream + 2 MB gVisor receive window (uncaps 15 Mbps BDP ceiling!)
+	// Forward all TCP connections using 0-RTT OpenStream + 64 KB pooled copy buffers
 	tcpFwd := tcp.NewForwarder(s, 2<<20, 1024, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
 		var wq waiter.Queue
@@ -167,12 +164,16 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 			wg.Add(2)
 			go func() {
 				defer wg.Done()
-				_, _ = io.Copy(st, localConn)
+				bufPtr := session.CopyBufPool.Get().(*[]byte)
+				defer session.CopyBufPool.Put(bufPtr)
+				_, _ = io.CopyBuffer(st, localConn, *bufPtr)
 				_ = st.CloseWrite()
 			}()
 			go func() {
 				defer wg.Done()
-				_, _ = io.Copy(localConn, st)
+				bufPtr := session.CopyBufPool.Get().(*[]byte)
+				defer session.CopyBufPool.Put(bufPtr)
+				_, _ = io.CopyBuffer(localConn, st, *bufPtr)
 				_ = localConn.CloseWrite()
 			}()
 			wg.Wait()
@@ -180,7 +181,7 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
 
-	// Forward all UDP datagrams (DNS, QUIC/443, VoIP, Gaming) with bounded flows & pooled buffers
+	// Forward all UDP datagrams (DNS -> AdGuard on server, QUIC/443 with 65s TTL, VoIP, Gaming)
 	udpFwd := udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
 		inst.udpMu.RLock()
 		count := len(inst.udpFlows)
@@ -219,15 +220,6 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 				if err != nil {
 					return
 				}
-				// 0ms local on-phone DNS AdBlock: answer NXDOMAIN locally without round-trip to Singapore!
-				if dstPort == 53 {
-					if qname, ok := adblock.ExtractDNSQueryName(buf[:n]); ok && localBlocker.IsBlocked(qname) {
-						if nx := adblock.BuildNXDomain(buf[:n]); nx != nil {
-							_, _ = localUDP.Write(nx)
-						}
-						continue
-					}
-				}
 				_ = mgr.SendUDP(flowID, dstHost, dstPort, buf[:n])
 			}
 		}()
@@ -244,7 +236,7 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 	inst.linkEP = linkEP
 	inst.cancel = cancel
 
-	// Pump packets: Android TUN -> gVisor (minimized allocations)
+	// Pump packets: Android TUN -> gVisor
 	go func() {
 		buf := make([]byte, mtu+128)
 		for {

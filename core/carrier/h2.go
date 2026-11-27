@@ -61,6 +61,8 @@ type H2ServerCarrier struct {
 func (c *H2ServerCarrier) CarrierID() uint64   { return c.id }
 func (c *H2ServerCarrier) GetEndpoint() Endpoint { return c.endpoint }
 func (c *H2ServerCarrier) IsClosed() bool      { return c.closed.Load() }
+func (c *H2ServerCarrier) Degraded() bool      { return false }
+func (c *H2ServerCarrier) WritePacketPriority(data []byte, _ bool) error { return c.WritePacket(data) }
 
 func (c *H2ServerCarrier) WritePacket(data []byte) error {
 	if c.closed.Load() {
@@ -200,6 +202,8 @@ func DialH2(ctx context.Context, ep Endpoint, timeout time.Duration) (*H2Carrier
 func (c *H2Carrier) CarrierID() uint64     { return c.id }
 func (c *H2Carrier) GetEndpoint() Endpoint { return c.endpoint }
 func (c *H2Carrier) IsClosed() bool        { return c.closed.Load() }
+func (c *H2Carrier) Degraded() bool        { return false }
+func (c *H2Carrier) WritePacketPriority(data []byte, _ bool) error { return c.WritePacket(data) }
 
 func (c *H2Carrier) WritePacket(data []byte) error {
 	if c.closed.Load() {

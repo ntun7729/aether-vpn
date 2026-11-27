@@ -25,7 +25,7 @@ class AetherVpnService : VpnService() {
         const val ACTION_STOP = "com.aether.vpn.STOP"
         private const val CHANNEL_ID = "aether_vpn_channel"
         private const val NOTIF_ID = 1001
-        private const val MTU = 1400
+        private const val MTU = 1280 // Prevents outer TCP segmentation of QUIC datagrams on 4G/5G
 
         @Volatile
         var lastError: String? = null
@@ -61,9 +61,13 @@ class AetherVpnService : VpnService() {
                 .addAddress("fd00:ae7e::2", 126)
                 .addRoute("0.0.0.0", 0)
                 .addRoute("::", 0)
-                .addDnsServer("1.1.1.1")
-                .addDnsServer("8.8.8.8")
+                .addDnsServer("94.140.14.14") // AdGuard DNS (ad/tracker blocking)
+                .addDnsServer("94.140.15.15")
                 .addDisallowedApplication(packageName)
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                builder.setMetered(false) // Prevent Android from throttling background streaming/downloads
+            }
 
             // Split tunneling: exclude private LAN ranges on Android 13+ so local traffic stays direct
             if (cfg.bypassLan && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
