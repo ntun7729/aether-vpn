@@ -6,7 +6,7 @@ import org.json.JSONObject
 
 data class AetherConfig(
     val psk: String = "",
-    val primaryUrl: String = "wss://your-app.up.railway.app/ws/sync",
+    val primaryUrl: String = "wss://aether-server-production.up.railway.app/ws/sync",
     val fallbackUrl: String = "",
     val cfCleanIp: String = "",
     val carriers: Int = 3
@@ -43,7 +43,7 @@ object ConfigStore {
         val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         return AetherConfig(
             psk = p.getString("psk", "") ?: "",
-            primaryUrl = p.getString("primary_url", "wss://your-app.up.railway.app/ws/sync") ?: "",
+            primaryUrl = p.getString("primary_url", "wss://aether-server-production.up.railway.app/ws/sync") ?: "",
             fallbackUrl = p.getString("fallback_url", "") ?: "",
             cfCleanIp = p.getString("cf_clean_ip", "") ?: "",
             carriers = p.getInt("carriers", 3)
