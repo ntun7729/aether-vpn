@@ -12,7 +12,21 @@ Custom binary VPN protocol (`Aether v1`), server, desktop/laptop proxy client, C
 
 ---
 
-## 1. Deploy the Server (Free / No VPS Required)
+## 1. Deploy the Server (Any Docker Platform — Railway / Render / Koyeb / Fly / VPS)
+
+Prebuilt multi-arch Docker image (`linux/amd64`, `linux/arm64`) on GitHub Container Registry:
+
+```text
+ghcr.io/ntun7729/aether-server:latest
+```
+
+Run on any Docker host:
+```bash
+docker run -d --name aether-server -p 8080:8080 \
+  -e AETHER_PSK="your-secret-key" \
+  -e TUNNEL_PATH="/ws/sync" \
+  ghcr.io/ntun7729/aether-server:latest
+```
 
 ### Option A: Railway (Primary)
 1. Push this repo to GitHub.
