@@ -158,12 +158,12 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
 
 	// Forward all UDP datagrams (including DNS & QUIC) from Android TUN into Aether UDP relay
-	udpFwd := udp.NewForwarder(s, func(r *udp.ForwarderRequest) {
+	udpFwd := udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
 		id := r.ID()
 		var wq waiter.Queue
 		ep, err := r.CreateEndpoint(&wq)
 		if err != nil {
-			return
+			return false
 		}
 		localUDP := gonet.NewUDPConn(&wq, ep)
 		flowID := inst.nextFlow.Add(1)
@@ -190,6 +190,7 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 				_ = mgr.SendUDP(flowID, dstHost, dstPort, buf[:n])
 			}
 		}()
+		return true
 	})
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
 
