@@ -443,11 +443,26 @@ func (s *Session) sendWindowUpdate(streamID uint32, delta uint32) {
 	}, 0)
 }
 
-// Ping sends an RTT probe over the session.
+// Ping sends an encrypted in-band RTT keepalive probe on EVERY active carrier
+// so cloud proxies (Railway/Render/CF) never drop idle WebSockets!
 func (s *Session) Ping() error {
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], uint64(time.Now().UnixNano()))
-	return s.sendFrame(&proto.Frame{Type: proto.FramePing, Payload: buf[:]}, 0)
+	f := &proto.Frame{Type: proto.FramePing, Payload: buf[:]}
+	raw, err := f.Encode(0)
+	if err != nil {
+		return err
+	}
+	s.carrierMu.RLock()
+	carriers := append([]carrier.Conn(nil), s.carriers...)
+	s.carrierMu.RUnlock()
+	for _, c := range carriers {
+		wire := s.Cipher.Seal(raw)
+		if err := c.WritePacketPriority(wire, true); err != nil {
+			s.removeCarrier(c)
+		}
+	}
+	return nil
 }
 
 // SendUDP sends a full-cone UDP datagram through the tunnel (QUIC / DNS / VoIP).

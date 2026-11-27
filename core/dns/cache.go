@@ -123,6 +123,28 @@ func QueryKey(pkt []byte) (string, bool) {
 	return fmt.Sprintf("%s|%d", strings.Join(parts, "."), qtype), true
 }
 
+// IsAAAAQuery returns true if pkt is a standard DNS query for QTYPE=28 (AAAA / IPv6).
+func IsAAAAQuery(pkt []byte) bool {
+	key, ok := QueryKey(pkt)
+	return ok && strings.HasSuffix(key, "|28")
+}
+
+// BuildEmptyNoError builds a minimal valid DNS NOERROR response with 0 answers.
+// Used on IPv4-only container hosts (Railway/Render) so apps use IPv4 instead of blackholed IPv6 QUIC.
+func BuildEmptyNoError(query []byte) []byte {
+	if len(query) < 12 {
+		return nil
+	}
+	resp := make([]byte, len(query))
+	copy(resp, query)
+	resp[2] = (query[2] & 0x01) | 0x81 // QR=1, RD preserved
+	resp[3] = 0x80                     // RA=1, RCODE=0 (NOERROR)
+	binary.BigEndian.PutUint16(resp[6:8], 0)
+	binary.BigEndian.PutUint16(resp[8:10], 0)
+	binary.BigEndian.PutUint16(resp[10:12], 0)
+	return resp
+}
+
 // Get returns a cached DNS response with its Transaction ID rewritten to match query.
 func (u *UDPCache) Get(query []byte) ([]byte, bool) {
 	key, ok := QueryKey(query)

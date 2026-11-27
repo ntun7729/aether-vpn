@@ -196,9 +196,6 @@ func WrapConn(conn *websocket.Conn, ep Endpoint) *Carrier {
 }
 
 func (c *Carrier) writerLoop() {
-	pingTicker := time.NewTicker(25 * time.Second)
-	defer pingTicker.Stop()
-
 	writeBin := func(data []byte) bool {
 		t0 := time.Now()
 		_ = c.conn.SetWriteDeadline(t0.Add(15 * time.Second))
@@ -206,21 +203,14 @@ func (c *Carrier) writerLoop() {
 			_ = c.Close()
 			return false
 		}
-		// Mark degraded if a single WebSocket write stalls >1.5s
 		c.degraded.Store(time.Since(t0) > 1500*time.Millisecond)
 		return true
 	}
 
-	var pongTimer *time.Timer
-	var pongTimeout <-chan time.Time
-
 	for {
-		// Strict priority: always drain high-priority lane (DNS/QUIC/Ping/WindowUpdate/Open) first!
+		// Strict priority: always drain high-priority lane (DNS/QUIC/Ping/WindowUpdate/Rst) first!
 		select {
 		case <-c.closeCh:
-			if pongTimer != nil {
-				pongTimer.Stop()
-			}
 			return
 		case data := <-c.highCh:
 			if !writeBin(data) {
@@ -232,9 +222,6 @@ func (c *Carrier) writerLoop() {
 
 		select {
 		case <-c.closeCh:
-			if pongTimer != nil {
-				pongTimer.Stop()
-			}
 			return
 		case data := <-c.highCh:
 			if !writeBin(data) {
@@ -243,26 +230,6 @@ func (c *Carrier) writerLoop() {
 		case data := <-c.bulkCh:
 			if !writeBin(data) {
 				return
-			}
-		case <-c.pongCh:
-			if pongTimer != nil {
-				pongTimer.Stop()
-				pongTimer = nil
-				pongTimeout = nil
-			}
-		case <-pongTimeout:
-			// No Pong within 5s -> zombie carrier after phone Doze/sleep; close immediately!
-			_ = c.Close()
-			return
-		case <-pingTicker.C:
-			_ = c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				_ = c.Close()
-				return
-			}
-			if pongTimer == nil {
-				pongTimer = time.NewTimer(5 * time.Second)
-				pongTimeout = pongTimer.C
 			}
 		}
 	}

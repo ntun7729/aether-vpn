@@ -323,6 +323,15 @@ func (s *Server) handleTCPStream(ctx context.Context, ss *serverSession, st *ses
 
 // resolveUDP53 serves cached DNS responses in <0.1ms and forwards misses to AdGuard DNS (94.140.14.14).
 func (s *Server) resolveUDP53(ss *serverSession, flowID uint32, origAddr proto.Address, query []byte) {
+	// Railway/Render containers have IPv4-only public egress: return empty NOERROR for AAAA
+	// so Chrome/Google use IPv4 QUIC instead of hitting an IPv6 blackhole (ERR_QUIC_PROTOCOL_ERROR).
+	if adns.IsAAAAQuery(query) {
+		if empty := adns.BuildEmptyNoError(query); empty != nil {
+			_ = ss.sess.SendUDP(flowID, origAddr.Host, origAddr.Port, empty)
+		}
+		return
+	}
+
 	if cached, ok := s.udpDNSCache.Get(query); ok {
 		_ = ss.sess.SendUDP(flowID, origAddr.Host, origAddr.Port, cached)
 		return
