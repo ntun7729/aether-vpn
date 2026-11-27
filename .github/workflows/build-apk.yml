@@ -45,7 +45,7 @@ jobs:
           go get gvisor.dev/gvisor@go
           go get -tool golang.org/x/mobile/cmd/gobind
           go mod tidy
-          gomobile bind -v -androidapi 26 -target=android/arm64,android/arm -o ../android/app/libs/aether.aar .
+          gomobile bind -v -androidapi 26 -target=android/arm64 -ldflags="-s -w" -o ../android/app/libs/aether.aar .
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
