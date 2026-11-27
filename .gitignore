@@ -1,0 +1,19 @@
+# Binaries & build artifacts
+/aether-server
+/aether-client
+*.apk
+*.aab
+*.aar
+*.keystore
+*.jks
+
+# Android / Gradle
+android/.gradle/
+android/local.properties
+android/app/build/
+android/build/
+android/app/libs/*.aar
+
+# Local configs with secrets
+aether.local.json
+.env

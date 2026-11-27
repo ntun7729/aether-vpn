@@ -1,0 +1,368 @@
+package session
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"sort"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/aether-vpn/aether/core/carrier"
+	acrypto "github.com/aether-vpn/aether/core/crypto"
+	"github.com/aether-vpn/aether/core/proto"
+)
+
+// ClientConfig configures the multi-endpoint Aether client manager.
+type ClientConfig struct {
+	PSK        string             `json:"psk"`
+	Endpoints  []carrier.Endpoint `json:"endpoints"`  // Ordered by priority: e.g. Railway (0), Render (1), CF Worker (2)
+	Carriers   int                `json:"carriers"`   // Parallel WebSocket carriers per session (default 3)
+	DialTimeout time.Duration     `json:"-"`
+	MaxPad     int                `json:"max_pad"`
+}
+
+// ClientManager maintains a resilient Aether Session across multiple carriers and endpoints
+// (automatically failing over from Railway -> Render -> Cloudflare Worker on outage).
+type ClientManager struct {
+	cfg   ClientConfig
+	psk   []byte
+	onUDP UDPHandler
+
+	mu         sync.RWMutex
+	failoverMu sync.Mutex
+	sess       *Session
+	epIndex    int // Index into sorted endpoints of the currently active endpoint
+	failCount  map[int]int
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	closed atomic.Bool
+}
+
+// NewClientManager creates a ClientManager and sorts endpoints by Priority.
+func NewClientManager(cfg ClientConfig, onUDP UDPHandler) (*ClientManager, error) {
+	if cfg.PSK == "" {
+		return nil, errors.New("aether: PSK is required")
+	}
+	if len(cfg.Endpoints) == 0 {
+		return nil, errors.New("aether: at least one endpoint is required")
+	}
+	if cfg.Carriers <= 0 {
+		cfg.Carriers = 3
+	}
+	if cfg.Carriers > 8 {
+		cfg.Carriers = 8
+	}
+	if cfg.DialTimeout <= 0 {
+		cfg.DialTimeout = 8 * time.Second
+	}
+
+	eps := make([]carrier.Endpoint, len(cfg.Endpoints))
+	copy(eps, cfg.Endpoints)
+	sort.SliceStable(eps, func(i, j int) bool {
+		return eps[i].Priority < eps[j].Priority
+	})
+	cfg.Endpoints = eps
+
+	ctx, cancel := context.WithCancel(context.Background())
+	return &ClientManager{
+		cfg:       cfg,
+		psk:       []byte(cfg.PSK),
+		onUDP:     onUDP,
+		failCount: make(map[int]int),
+		ctx:       ctx,
+		cancel:    cancel,
+	}, nil
+}
+
+// Start establishes the initial session + parallel carrier pool and starts the watchdog.
+func (m *ClientManager) Start(ctx context.Context) error {
+	if err := m.connectAnyEndpoint(ctx); err != nil {
+		return err
+	}
+	go m.watchdogLoop()
+	return nil
+}
+
+// Session returns the currently active Session.
+func (m *ClientManager) Session() (*Session, error) {
+	m.mu.RLock()
+	s := m.sess
+	m.mu.RUnlock()
+	if s == nil {
+		return nil, ErrNoCarriers
+	}
+	return s, nil
+}
+
+// OpenStream opens a multiplexed TCP stream on the active session.
+func (m *ClientManager) OpenStream(ctx context.Context, host string, port uint16) (*Stream, error) {
+	s, err := m.Session()
+	if err != nil {
+		return nil, err
+	}
+	return s.OpenStream(ctx, host, port)
+}
+
+// SendUDP sends a UDP datagram on the active session.
+func (m *ClientManager) SendUDP(flowID uint32, host string, port uint16, payload []byte) error {
+	s, err := m.Session()
+	if err != nil {
+		return err
+	}
+	return s.SendUDP(flowID, host, port, payload)
+}
+
+// Stats returns live telemetry for the active session.
+func (m *ClientManager) Stats() Stats {
+	m.mu.RLock()
+	s := m.sess
+	m.mu.RUnlock()
+	if s == nil {
+		return Stats{}
+	}
+	return s.Stats()
+}
+
+// Close shuts down the manager and active session.
+func (m *ClientManager) Close() error {
+	if m.closed.Swap(true) {
+		return nil
+	}
+	m.cancel()
+	m.mu.Lock()
+	s := m.sess
+	m.sess = nil
+	m.mu.Unlock()
+	if s != nil {
+		return s.Close()
+	}
+	return nil
+}
+
+func (m *ClientManager) connectAnyEndpoint(ctx context.Context) error {
+	var lastErr error
+	for i, ep := range m.cfg.Endpoints {
+		s, err := m.dialNewSession(ctx, ep)
+		if err != nil {
+			lastErr = err
+			log.Printf("[aether] endpoint %s (%s) failed: %v", ep.Name, ep.URL, err)
+			continue
+		}
+		m.mu.Lock()
+		old := m.sess
+		m.sess = s
+		m.epIndex = i
+		m.mu.Unlock()
+		if old != nil {
+			s.RecordFailover()
+			_ = old.Close()
+		}
+		log.Printf("[aether] session %x established on %s (%s)", s.ID[:6], ep.Name, ep.URL)
+		// Spin up remaining parallel carriers asynchronously
+		for k := 1; k < m.cfg.Carriers; k++ {
+			go m.attachExtraCarrier(s, ep)
+		}
+		return nil
+	}
+	return fmt.Errorf("all endpoints failed: %w", lastErr)
+}
+
+func (m *ClientManager) dialNewSession(ctx context.Context, ep carrier.Endpoint) (*Session, error) {
+	c, err := carrier.Dial(ctx, ep, m.cfg.DialTimeout)
+	if err != nil {
+		return nil, err
+	}
+
+	kp, err := acrypto.GenerateKeyPair()
+	if err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	sessID := NewSessionID()
+	hello := carrier.EncodeClientHello(carrier.ClientHello{
+		Version:   proto.Version,
+		Mode:      carrier.ModeNewSession,
+		SessionID: sessID,
+		PubKey:    kp.Public,
+		Timestamp: time.Now().Unix(),
+	}, m.psk)
+
+	if err := c.WritePacket(hello); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	respBytes, err := c.ReadPacket()
+	if err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	sh, err := carrier.DecodeServerHello(respBytes, sessID, m.psk)
+	if err != nil || sh.Status != carrier.StatusOK {
+		_ = c.Close()
+		if err == nil {
+			err = fmt.Errorf("server rejected handshake (status=%d)", sh.Status)
+		}
+		return nil, err
+	}
+
+	cipher, err := acrypto.DeriveSessionCipher(m.psk, kp.Private, sh.PubKey, sessID, false)
+	if err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+
+	s := New(sessID, cipher, false, nil, m.onUDP)
+	if m.cfg.MaxPad > 0 {
+		s.MaxPad = m.cfg.MaxPad
+	}
+	s.AttachCarrier(c, m.onCarrierDetach(s, ep))
+	return s, nil
+}
+
+func (m *ClientManager) attachExtraCarrier(s *Session, ep carrier.Endpoint) error {
+	if s.closed.Load() || m.closed.Load() {
+		return ErrSessionClosed
+	}
+	ctx, cancel := context.WithTimeout(m.ctx, m.cfg.DialTimeout)
+	defer cancel()
+
+	c, err := carrier.Dial(ctx, ep, m.cfg.DialTimeout)
+	if err != nil {
+		return err
+	}
+
+	hello := carrier.EncodeClientHello(carrier.ClientHello{
+		Version:   proto.Version,
+		Mode:      carrier.ModeAttachCarrier,
+		SessionID: s.ID,
+		Timestamp: time.Now().Unix(),
+	}, m.psk)
+
+	if err := c.WritePacket(hello); err != nil {
+		_ = c.Close()
+		return err
+	}
+	respBytes, err := c.ReadPacket()
+	if err != nil {
+		_ = c.Close()
+		return err
+	}
+	sh, err := carrier.DecodeServerHello(respBytes, s.ID, m.psk)
+	if err != nil {
+		_ = c.Close()
+		return err
+	}
+	if sh.Status == carrier.StatusUnknownSession {
+		_ = c.Close()
+		return carrier.ErrUnknownSession
+	}
+	if sh.Status != carrier.StatusOK {
+		_ = c.Close()
+		return fmt.Errorf("attach rejected (status=%d)", sh.Status)
+	}
+
+	s.AttachCarrier(c, m.onCarrierDetach(s, ep))
+	return nil
+}
+
+func (m *ClientManager) onCarrierDetach(s *Session, ep carrier.Endpoint) func(*carrier.Carrier, error) {
+	return func(c *carrier.Carrier, err error) {
+		if m.closed.Load() || s.closed.Load() {
+			return
+		}
+		log.Printf("[aether] carrier #%d detached from %s: %v (remaining=%d)", c.ID, ep.Name, err, s.ActiveCarriers())
+		// Immediately try to re-attach a replacement carrier to preserve zero-drop session!
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			if err := m.attachExtraCarrier(s, ep); err != nil {
+				if errors.Is(err, carrier.ErrUnknownSession) || s.ActiveCarriers() == 0 {
+					// Endpoint lost session or all carriers died -> trigger failover across endpoints
+					ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
+					defer cancel()
+					_ = m.failover(ctx)
+				}
+			}
+		}()
+	}
+}
+
+func (m *ClientManager) failover(ctx context.Context) error {
+	m.failoverMu.Lock()
+	defer m.failoverMu.Unlock()
+
+	m.mu.RLock()
+	curSess := m.sess
+	curIdx := m.epIndex
+	n := len(m.cfg.Endpoints)
+	m.mu.RUnlock()
+
+	// Another goroutine may have already recovered or failed over while we waited for the lock.
+	if curSess != nil && curSess.ActiveCarriers() > 0 {
+		return nil
+	}
+
+	// Try endpoints starting from the next one (e.g. Railway -> Render -> CF Worker), then wrap around
+	for offset := 1; offset <= n; offset++ {
+		idx := (curIdx + offset) % n
+		ep := m.cfg.Endpoints[idx]
+		s, err := m.dialNewSession(ctx, ep)
+		if err != nil {
+			log.Printf("[aether] failover candidate %s failed: %v", ep.Name, err)
+			continue
+		}
+		m.mu.Lock()
+		old := m.sess
+		m.sess = s
+		m.epIndex = idx
+		m.mu.Unlock()
+		if old != nil {
+			s.RecordFailover()
+			_ = old.Close()
+		}
+		log.Printf("[aether] failed over to %s (%s)", ep.Name, ep.URL)
+		for k := 1; k < m.cfg.Carriers; k++ {
+			go m.attachExtraCarrier(s, ep)
+		}
+		return nil
+	}
+	return ErrNoCarriers
+}
+
+func (m *ClientManager) watchdogLoop() {
+	pingTicker := time.NewTicker(15 * time.Second)
+	healTicker := time.NewTicker(5 * time.Second)
+	defer pingTicker.Stop()
+	defer healTicker.Stop()
+
+	for {
+		select {
+		case <-pingTicker.C:
+			if s, err := m.Session(); err == nil {
+				_ = s.Ping()
+			}
+		case <-healTicker.C:
+			m.mu.RLock()
+			s := m.sess
+			epIdx := m.epIndex
+			m.mu.RUnlock()
+			if s == nil {
+				continue
+			}
+			active := s.ActiveCarriers()
+			if active == 0 {
+				ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
+				_ = m.failover(ctx)
+				cancel()
+			} else if active < m.cfg.Carriers {
+				ep := m.cfg.Endpoints[epIdx]
+				go m.attachExtraCarrier(s, ep)
+			}
+		case <-m.ctx.Done():
+			return
+		}
+	}
+}

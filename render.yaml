@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: aether-vpn-server
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    plan: free
+    envVars:
+      - key: AETHER_PSK
+        generateValue: true
+      - key: TUNNEL_PATH
+        value: /ws/sync
