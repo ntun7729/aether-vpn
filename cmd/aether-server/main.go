@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -16,7 +19,10 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 
+	"github.com/aether-vpn/aether/core/adblock"
 	"github.com/aether-vpn/aether/core/carrier"
 	acrypto "github.com/aether-vpn/aether/core/crypto"
 	adns "github.com/aether-vpn/aether/core/dns"
@@ -47,22 +53,40 @@ type udpRelay struct {
 }
 
 type Server struct {
-	psk      []byte
-	path     string
-	guard    *netguard.Guard
-	dnsCache *adns.Cache
-	upgrader websocket.Upgrader
+	psk        []byte
+	path       string
+	h2Path     string
+	guard      *netguard.Guard
+	dnsCache   *adns.Cache
+	blocker    *adblock.Blocker
+	decoyProxy *httputil.ReverseProxy
+	upgrader   websocket.Upgrader
 
 	mu       sync.Mutex
 	sessions map[[16]byte]*serverSession
 }
 
-func NewServer(psk, tunnelPath string, allowPrivate bool) *Server {
+func NewServer(psk, tunnelPath string, allowPrivate, enableAdblock bool, decoyURL string) *Server {
+	var proxy *httputil.ReverseProxy
+	if decoyURL != "" {
+		if u, err := url.Parse(decoyURL); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
+			proxy = httputil.NewSingleHostReverseProxy(u)
+			orig := proxy.Director
+			proxy.Director = func(req *http.Request) {
+				orig(req)
+				req.Host = u.Host
+			}
+		}
+	}
+
 	s := &Server{
-		psk:      []byte(psk),
-		path:     tunnelPath,
-		guard:    &netguard.Guard{AllowPrivate: allowPrivate},
-		dnsCache: adns.NewCache(60 * time.Second),
+		psk:        []byte(psk),
+		path:       tunnelPath,
+		h2Path:     strings.TrimSuffix(tunnelPath, "/") + "/h2",
+		guard:      &netguard.Guard{AllowPrivate: allowPrivate},
+		dnsCache:   adns.NewCache(60 * time.Second),
+		blocker:    adblock.New(enableAdblock),
+		decoyProxy: proxy,
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:    64 * 1024,
 			WriteBufferSize:   64 * 1024,
@@ -76,8 +100,8 @@ func NewServer(psk, tunnelPath string, allowPrivate bool) *Server {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	switch r.URL.Path {
-	case "/health":
+	switch {
+	case r.URL.Path == "/health":
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -85,28 +109,41 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"ts":     time.Now().Unix(),
 		})
 		return
-	case s.path:
-		if websocket.IsWebSocketUpgrade(r) {
-			s.handleTunnel(w, r)
+
+	case r.URL.Path == s.path && websocket.IsWebSocketUpgrade(r):
+		conn, err := s.upgrader.Upgrade(w, r, nil)
+		if err != nil {
 			return
 		}
+		_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		s.serveCarrier(carrier.WrapConn(conn, carrier.Endpoint{Name: r.RemoteAddr}))
+		return
+
+	case r.URL.Path == s.h2Path && r.Method == http.MethodPost:
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		s.serveCarrier(carrier.WrapH2Server(r, w, flusher, carrier.Endpoint{Name: r.RemoteAddr}))
+		return
 	}
 
-	// Active-probe resistance: serve normal decoy web page for everything else
+	// Active-probe resistance: serve live decoy reverse proxy or static HTML
+	if s.decoyProxy != nil {
+		s.decoyProxy.ServeHTTP(w, r)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(decoyHTML))
 }
 
-func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
-	conn, err := s.upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		return
-	}
-	c := carrier.WrapConn(conn, carrier.Endpoint{Name: r.RemoteAddr})
-
-	// Step 1: Read & verify ClientHello within 10s
-	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+func (s *Server) serveCarrier(c carrier.Conn) {
 	helloBytes, err := c.ReadPacket()
 	if err != nil {
 		_ = c.Close()
@@ -146,13 +183,15 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 			_ = c.Close()
 			return
 		}
-		ss.sess.AttachCarrier(c, func(_ *carrier.Carrier, _ error) {
+		done := make(chan struct{})
+		ss.sess.AttachCarrier(c, func(_ carrier.Conn, _ error) {
 			s.touchSession(ch.SessionID)
+			close(done)
 		})
+		<-done
 		return
 	}
 
-	// ModeNewSession: ephemeral X25519 key exchange
 	kp, err := acrypto.GenerateKeyPair()
 	if err != nil {
 		_ = c.Close()
@@ -194,12 +233,19 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	s.sessions[ch.SessionID] = ss
 	s.mu.Unlock()
 
-	sess.AttachCarrier(c, func(_ *carrier.Carrier, _ error) {
+	done := make(chan struct{})
+	sess.AttachCarrier(c, func(_ carrier.Conn, _ error) {
 		s.touchSession(ch.SessionID)
+		close(done)
 	})
+	<-done
 }
 
 func (s *Server) handleTCPStream(ctx context.Context, ss *serverSession, st *session.Stream, addr proto.Address) error {
+	if s.blocker.IsBlocked(addr.Host) {
+		return errors.New("blocked by adblock")
+	}
+
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
@@ -209,7 +255,6 @@ func (s *Server) handleTCPStream(ctx context.Context, ss *serverSession, st *ses
 	}
 	ss.sess.ConfirmStreamOpen(st)
 
-	// Bidirectional splice with proper half-close
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -234,6 +279,16 @@ func (s *Server) handleTCPStream(ctx context.Context, ss *serverSession, st *ses
 }
 
 func (s *Server) handleUDPPacket(ss *serverSession, flowID uint32, addr proto.Address, payload []byte) {
+	// Fast DNS ad/tracker blocking on UDP port 53 (returns NXDOMAIN immediately, 0ms latency!)
+	if addr.Port == 53 {
+		if qname, ok := adblock.ExtractDNSQueryName(payload); ok && s.blocker.IsBlocked(qname) {
+			if nx := adblock.BuildNXDomain(payload); nx != nil {
+				_ = ss.sess.SendUDP(flowID, addr.Host, addr.Port, nx)
+			}
+			return
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	ip, err := s.guard.ResolveAndValidate(ctx, addr.Host)
 	cancel()
@@ -308,7 +363,6 @@ func (s *Server) gcLoop() {
 		now := time.Now()
 		s.mu.Lock()
 		for id, ss := range s.sessions {
-			// Keep carrier-less sessions alive for 90s so mobile roaming / failover can re-attach!
 			if ss.sess.ActiveCarriers() == 0 && now.Sub(ss.lastActive) > 90*time.Second {
 				delete(s.sessions, id)
 				go func(target *serverSession) {
@@ -343,16 +397,22 @@ func main() {
 		tunnelPath = "/" + tunnelPath
 	}
 	allowPrivate, _ := strconv.ParseBool(os.Getenv("ALLOW_PRIVATE"))
+	enableAdblock := true
+	if v := os.Getenv("ADBLOCK"); v != "" {
+		enableAdblock, _ = strconv.ParseBool(v)
+	}
+	decoyURL := os.Getenv("DECOY_URL")
 
-	srv := NewServer(psk, tunnelPath, allowPrivate)
+	srv := NewServer(psk, tunnelPath, allowPrivate, enableAdblock, decoyURL)
+	h2s := &http2.Server{}
 	httpSrv := &http.Server{
 		Addr:              "0.0.0.0:" + port,
-		Handler:           srv,
+		Handler:           h2c.NewHandler(srv, h2s),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	go func() {
-		log.Printf("[aether-server] listening on 0.0.0.0:%s (path=%s, allow_private=%v)", port, tunnelPath, allowPrivate)
+		log.Printf("[aether-server] listening on 0.0.0.0:%s (ws=%s, h2=%s, adblock=%v)", port, tunnelPath, srv.h2Path, enableAdblock)
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("server error: %v", err)
 		}

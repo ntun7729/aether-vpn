@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,15 +19,15 @@ import (
 
 // ClientConfig configures the multi-endpoint Aether client manager.
 type ClientConfig struct {
-	PSK        string             `json:"psk"`
-	Endpoints  []carrier.Endpoint `json:"endpoints"`  // Ordered by priority: e.g. Railway (0), Render (1), CF Worker (2)
-	Carriers   int                `json:"carriers"`   // Parallel WebSocket carriers per session (default 3)
-	DialTimeout time.Duration     `json:"-"`
-	MaxPad     int                `json:"max_pad"`
+	PSK         string             `json:"psk"`
+	Endpoints   []carrier.Endpoint `json:"endpoints"` // Ordered by priority: Railway (0), Render (1), CF Worker (2)
+	Carriers    int                `json:"carriers"`  // Parallel carriers per session (default 3)
+	DialTimeout time.Duration      `json:"-"`
+	MaxPad      int                `json:"max_pad"`
 }
 
-// ClientManager maintains a resilient Aether Session across multiple carriers and endpoints
-// (automatically failing over from Railway -> Render -> Cloudflare Worker on outage).
+// ClientManager maintains a resilient Aether Session across multiple carriers and endpoints,
+// with instant Wi-Fi<->5G roaming (TriggerRoaming) and automatic recovery back to primary.
 type ClientManager struct {
 	cfg   ClientConfig
 	psk   []byte
@@ -34,8 +36,7 @@ type ClientManager struct {
 	mu         sync.RWMutex
 	failoverMu sync.Mutex
 	sess       *Session
-	epIndex    int // Index into sorted endpoints of the currently active endpoint
-	failCount  map[int]int
+	epIndex    int
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -69,12 +70,11 @@ func NewClientManager(cfg ClientConfig, onUDP UDPHandler) (*ClientManager, error
 
 	ctx, cancel := context.WithCancel(context.Background())
 	return &ClientManager{
-		cfg:       cfg,
-		psk:       []byte(cfg.PSK),
-		onUDP:     onUDP,
-		failCount: make(map[int]int),
-		ctx:       ctx,
-		cancel:    cancel,
+		cfg:    cfg,
+		psk:    []byte(cfg.PSK),
+		onUDP:  onUDP,
+		ctx:    ctx,
+		cancel: cancel,
 	}, nil
 }
 
@@ -85,6 +85,26 @@ func (m *ClientManager) Start(ctx context.Context) error {
 	}
 	go m.watchdogLoop()
 	return nil
+}
+
+// TriggerRoaming is called on Android Wi-Fi <-> 5G network changes to immediately attach
+// fresh carriers on the new network interface while keeping active streams alive!
+func (m *ClientManager) TriggerRoaming() {
+	if m.closed.Load() {
+		return
+	}
+	m.mu.RLock()
+	s := m.sess
+	epIdx := m.epIndex
+	m.mu.RUnlock()
+	if s == nil {
+		return
+	}
+	ep := m.cfg.Endpoints[epIdx]
+	log.Printf("[aether] network change detected — proactively attaching fresh carriers to %s", ep.Name)
+	for k := 0; k < m.cfg.Carriers; k++ {
+		go m.attachExtraCarrier(s, ep)
+	}
 }
 
 // Session returns the currently active Session.
@@ -162,7 +182,6 @@ func (m *ClientManager) connectAnyEndpoint(ctx context.Context) error {
 			_ = old.Close()
 		}
 		log.Printf("[aether] session %x established on %s (%s)", s.ID[:6], ep.Name, ep.URL)
-		// Spin up remaining parallel carriers asynchronously
 		for k := 1; k < m.cfg.Carriers; k++ {
 			go m.attachExtraCarrier(s, ep)
 		}
@@ -269,18 +288,16 @@ func (m *ClientManager) attachExtraCarrier(s *Session, ep carrier.Endpoint) erro
 	return nil
 }
 
-func (m *ClientManager) onCarrierDetach(s *Session, ep carrier.Endpoint) func(*carrier.Carrier, error) {
-	return func(c *carrier.Carrier, err error) {
+func (m *ClientManager) onCarrierDetach(s *Session, ep carrier.Endpoint) func(carrier.Conn, error) {
+	return func(c carrier.Conn, err error) {
 		if m.closed.Load() || s.closed.Load() {
 			return
 		}
-		log.Printf("[aether] carrier #%d detached from %s: %v (remaining=%d)", c.ID, ep.Name, err, s.ActiveCarriers())
-		// Immediately try to re-attach a replacement carrier to preserve zero-drop session!
+		log.Printf("[aether] carrier #%d detached from %s: %v (remaining=%d)", c.CarrierID(), ep.Name, err, s.ActiveCarriers())
 		go func() {
 			time.Sleep(300 * time.Millisecond)
 			if err := m.attachExtraCarrier(s, ep); err != nil {
 				if errors.Is(err, carrier.ErrUnknownSession) || s.ActiveCarriers() == 0 {
-					// Endpoint lost session or all carriers died -> trigger failover across endpoints
 					ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
 					defer cancel()
 					_ = m.failover(ctx)
@@ -300,12 +317,10 @@ func (m *ClientManager) failover(ctx context.Context) error {
 	n := len(m.cfg.Endpoints)
 	m.mu.RUnlock()
 
-	// Another goroutine may have already recovered or failed over while we waited for the lock.
 	if curSess != nil && curSess.ActiveCarriers() > 0 {
 		return nil
 	}
 
-	// Try endpoints starting from the next one (e.g. Railway -> Render -> CF Worker), then wrap around
 	for offset := 1; offset <= n; offset++ {
 		idx := (curIdx + offset) % n
 		ep := m.cfg.Endpoints[idx]
@@ -332,11 +347,33 @@ func (m *ClientManager) failover(ctx context.Context) error {
 	return ErrNoCarriers
 }
 
+func (m *ClientManager) probeHealth(ep carrier.Endpoint) bool {
+	u := strings.Replace(ep.URL, "wss://", "https://", 1)
+	u = strings.Replace(u, "ws://", "http://", 1)
+	if idx := strings.Index(u, "://"); idx > 0 {
+		rest := u[idx+3:]
+		if slash := strings.IndexByte(rest, '/'); slash > 0 {
+			u = u[:idx+3+slash] + "/health"
+		} else {
+			u += "/health"
+		}
+	}
+	hc := &http.Client{Timeout: 4 * time.Second}
+	resp, err := hc.Get(u)
+	if err != nil {
+		return false
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
 func (m *ClientManager) watchdogLoop() {
 	pingTicker := time.NewTicker(15 * time.Second)
 	healTicker := time.NewTicker(5 * time.Second)
+	primaryProbeTicker := time.NewTicker(30 * time.Second)
 	defer pingTicker.Stop()
 	defer healTicker.Stop()
+	defer primaryProbeTicker.Stop()
 
 	for {
 		select {
@@ -360,6 +397,33 @@ func (m *ClientManager) watchdogLoop() {
 			} else if active < m.cfg.Carriers {
 				ep := m.cfg.Endpoints[epIdx]
 				go m.attachExtraCarrier(s, ep)
+			}
+		case <-primaryProbeTicker.C:
+			// Auto-return to primary endpoint (e.g. Railway) once it recovers after a fallback!
+			m.mu.RLock()
+			epIdx := m.epIndex
+			m.mu.RUnlock()
+			if epIdx > 0 && len(m.cfg.Endpoints) > 0 {
+				primary := m.cfg.Endpoints[0]
+				if m.probeHealth(primary) {
+					ctx, cancel := context.WithTimeout(m.ctx, 10*time.Second)
+					if s, err := m.dialNewSession(ctx, primary); err == nil {
+						m.mu.Lock()
+						old := m.sess
+						m.sess = s
+						m.epIndex = 0
+						m.mu.Unlock()
+						if old != nil {
+							s.RecordFailover()
+							_ = old.Close()
+						}
+						log.Printf("[aether] primary %s recovered — switched back automatically", primary.Name)
+						for k := 1; k < m.cfg.Carriers; k++ {
+							go m.attachExtraCarrier(s, primary)
+						}
+					}
+					cancel()
+				}
 			}
 		case <-m.ctx.Done():
 			return

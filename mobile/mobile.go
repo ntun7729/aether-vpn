@@ -277,6 +277,17 @@ func IsRunning() bool {
 	return active != nil
 }
 
+// OnNetworkChanged notifies the tunnel core when Android switches between Wi-Fi and 5G/LTE
+// so fresh carriers attach immediately without dropping active connections.
+func OnNetworkChanged() {
+	instMu.Lock()
+	inst := active
+	instMu.Unlock()
+	if inst != nil && inst.mgr != nil {
+		inst.mgr.TriggerRoaming()
+	}
+}
+
 // GetStatsJSON returns live session statistics as JSON for the Android UI.
 func GetStatsJSON() string {
 	instMu.Lock()

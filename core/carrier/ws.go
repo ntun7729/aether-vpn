@@ -2,7 +2,6 @@ package carrier
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	utls "github.com/refraction-networking/utls"
 
 	acrypto "github.com/aether-vpn/aether/core/crypto"
 	"github.com/aether-vpn/aether/core/proto"
@@ -38,15 +38,26 @@ var (
 	ErrHandshakeFail  = errors.New("aether/carrier: handshake failed")
 )
 
+// Conn is the transport-agnostic interface implemented by WebSocket and HTTP/2 carriers.
+type Conn interface {
+	CarrierID() uint64
+	GetEndpoint() Endpoint
+	WritePacket(data []byte) error
+	ReadPacket() ([]byte, error)
+	Close() error
+	IsClosed() bool
+}
+
 // Endpoint describes a server URL (Railway, Render, or Cloudflare Worker relay).
 type Endpoint struct {
 	Name      string `json:"name"`
 	URL       string `json:"url"`                  // e.g. wss://my-app.up.railway.app/ws/sync
 	ResolveIP string `json:"resolve_ip,omitempty"` // Optional Cloudflare clean IP override
+	Transport string `json:"transport,omitempty"`  // "auto" (default), "ws", or "h2"
 	Priority  int    `json:"priority,omitempty"`   // Lower = preferred (0=primary, 1=fallback)
 }
 
-// ClientHello is the first binary message sent on a newly upgraded WebSocket carrier.
+// ClientHello is the first binary message sent on a newly established carrier.
 type ClientHello struct {
 	Version   byte
 	Mode      byte
@@ -144,6 +155,9 @@ type Carrier struct {
 
 var nextCarrierID atomic.Uint64
 
+func (c *Carrier) CarrierID() uint64     { return c.ID }
+func (c *Carrier) GetEndpoint() Endpoint { return c.Endpoint }
+
 // WrapConn creates a Carrier around an established WebSocket connection.
 func WrapConn(conn *websocket.Conn, ep Endpoint) *Carrier {
 	conn.SetReadLimit(256 * 1024)
@@ -160,8 +174,29 @@ func WrapConn(conn *websocket.Conn, ep Endpoint) *Carrier {
 	return c
 }
 
-// Dial connects a WebSocket carrier to an Endpoint (optionally overriding the resolved IP for Cloudflare clean IPs).
-func Dial(ctx context.Context, ep Endpoint, timeout time.Duration) (*Carrier, error) {
+// Dial connects a carrier using Endpoint.Transport ("auto", "ws", or "h2").
+// In "auto" mode it prefers WebSocket (with uTLS Chrome fingerprint) and falls back to HTTP/2 streaming.
+func Dial(ctx context.Context, ep Endpoint, timeout time.Duration) (Conn, error) {
+	switch ep.Transport {
+	case "h2":
+		return DialH2(ctx, ep, timeout)
+	case "ws":
+		return DialWS(ctx, ep, timeout)
+	default: // "auto"
+		c, err := DialWS(ctx, ep, timeout)
+		if err == nil {
+			return c, nil
+		}
+		h2c, h2Err := DialH2(ctx, ep, timeout)
+		if h2Err == nil {
+			return h2c, nil
+		}
+		return nil, fmt.Errorf("ws (%v) and h2 (%v) both failed", err, h2Err)
+	}
+}
+
+// DialWS connects a WebSocket carrier using uTLS Chrome ClientHello fingerprint (anti-DPI).
+func DialWS(ctx context.Context, ep Endpoint, timeout time.Duration) (*Carrier, error) {
 	u, err := url.Parse(ep.URL)
 	if err != nil {
 		return nil, err
@@ -185,17 +220,44 @@ func Dial(ctx context.Context, ep Endpoint, timeout time.Duration) (*Carrier, er
 		HandshakeTimeout:  timeout,
 		ReadBufferSize:    64 * 1024,
 		WriteBufferSize:   64 * 1024,
-		EnableCompression: false, // Inner payload is already encrypted
-		TLSClientConfig: &tls.Config{
-			ServerName: host,
-			MinVersion: tls.VersionTLS13,
-		},
+		EnableCompression: false,
 		NetDialContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
 			target := addr
 			if ep.ResolveIP != "" {
 				target = net.JoinHostPort(ep.ResolveIP, port)
 			}
 			return netDialer.DialContext(dctx, network, target)
+		},
+		NetDialTLSContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
+			target := addr
+			if ep.ResolveIP != "" {
+				target = net.JoinHostPort(ep.ResolveIP, port)
+			}
+			rawConn, err := netDialer.DialContext(dctx, network, target)
+			if err != nil {
+				return nil, err
+			}
+			// Use uTLS Chrome fingerprint with ALPN forced to http/1.1 for WebSocket upgrade
+			spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
+			if err != nil {
+				_ = rawConn.Close()
+				return nil, err
+			}
+			for _, ext := range spec.Extensions {
+				if alpn, ok := ext.(*utls.ALPNExtension); ok {
+					alpn.AlpnProtocols = []string{"http/1.1"}
+				}
+			}
+			uConn := utls.UClient(rawConn, &utls.Config{ServerName: host}, utls.HelloCustom)
+			if err := uConn.ApplyPreset(&spec); err != nil {
+				_ = rawConn.Close()
+				return nil, err
+			}
+			if err := uConn.HandshakeContext(dctx); err != nil {
+				_ = rawConn.Close()
+				return nil, err
+			}
+			return uConn, nil
 		},
 	}
 
@@ -237,17 +299,6 @@ func (c *Carrier) ReadPacket() ([]byte, error) {
 			return data, nil
 		}
 	}
-}
-
-// Ping sends a WebSocket control ping frame.
-func (c *Carrier) Ping() error {
-	if c.closed.Load() {
-		return net.ErrClosed
-	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	_ = c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	return c.conn.WriteMessage(websocket.PingMessage, nil)
 }
 
 // Close closes the underlying WebSocket connection.

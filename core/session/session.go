@@ -18,11 +18,13 @@ import (
 )
 
 const (
-	MaxUnackedFrames = 2048
-	StreamChunkSize  = 32 * 1024
-	DefaultMaxPad    = 48
-	AckBatchInterval = 40 * time.Millisecond
-	AckBatchCount    = 16
+	MaxUnackedFrames      = 2048
+	StreamChunkSize       = 32 * 1024
+	DefaultMaxPad         = 48
+	AckBatchInterval      = 40 * time.Millisecond
+	AckBatchCount         = 16
+	InitialStreamWindow   = 1 << 20   // 1 MB per-stream flow control window
+	WindowUpdateThreshold = 256 << 10 // Send WINDOW_UPDATE every 256 KB drained
 )
 
 var (
@@ -50,8 +52,7 @@ type StreamOpenHandler func(ctx context.Context, s *Stream, addr proto.Address) 
 // UDPHandler is invoked when a UDP datagram arrives.
 type UDPHandler func(flowID uint32, addr proto.Address, payload []byte)
 
-// Session is a logical encrypted multiplexed tunnel spanning 1..N WebSocket carriers.
-// Active streams survive carrier drops, Wi-Fi/5G roaming, and parallel striping.
+// Session is a logical encrypted multiplexed tunnel spanning 1..N carriers (WebSocket or HTTP/2).
 type Session struct {
 	ID       [16]byte
 	IsServer bool
@@ -63,14 +64,14 @@ type Session struct {
 
 	// Carrier pool
 	carrierMu   sync.RWMutex
-	carriers    []*carrier.Carrier
+	carriers    []carrier.Conn
 	carrierIdx  atomic.Uint64
-	carrierWait chan struct{} // signaled when a carrier is added
+	carrierWait chan struct{}
 
-	// Reliable sequencing & replay buffer (for zero-drop failover)
+	// Reliable sequencing & replay buffer (for zero-drop failover/roaming)
 	sendSeqMu   sync.Mutex
 	nextSendSeq uint64
-	unacked     map[uint64][]byte // seq -> encrypted wire packet ready to replay
+	unacked     map[uint64][]byte
 	peerAckSeq  uint64
 
 	recvSeqMu   sync.Mutex
@@ -127,19 +128,19 @@ func New(id [16]byte, cipher *acrypto.SessionCipher, isServer bool, onOpen Strea
 	return s
 }
 
-// AttachCarrier binds a WebSocket carrier to this session and starts its read loop.
-// If there are unacked reliable frames from a previous dropped carrier, they are replayed immediately.
-func (s *Session) AttachCarrier(c *carrier.Carrier, onDetach func(*carrier.Carrier, error)) {
+// AttachCarrier binds a WebSocket or HTTP/2 carrier to this session and starts its read loop.
+func (s *Session) AttachCarrier(c carrier.Conn, onDetach func(carrier.Conn, error)) {
 	if s.closed.Load() {
 		_ = c.Close()
 		return
 	}
+	ep := c.GetEndpoint()
 	s.carrierMu.Lock()
 	s.carriers = append(s.carriers, c)
-	if c.Endpoint.Name != "" {
-		s.endpoint.Store(c.Endpoint.Name)
-	} else if c.Endpoint.URL != "" {
-		s.endpoint.Store(c.Endpoint.URL)
+	if ep.Name != "" {
+		s.endpoint.Store(ep.Name)
+	} else if ep.URL != "" {
+		s.endpoint.Store(ep.URL)
 	}
 	s.carrierMu.Unlock()
 
@@ -148,7 +149,6 @@ func (s *Session) AttachCarrier(c *carrier.Carrier, onDetach func(*carrier.Carri
 	default:
 	}
 
-	// Replay any unacked frames on the newly attached carrier so streams resume immediately.
 	go s.replayUnackedOn(c)
 	go s.readLoop(c, onDetach)
 }
@@ -160,10 +160,10 @@ func (s *Session) ActiveCarriers() int {
 	return len(s.carriers)
 }
 
-func (s *Session) removeCarrier(c *carrier.Carrier) {
+func (s *Session) removeCarrier(c carrier.Conn) {
 	s.carrierMu.Lock()
 	for i, existing := range s.carriers {
-		if existing.ID == c.ID {
+		if existing.CarrierID() == c.CarrierID() {
 			s.carriers = append(s.carriers[:i], s.carriers[i+1:]...)
 			break
 		}
@@ -172,7 +172,7 @@ func (s *Session) removeCarrier(c *carrier.Carrier) {
 	_ = c.Close()
 }
 
-func (s *Session) pickCarrier() *carrier.Carrier {
+func (s *Session) pickCarrier() carrier.Conn {
 	s.carrierMu.RLock()
 	defer s.carrierMu.RUnlock()
 	n := len(s.carriers)
@@ -201,7 +201,6 @@ func (s *Session) SendReliable(f *proto.Frame) error {
 	}
 	wire := s.Cipher.Seal(raw)
 
-	// Bound replay buffer memory if peer is severely stalled
 	if len(s.unacked) < MaxUnackedFrames {
 		s.unacked[seq] = wire
 	}
@@ -210,13 +209,13 @@ func (s *Session) SendReliable(f *proto.Frame) error {
 	return s.writeWire(wire)
 }
 
-// SendUnreliable encrypts and sends an unreliable frame (UDP datagram, Ping, Pong, Ack) with Seq=0.
+// SendUnreliable encrypts and sends an unreliable frame (UDP, Ping, Pong, Ack, WindowUpdate) with Seq=0.
 func (s *Session) SendUnreliable(f *proto.Frame) error {
 	if s.closed.Load() {
 		return ErrSessionClosed
 	}
 	f.Seq = 0
-	raw, err := f.Encode(0) // Keep UDP/Ping/Ack compact for lowest latency
+	raw, err := f.Encode(0)
 	if err != nil {
 		return err
 	}
@@ -225,11 +224,9 @@ func (s *Session) SendUnreliable(f *proto.Frame) error {
 }
 
 func (s *Session) writeWire(wire []byte) error {
-	// Try up to 3 live carriers if one fails mid-write
 	for attempt := 0; attempt < 3; attempt++ {
 		c := s.pickCarrier()
 		if c == nil {
-			// Wait briefly for a replacement carrier during roaming/failover
 			select {
 			case <-s.carrierWait:
 				continue
@@ -249,13 +246,12 @@ func (s *Session) writeWire(wire []byte) error {
 	return ErrNoCarriers
 }
 
-func (s *Session) replayUnackedOn(c *carrier.Carrier) {
+func (s *Session) replayUnackedOn(c carrier.Conn) {
 	s.sendSeqMu.Lock()
 	if len(s.unacked) == 0 {
 		s.sendSeqMu.Unlock()
 		return
 	}
-	// Collect ordered seqs from peerAckSeq+1 .. nextSendSeq-1
 	start := s.peerAckSeq + 1
 	end := s.nextSendSeq
 	packets := make([][]byte, 0, len(s.unacked))
@@ -274,7 +270,7 @@ func (s *Session) replayUnackedOn(c *carrier.Carrier) {
 	}
 }
 
-func (s *Session) readLoop(c *carrier.Carrier, onDetach func(*carrier.Carrier, error)) {
+func (s *Session) readLoop(c carrier.Conn, onDetach func(carrier.Conn, error)) {
 	var exitErr error
 	defer func() {
 		s.removeCarrier(c)
@@ -306,7 +302,6 @@ func (s *Session) readLoop(c *carrier.Carrier, onDetach func(*carrier.Carrier, e
 }
 
 func (s *Session) handleFrame(f *proto.Frame) {
-	// Unreliable control / UDP frames bypass ordering
 	if f.Seq == 0 {
 		switch f.Type {
 		case proto.FrameUDPPacket:
@@ -317,10 +312,7 @@ func (s *Session) handleFrame(f *proto.Frame) {
 				}
 			}
 		case proto.FramePing:
-			_ = s.SendUnreliable(&proto.Frame{
-				Type:    proto.FramePong,
-				Payload: f.Payload,
-			})
+			_ = s.SendUnreliable(&proto.Frame{Type: proto.FramePong, Payload: f.Payload})
 		case proto.FramePong:
 			if len(f.Payload) == 8 {
 				sentNs := int64(binary.BigEndian.Uint64(f.Payload))
@@ -331,21 +323,25 @@ func (s *Session) handleFrame(f *proto.Frame) {
 			}
 		case proto.FrameSessionAck:
 			if len(f.Payload) == 8 {
-				acked := binary.BigEndian.Uint64(f.Payload)
-				s.processAck(acked)
+				s.processAck(binary.BigEndian.Uint64(f.Payload))
+			}
+		case proto.FrameWindowUpdate:
+			if len(f.Payload) == 4 {
+				delta := int64(binary.BigEndian.Uint32(f.Payload))
+				if st := s.getStream(f.StreamID); st != nil {
+					st.addSendWindow(delta)
+				}
 			}
 		}
 		return
 	}
 
-	// Reliable frame: deduplicate & deliver strictly in order across parallel carriers
 	var ready []*proto.Frame
 	var sendAckNow bool
 	var ackVal uint64
 
 	s.recvSeqMu.Lock()
 	if f.Seq < s.nextRecvSeq {
-		// Duplicate frame from replay — ignore, send ACK to help peer prune
 		ackVal = s.nextRecvSeq - 1
 		sendAckNow = true
 	} else if f.Seq == s.nextRecvSeq {
@@ -414,20 +410,17 @@ func (s *Session) dispatchReliableFrame(f *proto.Frame) {
 		}
 
 	case proto.FrameStreamData:
-		st := s.getStream(f.StreamID)
-		if st != nil {
+		if st := s.getStream(f.StreamID); st != nil {
 			st.deliverData(f.Payload)
 		}
 
 	case proto.FrameStreamFin:
-		st := s.getStream(f.StreamID)
-		if st != nil {
+		if st := s.getStream(f.StreamID); st != nil {
 			st.deliverEOF()
 		}
 
 	case proto.FrameStreamRst:
-		st := s.getStream(f.StreamID)
-		if st != nil {
+		if st := s.getStream(f.StreamID); st != nil {
 			st.deliverReset()
 		}
 	}
@@ -454,9 +447,16 @@ func (s *Session) sendOpenAck(streamID uint32, err error) {
 func (s *Session) sendAck(seq uint64) {
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], seq)
+	_ = s.SendUnreliable(&proto.Frame{Type: proto.FrameSessionAck, Payload: buf[:]})
+}
+
+func (s *Session) sendWindowUpdate(streamID uint32, delta uint32) {
+	var buf [4]byte
+	binary.BigEndian.PutUint32(buf[:], delta)
 	_ = s.SendUnreliable(&proto.Frame{
-		Type:    proto.FrameSessionAck,
-		Payload: buf[:],
+		Type:     proto.FrameWindowUpdate,
+		StreamID: streamID,
+		Payload:  buf[:],
 	})
 }
 
@@ -497,10 +497,7 @@ func (s *Session) ackLoop() {
 func (s *Session) Ping() error {
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], uint64(time.Now().UnixNano()))
-	return s.SendUnreliable(&proto.Frame{
-		Type:    proto.FramePing,
-		Payload: buf[:],
-	})
+	return s.SendUnreliable(&proto.Frame{Type: proto.FramePing, Payload: buf[:]})
 }
 
 // SendUDP sends a full-cone UDP datagram through the tunnel.
@@ -625,18 +622,23 @@ func (s *Session) Close() error {
 	return nil
 }
 
-// Stream implements net.Conn over a multiplexed Aether session.
+// Stream implements net.Conn with per-stream windowed flow control.
 type Stream struct {
 	ID      uint32
 	sess    *Session
 	openCh  chan error
 	openOne sync.Once
 
-	readMu    sync.Mutex
-	readCond  *sync.Cond
-	readBuf   []byte
-	readEOF   bool
-	readReset bool
+	readMu       sync.Mutex
+	readCond     *sync.Cond
+	readBuf      []byte
+	readDrained  int
+	readEOF      bool
+	readReset    bool
+
+	winMu      sync.Mutex
+	winCond    *sync.Cond
+	sendWindow int64
 
 	writeClosed atomic.Bool
 	closed      atomic.Bool
@@ -644,18 +646,25 @@ type Stream struct {
 
 func newStream(sess *Session, id uint32) *Stream {
 	st := &Stream{
-		ID:     id,
-		sess:   sess,
-		openCh: make(chan error, 1),
+		ID:         id,
+		sess:       sess,
+		openCh:     make(chan error, 1),
+		sendWindow: InitialStreamWindow,
 	}
 	st.readCond = sync.NewCond(&st.readMu)
+	st.winCond = sync.NewCond(&st.winMu)
 	return st
 }
 
 func (st *Stream) resolveOpen(err error) {
-	st.openOne.Do(func() {
-		st.openCh <- err
-	})
+	st.openOne.Do(func() { st.openCh <- err })
+}
+
+func (st *Stream) addSendWindow(delta int64) {
+	st.winMu.Lock()
+	st.sendWindow += delta
+	st.winCond.Broadcast()
+	st.winMu.Unlock()
 }
 
 func (st *Stream) deliverData(data []byte) {
@@ -680,12 +689,13 @@ func (st *Stream) deliverReset() {
 	st.readReset = true
 	st.readCond.Broadcast()
 	st.readMu.Unlock()
+	st.winMu.Lock()
+	st.winCond.Broadcast()
+	st.winMu.Unlock()
 }
 
 func (st *Stream) Read(p []byte) (int, error) {
 	st.readMu.Lock()
-	defer st.readMu.Unlock()
-
 	for len(st.readBuf) == 0 && !st.readEOF && !st.readReset {
 		st.readCond.Wait()
 	}
@@ -696,9 +706,21 @@ func (st *Stream) Read(p []byte) (int, error) {
 		} else {
 			st.readBuf = st.readBuf[n:]
 		}
+		st.readDrained += n
+		var credit uint32
+		if st.readDrained >= WindowUpdateThreshold {
+			credit = uint32(st.readDrained)
+			st.readDrained = 0
+		}
+		st.readMu.Unlock()
+		if credit > 0 {
+			st.sess.sendWindowUpdate(st.ID, credit)
+		}
 		return n, nil
 	}
-	if st.readReset {
+	reset := st.readReset
+	st.readMu.Unlock()
+	if reset {
 		return 0, ErrStreamReset
 	}
 	return 0, io.EOF
@@ -714,6 +736,19 @@ func (st *Stream) Write(p []byte) (int, error) {
 		if len(chunk) > StreamChunkSize {
 			chunk = p[:StreamChunkSize]
 		}
+
+		// Wait for per-stream send window credit (prevents OOM on mobile during huge downloads)
+		st.winMu.Lock()
+		for st.sendWindow <= 0 && !st.closed.Load() && !st.writeClosed.Load() && !st.readReset {
+			st.winCond.Wait()
+		}
+		if st.closed.Load() || st.writeClosed.Load() || st.readReset {
+			st.winMu.Unlock()
+			return total, net.ErrClosed
+		}
+		st.sendWindow -= int64(len(chunk))
+		st.winMu.Unlock()
+
 		err := st.sess.SendReliable(&proto.Frame{
 			Type:     proto.FrameStreamData,
 			StreamID: st.ID,
@@ -728,11 +763,13 @@ func (st *Stream) Write(p []byte) (int, error) {
 	return total, nil
 }
 
-// CloseWrite sends a TCP-like half-close FIN without closing the read side.
 func (st *Stream) CloseWrite() error {
 	if st.writeClosed.Swap(true) {
 		return nil
 	}
+	st.winMu.Lock()
+	st.winCond.Broadcast()
+	st.winMu.Unlock()
 	return st.sess.SendReliable(&proto.Frame{
 		Type:     proto.FrameStreamFin,
 		StreamID: st.ID,
@@ -751,6 +788,9 @@ func (st *Stream) Close() error {
 		})
 	}
 	st.deliverEOF()
+	st.winMu.Lock()
+	st.winCond.Broadcast()
+	st.winMu.Unlock()
 	return nil
 }
 

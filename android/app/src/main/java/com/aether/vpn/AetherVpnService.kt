@@ -5,12 +5,18 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.ComponentName
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.IpPrefix
+import android.net.Network
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.service.quicksettings.TileService
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import java.net.InetAddress
 
 class AetherVpnService : VpnService() {
 
@@ -26,6 +32,7 @@ class AetherVpnService : VpnService() {
     }
 
     private var tunInterface: ParcelFileDescriptor? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -54,17 +61,38 @@ class AetherVpnService : VpnService() {
                 .addRoute("0.0.0.0", 0)
                 .addDnsServer("1.1.1.1")
                 .addDnsServer("8.8.8.8")
-                .addDisallowedApplication(packageName) // Prevent VPN routing loop
+                .addDisallowedApplication(packageName)
+
+            // Split tunneling: exclude private LAN ranges on Android 13+ so local traffic stays direct
+            if (cfg.bypassLan && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                try {
+                    builder.excludeRoute(IpPrefix(InetAddress.getByName("10.0.0.0"), 8))
+                    builder.excludeRoute(IpPrefix(InetAddress.getByName("172.16.0.0"), 12))
+                    builder.excludeRoute(IpPrefix(InetAddress.getByName("192.168.0.0"), 16))
+                } catch (_: Exception) {
+                }
+            }
+
+            // Per-app bypass list (e.g. local banking apps)
+            if (cfg.bypassApps.isNotBlank()) {
+                cfg.bypassApps.split(",").map { it.trim() }.filter { it.isNotEmpty() }.forEach { pkg ->
+                    try {
+                        builder.addDisallowedApplication(pkg)
+                    } catch (_: Exception) {
+                    }
+                }
+            }
 
             val pfd = builder.establish() ?: throw IllegalStateException("VpnService.Builder.establish() returned null")
             tunInterface = pfd
 
-            // Detach FD so Go's os.NewFile owns its lifecycle cleanly
             val fd = pfd.detachFd()
             tunInterface = null
 
             Aethermobile.startVPN(fd.toLong(), MTU.toLong(), cfg.toCoreJson())
-            updateNotification("AetherVPN Connected (Multi-Path Active)")
+            registerRoamingCallback()
+            updateNotification("AetherVPN Connected (Multi-Path + uTLS)")
+            refreshQuickTile()
         } catch (e: Exception) {
             Log.e("AetherVPN", "Failed to start VPN", e)
             lastError = e.message ?: e.toString()
@@ -73,7 +101,41 @@ class AetherVpnService : VpnService() {
         }
     }
 
+    private fun registerRoamingCallback() {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return
+        unregisterRoamingCallback()
+        var firstCallback = true
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                if (firstCallback) {
+                    firstCallback = false
+                    return
+                }
+                // Wi-Fi <-> 5G switch: immediately attach fresh carriers on the new interface!
+                try {
+                    Aethermobile.onNetworkChanged()
+                } catch (_: Throwable) {
+                }
+            }
+        }
+        try {
+            cm.registerDefaultNetworkCallback(cb)
+            networkCallback = cb
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun unregisterRoamingCallback() {
+        val cb = networkCallback ?: return
+        networkCallback = null
+        try {
+            getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb)
+        } catch (_: Exception) {
+        }
+    }
+
     private fun stopTunnel() {
+        unregisterRoamingCallback()
         try {
             Aethermobile.stopVPN()
         } catch (_: Exception) {
@@ -84,6 +146,14 @@ class AetherVpnService : VpnService() {
         }
         tunInterface = null
         stopForeground(STOP_FOREGROUND_REMOVE)
+        refreshQuickTile()
+    }
+
+    private fun refreshQuickTile() {
+        try {
+            TileService.requestListeningState(this, ComponentName(this, AetherTileService::class.java))
+        } catch (_: Exception) {
+        }
     }
 
     override fun onDestroy() {

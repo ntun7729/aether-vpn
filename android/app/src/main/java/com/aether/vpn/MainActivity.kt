@@ -2,9 +2,12 @@ package com.aether.vpn
 
 import aethermobile.Aethermobile
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.net.VpnService
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -16,6 +19,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -82,15 +86,30 @@ fun AetherScreen(
     onConnect: (AetherConfig) -> Unit,
     onDisconnect: () -> Unit
 ) {
+    val context = LocalContext.current
     var psk by remember { mutableStateOf(initial.psk) }
     var primaryUrl by remember { mutableStateOf(initial.primaryUrl) }
     var fallbackUrl by remember { mutableStateOf(initial.fallbackUrl) }
     var cfCleanIp by remember { mutableStateOf(initial.cfCleanIp) }
+    var transport by remember { mutableStateOf(initial.transport) }
     var carriers by remember { mutableStateOf(initial.carriers.toString()) }
+    var bypassLan by remember { mutableStateOf(initial.bypassLan) }
+    var bypassApps by remember { mutableStateOf(initial.bypassApps) }
 
     var running by remember { mutableStateOf(false) }
     var statsText by remember { mutableStateOf("Disconnected") }
     var errorText by remember { mutableStateOf<String?>(null) }
+
+    fun currentConfig() = AetherConfig(
+        psk = psk,
+        primaryUrl = primaryUrl,
+        fallbackUrl = fallbackUrl,
+        cfCleanIp = cfCleanIp,
+        transport = transport,
+        carriers = carriers.toIntOrNull() ?: 3,
+        bypassLan = bypassLan,
+        bypassApps = bypassApps
+    )
 
     LaunchedEffect(Unit) {
         while (true) {
@@ -119,13 +138,13 @@ fun AetherScreen(
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
             .padding(20.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp)
+        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Text("AetherVPN", fontSize = 28.sp, fontWeight = FontWeight.Bold)
-        Text("Multi-Path Encrypted Tunnel (Railway / Render / CF)", color = Color.Gray, fontSize = 13.sp)
+        Text("AetherVPN v1.1", fontSize = 26.sp, fontWeight = FontWeight.Bold)
+        Text("uTLS Chrome · Multi-Path WS/H2 · Auto-Failover · AdBlock", color = Color.Gray, fontSize = 12.sp)
 
         Card(modifier = Modifier.fillMaxWidth()) {
-            Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(
                     if (running) "CONNECTED" else "DISCONNECTED",
                     color = if (running) Color(0xFF4ADE80) else Color(0xFFF87171),
@@ -140,13 +159,7 @@ fun AetherScreen(
 
         Button(
             onClick = {
-                val cfg = AetherConfig(
-                    psk = psk,
-                    primaryUrl = primaryUrl,
-                    fallbackUrl = fallbackUrl,
-                    cfCleanIp = cfCleanIp,
-                    carriers = carriers.toIntOrNull() ?: 3
-                )
+                val cfg = currentConfig()
                 if (running) onDisconnect() else onConnect(cfg)
             },
             modifier = Modifier.fillMaxWidth().height(52.dp),
@@ -157,10 +170,47 @@ fun AetherScreen(
             Text(if (running) "DISCONNECT" else "CONNECT", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
         }
 
+        // 1-Tap aether:// URI Import / Copy
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+            OutlinedButton(
+                onClick = {
+                    val cm = context.getSystemService(ClipboardManager::class.java)
+                    val clip = cm?.primaryClip?.getItemAt(0)?.text?.toString() ?: ""
+                    val imported = AetherConfig.fromShareUri(clip, currentConfig())
+                    if (imported != null) {
+                        psk = imported.psk
+                        primaryUrl = imported.primaryUrl
+                        fallbackUrl = imported.fallbackUrl
+                        cfCleanIp = imported.cfCleanIp
+                        transport = imported.transport
+                        carriers = imported.carriers.toString()
+                        onSave(imported)
+                        Toast.makeText(context, "Imported aether:// config!", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(context, "Copy an aether:// link first", Toast.LENGTH_SHORT).show()
+                    }
+                },
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("Import Link", fontSize = 13.sp)
+            }
+            OutlinedButton(
+                onClick = {
+                    val uri = currentConfig().toShareUri()
+                    val cm = context.getSystemService(ClipboardManager::class.java)
+                    cm?.setPrimaryClip(ClipData.newPlainText("AetherVPN", uri))
+                    Toast.makeText(context, "Copied aether:// link!", Toast.LENGTH_SHORT).show()
+                },
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("Copy Share Link", fontSize = 13.sp)
+            }
+        }
+
         OutlinedTextField(
             value = primaryUrl,
             onValueChange = { primaryUrl = it },
-            label = { Text("Primary Server URL (Railway WSS)") },
+            label = { Text("Primary Server URL (Railway)") },
             singleLine = true,
             modifier = Modifier.fillMaxWidth()
         )
@@ -168,7 +218,7 @@ fun AetherScreen(
         OutlinedTextField(
             value = fallbackUrl,
             onValueChange = { fallbackUrl = it },
-            label = { Text("Fallback Server URL (Render / CF Worker WSS)") },
+            label = { Text("Fallback URL (Render / CF Worker)") },
             singleLine = true,
             modifier = Modifier.fillMaxWidth()
         )
@@ -181,36 +231,53 @@ fun AetherScreen(
             modifier = Modifier.fillMaxWidth()
         )
 
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
             OutlinedTextField(
                 value = cfCleanIp,
                 onValueChange = { cfCleanIp = it },
-                label = { Text("Optional Clean IP") },
+                label = { Text("Clean IP") },
                 singleLine = true,
                 modifier = Modifier.weight(2f)
             )
             OutlinedTextField(
+                value = transport,
+                onValueChange = { transport = it },
+                label = { Text("Mode") },
+                singleLine = true,
+                modifier = Modifier.weight(1.1f)
+            )
+            OutlinedTextField(
                 value = carriers,
                 onValueChange = { carriers = it },
-                label = { Text("Carriers") },
+                label = { Text("Pool") },
                 singleLine = true,
-                modifier = Modifier.weight(1f)
+                modifier = Modifier.weight(0.9f)
             )
         }
 
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Bypass Local LAN (Save Quota)", fontSize = 14.sp)
+            Switch(checked = bypassLan, onCheckedChange = { bypassLan = it })
+        }
+
+        OutlinedTextField(
+            value = bypassApps,
+            onValueChange = { bypassApps = it },
+            label = { Text("Bypass Apps (comma-separated packages)") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
+
         OutlinedButton(
             onClick = {
-                onSave(
-                    AetherConfig(
-                        psk = psk,
-                        primaryUrl = primaryUrl,
-                        fallbackUrl = fallbackUrl,
-                        cfCleanIp = cfCleanIp,
-                        carriers = carriers.toIntOrNull() ?: 3
-                    )
-                )
+                onSave(currentConfig())
+                Toast.makeText(context, "Settings saved", Toast.LENGTH_SHORT).show()
             },
-            modifier = Modifier.fillMaxWidth().align(Alignment.CenterHorizontally)
+            modifier = Modifier.fillMaxWidth()
         ) {
             Text("Save Settings")
         }

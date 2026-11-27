@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
@@ -306,11 +307,13 @@ func parseSocksAddrBytes(b []byte) (string, uint16, int, error) {
 
 func main() {
 	cfgPath := flag.String("config", "", "Path to JSON config file")
-	listen := flag.String("listen", "127.0.0.1:1080", "Local SOCKS5/HTTP proxy address")
-	serverURL := flag.String("server", "", "Primary WebSocket server URL (e.g. wss://app.up.railway.app/ws/sync)")
-	fallbackURL := flag.String("fallback", "", "Optional fallback WebSocket URL (e.g. Render or CF Worker)")
+	listen := flag.String("listen", "", "Local SOCKS5/HTTP proxy address (overrides config)")
+	serverURL := flag.String("server", "", "Primary server URL (e.g. wss://app.up.railway.app/ws/sync)")
+	fallbackURL := flag.String("fallback", "", "Optional fallback URL (e.g. Render or CF Worker)")
+	transport := flag.String("transport", "auto", "Carrier transport: auto, ws, or h2")
 	psk := flag.String("psk", "", "Pre-shared secret key")
-	carriers := flag.Int("carriers", 3, "Number of parallel WebSocket carriers")
+	carriers := flag.Int("carriers", 3, "Number of parallel carriers")
+	exportURI := flag.Bool("export-uri", false, "Print aether:// share URI for 1-tap Android import and exit")
 	flag.Parse()
 
 	var cfg Config
@@ -322,6 +325,9 @@ func main() {
 		if err := json.Unmarshal(raw, &cfg); err != nil {
 			log.Fatalf("invalid config JSON: %v", err)
 		}
+		if *listen != "" {
+			cfg.Listen = *listen
+		}
 	} else {
 		cfg = Config{
 			Listen:   *listen,
@@ -329,14 +335,37 @@ func main() {
 			Carriers: *carriers,
 		}
 		if *serverURL != "" {
-			cfg.Endpoints = append(cfg.Endpoints, carrier.Endpoint{Name: "primary", URL: *serverURL, Priority: 0})
+			cfg.Endpoints = append(cfg.Endpoints, carrier.Endpoint{Name: "primary", URL: *serverURL, Transport: *transport, Priority: 0})
 		}
 		if *fallbackURL != "" {
-			cfg.Endpoints = append(cfg.Endpoints, carrier.Endpoint{Name: "fallback", URL: *fallbackURL, Priority: 1})
+			cfg.Endpoints = append(cfg.Endpoints, carrier.Endpoint{Name: "fallback", URL: *fallbackURL, Transport: *transport, Priority: 1})
 		}
 	}
 	if cfg.Listen == "" {
 		cfg.Listen = "127.0.0.1:1080"
+	}
+
+	if *exportURI {
+		shareObj := map[string]any{
+			"psk":       cfg.PSK,
+			"carriers":  cfg.Carriers,
+			"transport": *transport,
+		}
+		if len(cfg.Endpoints) > 0 {
+			shareObj["primary_url"] = cfg.Endpoints[0].URL
+			if cfg.Endpoints[0].ResolveIP != "" {
+				shareObj["cf_clean_ip"] = cfg.Endpoints[0].ResolveIP
+			}
+			if cfg.Endpoints[0].Transport != "" {
+				shareObj["transport"] = cfg.Endpoints[0].Transport
+			}
+		}
+		if len(cfg.Endpoints) > 1 {
+			shareObj["fallback_url"] = cfg.Endpoints[1].URL
+		}
+		raw, _ := json.Marshal(shareObj)
+		fmt.Println("aether://" + base64.RawURLEncoding.EncodeToString(raw))
+		return
 	}
 
 	var proxy *ProxyServer

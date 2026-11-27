@@ -21,6 +21,7 @@ const (
 	FramePing          byte = 0x07 // Bidirectional: RTT probe
 	FramePong          byte = 0x08 // Bidirectional: RTT probe response
 	FrameSessionAck    byte = 0x09 // Bidirectional: cumulative/selective frame sequence ACK for zero-drop failover
+	FrameWindowUpdate  byte = 0x0A // Bidirectional: per-stream receive window credit (Payload = uint32 delta)
 )
 
 // Address types for StreamOpen and UDPPacket.
