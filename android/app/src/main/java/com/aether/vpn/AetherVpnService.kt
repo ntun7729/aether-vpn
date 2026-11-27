@@ -25,7 +25,7 @@ class AetherVpnService : VpnService() {
         const val ACTION_STOP = "com.aether.vpn.STOP"
         private const val CHANNEL_ID = "aether_vpn_channel"
         private const val NOTIF_ID = 1001
-        private const val MTU = 1280 // Prevents outer TCP segmentation of QUIC datagrams on 4G/5G
+        private const val MTU = 1500 // Full Ethernet MTU so 1350-1472B Google/Cloudflare QUIC packets never hit EMSGSIZE!
 
         @Volatile
         var lastError: String? = null

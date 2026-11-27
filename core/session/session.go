@@ -18,9 +18,9 @@ import (
 )
 
 const (
-	StreamChunkSize       = 60 * 1024 // 60 KB bulk chunks (cuts syscalls & AEAD calls in half!)
+	StreamChunkSize       = 60 * 1024 // 60 KB bulk chunks
 	DefaultMaxPad         = 24
-	InitialStreamWindow   = 4 << 20   // 4 MB per-stream flow control window (uncaps high-BDP 100+ Mbps)
+	InitialStreamWindow   = 4 << 20   // 4 MB per-stream flow control window
 	WindowUpdateThreshold = 512 << 10 // Send WINDOW_UPDATE every 512 KB drained
 	MaxStreamBuffer       = 6 << 20   // 6 MB hard cap per stream ring buffer
 )
@@ -58,8 +58,7 @@ type StreamOpenHandler func(ctx context.Context, s *Stream, addr proto.Address) 
 // UDPHandler is invoked when a UDP datagram arrives.
 type UDPHandler func(flowID uint32, addr proto.Address, payload []byte)
 
-// ringBuffer is a compact, non-leaking circular byte buffer that replaces slice reslicing.
-// Prevents the memory ballooning and Android GC stalls seen in Aether v1.
+// ringBuffer is a compact, non-leaking circular byte buffer.
 type ringBuffer struct {
 	buf  []byte
 	head int
@@ -126,7 +125,6 @@ func (r *ringBuffer) read(p []byte) int {
 	if r.size == 0 {
 		r.head = 0
 		r.tail = 0
-		// Shrink oversized buffers back down once drained to keep RAM tiny on Android
 		if len(r.buf) > 64*1024 {
 			r.buf = nil
 		}
@@ -142,8 +140,8 @@ func (r *ringBuffer) reset() {
 }
 
 // Session is an Aether v2 multiplexed encrypted tunnel spanning 1..N carriers.
-// Each stream is pinned to a carrier (streamID % N) to completely eliminate
-// cross-stream Head-of-Line blocking, and uses 0-RTT stream open.
+// Every Stream is strictly pinned to a single carrier.Conn instance for its entire lifetime
+// so Open -> Data -> Fin ALWAYS arrive in exact FIFO order even while other carriers join/leave.
 type Session struct {
 	ID       [16]byte
 	IsServer bool
@@ -156,7 +154,7 @@ type Session struct {
 	// Carrier pool
 	carrierMu   sync.RWMutex
 	carriers    []carrier.Conn
-	udpIdx      atomic.Uint64
+	pickIdx     atomic.Uint64
 	carrierWait chan struct{}
 
 	// Streams
@@ -267,67 +265,69 @@ func (s *Session) removeCarrier(c carrier.Conn) {
 	}
 	s.carrierMu.Unlock()
 	_ = c.Close()
+
+	// Reset any streams that were pinned exclusively to this dead carrier so they fail fast
+	// instead of hanging forever waiting for a FIN that will never arrive.
+	s.streamMu.RLock()
+	var dead []*Stream
+	for _, st := range s.streams {
+		if st.pinned != nil && st.pinned.CarrierID() == c.CarrierID() {
+			dead = append(dead, st)
+		}
+	}
+	s.streamMu.RUnlock()
+	for _, st := range dead {
+		st.deliverReset()
+	}
 }
 
-// pickCarrierForStream pins a stream to one healthy carrier (skipping degraded carriers).
-func (s *Session) pickCarrierForStream(streamID uint32) carrier.Conn {
+// pickHealthyCarrier selects a healthy carrier for a new stream or UDP flow.
+func (s *Session) pickHealthyCarrier() carrier.Conn {
 	s.carrierMu.RLock()
 	defer s.carrierMu.RUnlock()
 	n := len(s.carriers)
 	if n == 0 {
 		return nil
 	}
-	start := uint64(streamID) % uint64(n)
-	if streamID == 0 {
-		start = s.udpIdx.Add(1) % uint64(n)
-	}
-	// Prefer a non-degraded carrier starting from the stream's pinned slot
+	start := s.pickIdx.Add(1) % uint64(n)
 	for offset := 0; offset < n; offset++ {
 		c := s.carriers[(start+uint64(offset))%uint64(n)]
-		if !c.Degraded() {
+		if !c.IsClosed() && !c.Degraded() {
 			return c
 		}
 	}
 	return s.carriers[start]
 }
 
-func (s *Session) sendFrame(f *proto.Frame, pad int) error {
+// pickCarrierForFlow deterministically picks a carrier for a UDP flowID.
+func (s *Session) pickCarrierForFlow(flowID uint32) carrier.Conn {
+	s.carrierMu.RLock()
+	defer s.carrierMu.RUnlock()
+	n := len(s.carriers)
+	if n == 0 {
+		return nil
+	}
+	return s.carriers[uint64(flowID)%uint64(n)]
+}
+
+func (s *Session) sendOnCarrier(c carrier.Conn, f *proto.Frame, pad int, highPriority bool) error {
 	if s.closed.Load() {
 		return ErrSessionClosed
+	}
+	if c == nil || c.IsClosed() {
+		return ErrNoCarriers
 	}
 	raw, err := f.Encode(pad)
 	if err != nil {
 		return err
 	}
 	wire := s.Cipher.Seal(raw)
-	// Only non-stream-ordered frames (Ping/Pong/WindowUpdate/UDP/Rst) use the high-priority lane
-	// so StreamOpen -> StreamData -> StreamFin ALWAYS preserve strict FIFO order!
-	highPriority := f.Type == proto.FramePing ||
-		f.Type == proto.FramePong ||
-		f.Type == proto.FrameWindowUpdate ||
-		f.Type == proto.FrameUDPPacket ||
-		f.Type == proto.FrameStreamRst
-
-	for attempt := 0; attempt < 3; attempt++ {
-		c := s.pickCarrierForStream(f.StreamID)
-		if c == nil {
-			select {
-			case <-s.carrierWait:
-				continue
-			case <-time.After(1500 * time.Millisecond):
-				return ErrNoCarriers
-			case <-s.ctx.Done():
-				return ErrSessionClosed
-			}
-		}
-		if err := c.WritePacketPriority(wire, highPriority); err != nil {
-			s.removeCarrier(c)
-			continue
-		}
-		s.txBytes.Add(uint64(len(wire)))
-		return nil
+	if err := c.WritePacketPriority(wire, highPriority); err != nil {
+		s.removeCarrier(c)
+		return err
 	}
-	return ErrNoCarriers
+	s.txBytes.Add(uint64(len(wire)))
+	return nil
 }
 
 func (s *Session) readLoop(c carrier.Conn, onDetach func(carrier.Conn, error)) {
@@ -357,11 +357,11 @@ func (s *Session) readLoop(c carrier.Conn, onDetach func(carrier.Conn, error)) {
 			exitErr = err
 			return
 		}
-		s.handleFrame(frame)
+		s.handleFrame(c, frame)
 	}
 }
 
-func (s *Session) handleFrame(f *proto.Frame) {
+func (s *Session) handleFrame(src carrier.Conn, f *proto.Frame) {
 	switch f.Type {
 	case proto.FrameUDPPacket:
 		if s.onUDP != nil {
@@ -372,7 +372,8 @@ func (s *Session) handleFrame(f *proto.Frame) {
 		}
 
 	case proto.FramePing:
-		_ = s.sendFrame(&proto.Frame{Type: proto.FramePong, Payload: f.Payload}, 0)
+		// Always reply Pong on the EXACT same carrier that received Ping (refreshes its read deadline!)
+		_ = s.sendOnCarrier(src, &proto.Frame{Type: proto.FramePong, Payload: f.Payload}, 0, true)
 
 	case proto.FramePong:
 		if len(f.Payload) == 8 {
@@ -397,19 +398,19 @@ func (s *Session) handleFrame(f *proto.Frame) {
 		}
 		addr, _, err := proto.DecodeAddress(f.Payload)
 		if err != nil {
-			_ = s.sendFrame(&proto.Frame{Type: proto.FrameStreamRst, StreamID: f.StreamID}, 0)
+			_ = s.sendOnCarrier(src, &proto.Frame{Type: proto.FrameStreamRst, StreamID: f.StreamID}, 0, true)
 			return
 		}
-		st := s.registerStream(f.StreamID)
+		// Pin server stream to the exact carrier that delivered FrameStreamOpen!
+		st := s.registerStream(f.StreamID, src)
 		go func() {
 			if err := s.onStreamOpen(s.ctx, st, addr); err != nil {
-				_ = s.sendFrame(&proto.Frame{Type: proto.FrameStreamRst, StreamID: f.StreamID}, 0)
+				_ = s.sendOnCarrier(src, &proto.Frame{Type: proto.FrameStreamRst, StreamID: f.StreamID}, 0, true)
 				_ = st.Close()
 			}
 		}()
 
 	case proto.FrameStreamOpenAck:
-		// Backward-compatible: if server sends error Ack, reset the 0-RTT stream
 		if len(f.Payload) > 0 && f.Payload[0] != 0 {
 			if st := s.getStream(f.StreamID); st != nil {
 				st.deliverReset()
@@ -433,62 +434,77 @@ func (s *Session) handleFrame(f *proto.Frame) {
 	}
 }
 
-func (s *Session) sendWindowUpdate(streamID uint32, delta uint32) {
+func (s *Session) sendWindowUpdate(st *Stream, delta uint32) {
 	var buf [4]byte
 	binary.BigEndian.PutUint32(buf[:], delta)
-	_ = s.sendFrame(&proto.Frame{
+	_ = s.sendOnCarrier(st.pinned, &proto.Frame{
 		Type:     proto.FrameWindowUpdate,
-		StreamID: streamID,
+		StreamID: st.ID,
 		Payload:  buf[:],
-	}, 0)
+	}, 0, true)
 }
 
-// Ping sends an encrypted in-band RTT keepalive probe on EVERY active carrier
-// so cloud proxies (Railway/Render/CF) never drop idle WebSockets!
+// Ping sends an encrypted in-band RTT keepalive probe on EVERY active carrier.
 func (s *Session) Ping() error {
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], uint64(time.Now().UnixNano()))
 	f := &proto.Frame{Type: proto.FramePing, Payload: buf[:]}
-	raw, err := f.Encode(0)
-	if err != nil {
-		return err
-	}
 	s.carrierMu.RLock()
 	carriers := append([]carrier.Conn(nil), s.carriers...)
 	s.carrierMu.RUnlock()
 	for _, c := range carriers {
-		wire := s.Cipher.Seal(raw)
-		if err := c.WritePacketPriority(wire, true); err != nil {
-			s.removeCarrier(c)
-		}
+		_ = s.sendOnCarrier(c, f, 0, true)
 	}
 	return nil
 }
 
-// SendUDP sends a full-cone UDP datagram through the tunnel (QUIC / DNS / VoIP).
+// SendUDP sends a full-cone UDP datagram through the tunnel on the high-priority lane.
 func (s *Session) SendUDP(flowID uint32, host string, port uint16, payload []byte) error {
-	return s.sendFrame(&proto.Frame{
+	c := s.pickCarrierForFlow(flowID)
+	if c == nil {
+		return ErrNoCarriers
+	}
+	return s.sendOnCarrier(c, &proto.Frame{
 		Type:     proto.FrameUDPPacket,
 		StreamID: flowID,
 		Payload:  proto.EncodeUDPPacket(host, port, payload),
-	}, 0)
+	}, 0, true)
 }
 
-// OpenStream opens a 0-RTT multiplexed TCP stream to host:port!
-// Returns immediately so the client can transmit TLS ClientHello in the very same burst
-// without waiting an extra round-trip for StreamOpenAck.
+// OpenStream opens a 0-RTT multiplexed TCP stream pinned to one healthy carrier for its lifetime.
 func (s *Session) OpenStream(ctx context.Context, host string, port uint16) (*Stream, error) {
 	if s.closed.Load() {
 		return nil, ErrSessionClosed
 	}
-	id := s.nextStreamID.Add(1)
-	st := s.registerStream(id)
 
-	err := s.sendFrame(&proto.Frame{
+	var c carrier.Conn
+	for attempt := 0; attempt < 3; attempt++ {
+		c = s.pickHealthyCarrier()
+		if c != nil {
+			break
+		}
+		select {
+		case <-s.carrierWait:
+		case <-time.After(1500 * time.Millisecond):
+			return nil, ErrNoCarriers
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-s.ctx.Done():
+			return nil, ErrSessionClosed
+		}
+	}
+	if c == nil {
+		return nil, ErrNoCarriers
+	}
+
+	id := s.nextStreamID.Add(1)
+	st := s.registerStream(id, c)
+
+	err := s.sendOnCarrier(c, &proto.Frame{
 		Type:     proto.FrameStreamOpen,
 		StreamID: id,
 		Payload:  proto.EncodeAddress(host, port),
-	}, s.MaxPad)
+	}, s.MaxPad, false) // FIFO stream lane so Open strictly precedes Data & Fin!
 	if err != nil {
 		s.removeStream(id)
 		return nil, err
@@ -496,11 +512,11 @@ func (s *Session) OpenStream(ctx context.Context, host string, port uint16) (*St
 	return st, nil
 }
 
-// ConfirmStreamOpen is a no-op in Aether v2 0-RTT mode (kept for API compatibility).
+// ConfirmStreamOpen is a no-op in Aether v2 0-RTT mode.
 func (s *Session) ConfirmStreamOpen(st *Stream) {}
 
-func (s *Session) registerStream(id uint32) *Stream {
-	st := newStream(s, id)
+func (s *Session) registerStream(id uint32, pinned carrier.Conn) *Stream {
+	st := newStream(s, id, pinned)
 	s.streamMu.Lock()
 	s.streams[id] = st
 	s.streamMu.Unlock()
@@ -572,10 +588,11 @@ func (s *Session) Close() error {
 	return nil
 }
 
-// Stream implements net.Conn with a zero-leak circular ringBuffer and windowed flow control.
+// Stream implements net.Conn pinned to a single carrier.Conn with a zero-leak ringBuffer.
 type Stream struct {
-	ID   uint32
-	sess *Session
+	ID     uint32
+	sess   *Session
+	pinned carrier.Conn
 
 	readMu      sync.Mutex
 	readCond    *sync.Cond
@@ -592,10 +609,11 @@ type Stream struct {
 	closed      atomic.Bool
 }
 
-func newStream(sess *Session, id uint32) *Stream {
+func newStream(sess *Session, id uint32, pinned carrier.Conn) *Stream {
 	st := &Stream{
 		ID:         id,
 		sess:       sess,
+		pinned:     pinned,
 		sendWindow: InitialStreamWindow,
 	}
 	st.readCond = sync.NewCond(&st.readMu)
@@ -654,7 +672,7 @@ func (st *Stream) Read(p []byte) (int, error) {
 		}
 		st.readMu.Unlock()
 		if credit > 0 {
-			st.sess.sendWindowUpdate(st.ID, credit)
+			st.sess.sendWindowUpdate(st, credit)
 		}
 		return n, nil
 	}
@@ -690,13 +708,13 @@ func (st *Stream) Write(p []byte) (int, error) {
 
 		pad := st.sess.MaxPad
 		if len(chunk) >= 1024 {
-			pad = 0 // Skip crypto/rand padding on bulk data chunks for max throughput & low phone CPU
+			pad = 0
 		}
-		err := st.sess.sendFrame(&proto.Frame{
+		err := st.sess.sendOnCarrier(st.pinned, &proto.Frame{
 			Type:     proto.FrameStreamData,
 			StreamID: st.ID,
 			Payload:  chunk,
-		}, pad)
+		}, pad, false) // FIFO stream lane!
 		if err != nil {
 			return total, err
 		}
@@ -713,10 +731,10 @@ func (st *Stream) CloseWrite() error {
 	st.winMu.Lock()
 	st.winCond.Broadcast()
 	st.winMu.Unlock()
-	return st.sess.sendFrame(&proto.Frame{
+	return st.sess.sendOnCarrier(st.pinned, &proto.Frame{
 		Type:     proto.FrameStreamFin,
 		StreamID: st.ID,
-	}, 0)
+	}, 0, false) // FIFO stream lane!
 }
 
 func (st *Stream) Close() error {
@@ -725,10 +743,10 @@ func (st *Stream) Close() error {
 	}
 	st.sess.removeStream(st.ID)
 	if !st.writeClosed.Swap(true) {
-		_ = st.sess.sendFrame(&proto.Frame{
+		_ = st.sess.sendOnCarrier(st.pinned, &proto.Frame{
 			Type:     proto.FrameStreamFin,
 			StreamID: st.ID,
-		}, 0)
+		}, 0, false)
 	}
 	st.readMu.Lock()
 	st.readEOF = true

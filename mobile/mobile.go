@@ -80,7 +80,7 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 		return errors.New("aether vpn is already running")
 	}
 	if mtu <= 0 {
-		mtu = 1280
+		mtu = 1500
 	}
 
 	var cfg MobileConfig

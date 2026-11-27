@@ -321,10 +321,8 @@ func (s *Server) handleTCPStream(ctx context.Context, ss *serverSession, st *ses
 	return nil
 }
 
-// resolveUDP53 serves cached DNS responses in <0.1ms and forwards misses to AdGuard DNS (94.140.14.14).
+// resolveUDP53 serves cached DNS responses in <0.1ms and races all upstream AdGuard DNS servers in parallel (hedged)!
 func (s *Server) resolveUDP53(ss *serverSession, flowID uint32, origAddr proto.Address, query []byte) {
-	// Railway/Render containers have IPv4-only public egress: return empty NOERROR for AAAA
-	// so Chrome/Google use IPv4 QUIC instead of hitting an IPv6 blackhole (ERR_QUIC_PROTOCOL_ERROR).
 	if adns.IsAAAAQuery(query) {
 		if empty := adns.BuildEmptyNoError(query); empty != nil {
 			_ = ss.sess.SendUDP(flowID, origAddr.Host, origAddr.Port, empty)
@@ -337,25 +335,32 @@ func (s *Server) resolveUDP53(ss *serverSession, flowID uint32, origAddr proto.A
 		return
 	}
 
+	resCh := make(chan []byte, len(s.upstreamDNS))
 	for _, upstream := range s.upstreamDNS {
-		conn, err := net.DialTimeout("udp", upstream, 2*time.Second)
-		if err != nil {
-			continue
-		}
-		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
-		if _, err := conn.Write(query); err != nil {
-			_ = conn.Close()
-			continue
-		}
-		resp := make([]byte, 4096)
-		n, err := conn.Read(resp)
-		_ = conn.Close()
-		if err != nil || n < 12 {
-			continue
-		}
-		s.udpDNSCache.Put(query, resp[:n])
-		_ = ss.sess.SendUDP(flowID, origAddr.Host, origAddr.Port, resp[:n])
-		return
+		go func(addr string) {
+			conn, err := net.DialTimeout("udp", addr, 1500*time.Millisecond)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+			if _, err := conn.Write(query); err != nil {
+				return
+			}
+			resp := make([]byte, 4096)
+			n, err := conn.Read(resp)
+			if err != nil || n < 12 {
+				return
+			}
+			resCh <- resp[:n]
+		}(upstream)
+	}
+
+	select {
+	case resp := <-resCh:
+		s.udpDNSCache.Put(query, resp)
+		_ = ss.sess.SendUDP(flowID, origAddr.Host, origAddr.Port, resp)
+	case <-time.After(2200 * time.Millisecond):
 	}
 }
 
