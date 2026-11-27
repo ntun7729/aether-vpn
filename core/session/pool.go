@@ -87,8 +87,8 @@ func (m *ClientManager) Start(ctx context.Context) error {
 	return nil
 }
 
-// TriggerRoaming is called on Android Wi-Fi <-> 5G network changes to immediately attach
-// fresh carriers on the new network interface and retire old zombie carriers cleanly!
+// TriggerRoaming is called on Android Wi-Fi <-> 5G network changes.
+// Probes existing carriers first so noisy Android network callbacks never kill healthy streams!
 func (m *ClientManager) TriggerRoaming() {
 	if m.closed.Load() {
 		return
@@ -101,17 +101,13 @@ func (m *ClientManager) TriggerRoaming() {
 		return
 	}
 	ep := m.cfg.Endpoints[epIdx]
-	log.Printf("[aether] network change detected — replacing carriers cleanly on %s", ep.Name)
 	go func() {
-		var firstNewID uint64
-		for k := 0; k < m.cfg.Carriers; k++ {
-			id, err := m.attachExtraCarrierWithID(s, ep)
-			if err == nil && (firstNewID == 0 || id < firstNewID) {
-				firstNewID = id
-			}
-		}
-		if firstNewID > 0 {
-			s.ReplaceOldCarriers(firstNewID)
+		// Probe existing carriers; any dead carrier will immediately fail write and detach.
+		_ = s.Ping()
+		time.Sleep(500 * time.Millisecond)
+		missing := m.cfg.Carriers - s.ActiveCarriers()
+		for k := 0; k < missing; k++ {
+			_, _ = m.attachExtraCarrierWithID(s, ep)
 		}
 	}()
 }

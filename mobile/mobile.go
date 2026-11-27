@@ -32,8 +32,9 @@ import (
 
 const (
 	nicID       tcpip.NICID = 1
-	maxUDPFlows             = 256              // Supports heavy pooled QUIC (Google/YouTube) + DNS
-	udpIdleTTL              = 65 * time.Second // Matches Google HTTP/3 QUIC pool keepalive (fixes ERR_QUIC_PROTOCOL_ERROR)
+	maxUDPFlows             = 1024             // Plenty of room for heavy browsing + QUIC
+	dnsIdleTTL              = 4 * time.Second  // 1-shot DNS queries free up immediately (never exhaust UDP cap!)
+	udpIdleTTL              = 65 * time.Second // Keeps pooled Google/YouTube HTTP/3 QUIC connections alive
 )
 
 var udpBufPool = sync.Pool{
@@ -181,16 +182,21 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
 
-	// Forward all UDP datagrams (DNS -> AdGuard on server, QUIC/443 with 65s TTL, VoIP, Gaming)
+	// Forward all UDP datagrams (DNS with fast 4s TTL, QUIC/443 with 65s TTL, VoIP, Gaming)
 	udpFwd := udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
-		inst.udpMu.RLock()
-		count := len(inst.udpFlows)
-		inst.udpMu.RUnlock()
-		if count >= maxUDPFlows {
-			return false
+		id := r.ID()
+		isDNS := id.LocalPort == 53
+
+		// Never drop DNS queries on the UDP cap!
+		if !isDNS {
+			inst.udpMu.RLock()
+			count := len(inst.udpFlows)
+			inst.udpMu.RUnlock()
+			if count >= maxUDPFlows {
+				return false
+			}
 		}
 
-		id := r.ID()
 		var wq waiter.Queue
 		ep, err := r.CreateEndpoint(&wq)
 		if err != nil {
@@ -201,6 +207,11 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 		inst.udpMu.Lock()
 		inst.udpFlows[flowID] = &udpFlowEntry{conn: localUDP}
 		inst.udpMu.Unlock()
+
+		idleTTL := udpIdleTTL
+		if isDNS {
+			idleTTL = dnsIdleTTL
+		}
 
 		go func() {
 			bufPtr := udpBufPool.Get().(*[]byte)
@@ -215,7 +226,7 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 			dstHost := id.LocalAddress.String()
 			dstPort := id.LocalPort
 			for {
-				_ = localUDP.SetReadDeadline(time.Now().Add(udpIdleTTL))
+				_ = localUDP.SetReadDeadline(time.Now().Add(idleTTL))
 				n, err := localUDP.Read(buf)
 				if err != nil {
 					return
