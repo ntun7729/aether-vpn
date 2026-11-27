@@ -26,15 +26,16 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 
 	"github.com/aether-vpn/aether/core/carrier"
+	adns "github.com/aether-vpn/aether/core/dns"
 	"github.com/aether-vpn/aether/core/proto"
 	"github.com/aether-vpn/aether/core/session"
 )
 
 const (
 	nicID       tcpip.NICID = 1
-	maxUDPFlows             = 1024             // Plenty of room for heavy browsing + QUIC
-	dnsIdleTTL              = 4 * time.Second  // 1-shot DNS queries free up immediately (never exhaust UDP cap!)
-	udpIdleTTL              = 65 * time.Second // Keeps pooled Google/YouTube HTTP/3 QUIC connections alive
+	maxUDPFlows             = 1024
+	dnsIdleTTL              = 4 * time.Second
+	udpIdleTTL              = 65 * time.Second
 )
 
 var udpBufPool = sync.Pool{
@@ -51,7 +52,9 @@ type MobileConfig struct {
 }
 
 type udpFlowEntry struct {
-	conn *gonet.UDPConn
+	conn       *gonet.UDPConn
+	isDNS      bool
+	lastQuery  []byte
 }
 
 type vpnInstance struct {
@@ -59,6 +62,7 @@ type vpnInstance struct {
 	tunFile  *os.File
 	ipStack  *stack.Stack
 	linkEP   *channel.Endpoint
+	dnsCache *adns.UDPCache
 	cancel   context.CancelFunc
 	udpMu    sync.RWMutex
 	udpFlows map[uint32]*udpFlowEntry
@@ -70,9 +74,9 @@ var (
 	active *vpnInstance
 )
 
-// StartVPN starts the Aether v2.2 multi-path VPN tunnel over an Android VpnService TUN fd.
-// Zero on-phone adblock overhead (AdGuard DNS runs on server), full QUIC support (65s idle TTL),
-// CUBIC + 2MB gVisor window, and 64KB pooled io.CopyBuffer.
+// StartVPN starts the Aether v2.3 multi-path VPN tunnel over an Android VpnService TUN fd.
+// Includes: zero-delay gVisor TCP (Nagle off), 60s local cache of AdGuard DNS replies (0.1ms hits),
+// instant local AAAA empty-NOERROR, full QUIC (65s TTL, MTU 1500), and 64KB pooled copy buffers.
 func StartVPN(tunFd int, mtu int, configJSON string) error {
 	instMu.Lock()
 	defer instMu.Unlock()
@@ -91,6 +95,7 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 
 	inst := &vpnInstance{
 		udpFlows: make(map[uint32]*udpFlowEntry),
+		dnsCache: adns.NewUDPCache(60 * time.Second),
 	}
 
 	mgr, err := session.NewClientManager(session.ClientConfig{
@@ -100,8 +105,16 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 	}, func(flowID uint32, addr proto.Address, payload []byte) {
 		inst.udpMu.RLock()
 		entry, ok := inst.udpFlows[flowID]
+		var q []byte
+		if ok && entry.isDNS && len(entry.lastQuery) >= 12 {
+			q = entry.lastQuery
+		}
 		inst.udpMu.RUnlock()
+
 		if ok && entry.conn != nil {
+			if len(q) > 0 {
+				inst.dnsCache.Put(q, payload)
+			}
 			_, _ = entry.conn.Write(payload)
 		}
 	})
@@ -116,7 +129,7 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 	}
 	startCancel()
 
-	// Build high-BDP tuned gVisor userspace TCP/IP stack (CUBIC + SACK + 2MB/4MB windows)
+	// Build low-latency, high-BDP gVisor TCP/IP stack (CUBIC + SACK + NoDelay + 2MB/4MB windows)
 	linkEP := channel.New(2048, uint32(mtu), "")
 	s := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
@@ -127,6 +140,8 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sack)
 	cc := tcpip.CongestionControlOption("cubic")
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &cc)
+	delay := tcpip.TCPDelayEnabled(false)
+	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &delay)
 	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 64 * 1024, Default: 1 << 20, Max: 4 << 20}
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcvBuf)
 	sndBuf := tcpip.TCPSendBufferSizeRangeOption{Min: 64 * 1024, Default: 1 << 20, Max: 4 << 20}
@@ -143,7 +158,7 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 		{Destination: header.IPv6EmptySubnet, NIC: nicID},
 	})
 
-	// Forward all TCP connections using 0-RTT OpenStream + 64 KB pooled copy buffers
+	// Forward all TCP connections with TCP_NODELAY + 0-RTT OpenStream + 64 KB pooled buffers
 	tcpFwd := tcp.NewForwarder(s, 2<<20, 1024, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
 		var wq waiter.Queue
@@ -152,6 +167,7 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 			r.Complete(true)
 			return
 		}
+		ep.SocketOptions().SetDelayOption(false) // Disable 40ms local Nagle delay!
 		r.Complete(false)
 		localConn := gonet.NewTCPConn(&wq, ep)
 		go func() {
@@ -182,12 +198,11 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
 
-	// Forward all UDP datagrams (DNS with fast 4s TTL, QUIC/443 with 65s TTL, VoIP, Gaming)
+	// Forward UDP datagrams: 0.1ms local cache of AdGuard DNS answers, 4s DNS TTL, 65s QUIC TTL
 	udpFwd := udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
 		id := r.ID()
 		isDNS := id.LocalPort == 53
 
-		// Never drop DNS queries on the UDP cap!
 		if !isDNS {
 			inst.udpMu.RLock()
 			count := len(inst.udpFlows)
@@ -204,8 +219,9 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 		}
 		localUDP := gonet.NewUDPConn(&wq, ep)
 		flowID := inst.nextFlow.Add(1)
+		entry := &udpFlowEntry{conn: localUDP, isDNS: isDNS}
 		inst.udpMu.Lock()
-		inst.udpFlows[flowID] = &udpFlowEntry{conn: localUDP}
+		inst.udpFlows[flowID] = entry
 		inst.udpMu.Unlock()
 
 		idleTTL := udpIdleTTL
@@ -231,7 +247,26 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 				if err != nil {
 					return
 				}
-				_ = mgr.SendUDP(flowID, dstHost, dstPort, buf[:n])
+				pkt := buf[:n]
+				if isDNS {
+					// Answer AAAA locally in 0.1ms (Railway is IPv4-only)
+					if adns.IsAAAAQuery(pkt) {
+						if empty := adns.BuildEmptyNoError(pkt); empty != nil {
+							_, _ = localUDP.Write(empty)
+						}
+						continue
+					}
+					// Serve cached AdGuard DNS answers locally in 0.1ms (zero Singapore round-trip!)
+					if cached, ok := inst.dnsCache.Get(pkt); ok {
+						_, _ = localUDP.Write(cached)
+						continue
+					}
+					qCopy := append([]byte(nil), pkt...)
+					inst.udpMu.Lock()
+					entry.lastQuery = qCopy
+					inst.udpMu.Unlock()
+				}
+				_ = mgr.SendUDP(flowID, dstHost, dstPort, pkt)
 			}
 		}()
 		return true

@@ -177,7 +177,7 @@ func WrapConn(conn *websocket.Conn, ep Endpoint) *Carrier {
 		Endpoint: ep,
 		conn:     conn,
 		highCh:   make(chan []byte, 128),
-		bulkCh:   make(chan []byte, 256),
+		bulkCh:   make(chan []byte, 48), // Balanced 48-frame queue (~2.8MB max) — fast browsing + zero burst stalls!
 		pongCh:   make(chan struct{}, 1),
 		closeCh:  make(chan struct{}),
 	}

@@ -188,3 +188,25 @@ func (u *UDPCache) Put(query, resp []byte) {
 	u.entries[key] = udpDNSEntry{raw: buf, expiresAt: now.Add(u.ttl)}
 	u.mu.Unlock()
 }
+
+// Flush clears all cached IP entries.
+func (c *Cache) Flush() {
+	c.mu.Lock()
+	c.entries = make(map[string]cacheEntry)
+	c.mu.Unlock()
+}
+
+// Flush clears all cached UDP DNS responses.
+func (u *UDPCache) Flush() {
+	u.mu.Lock()
+	u.entries = make(map[string]udpDNSEntry)
+	u.mu.Unlock()
+}
+
+// Size returns the number of currently cached UDP DNS entries.
+func (u *UDPCache) Size() int {
+	u.mu.RLock()
+	n := len(u.entries)
+	u.mu.RUnlock()
+	return n
+}
