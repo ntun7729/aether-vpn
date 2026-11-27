@@ -30,7 +30,18 @@ import (
 	"github.com/aether-vpn/aether/core/session"
 )
 
-const nicID tcpip.NICID = 1
+const (
+	nicID       tcpip.NICID = 1
+	maxUDPFlows             = 128
+	udpIdleTTL              = 15 * time.Second
+)
+
+var udpBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 8192)
+		return &b
+	},
+}
 
 type MobileConfig struct {
 	PSK       string             `json:"psk"`
@@ -58,7 +69,9 @@ var (
 	active *vpnInstance
 )
 
-// StartVPN starts the Aether multi-path VPN tunnel over an Android VpnService TUN file descriptor.
+// StartVPN starts the Aether v2 multi-path VPN tunnel over an Android VpnService TUN fd.
+// Keeps full UDP (including QUIC/443) enabled while using tuned gVisor TCP + pooled buffers
+// to eliminate mobile CPU/GC lag.
 func StartVPN(tunFd int, mtu int, configJSON string) error {
 	instMu.Lock()
 	defer instMu.Unlock()
@@ -102,12 +115,15 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 	}
 	startCancel()
 
-	// Build gVisor userspace TCP/IP stack over a channel link endpoint
-	linkEP := channel.New(512, uint32(mtu), "")
+	// Build tuned gVisor userspace TCP/IP stack (SACK enabled, 256 KB window, zero-lag)
+	linkEP := channel.New(1024, uint32(mtu), "")
 	s := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 	})
+
+	sack := tcpip.TCPSACKEnabled(true)
+	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sack)
 
 	if err := s.CreateNIC(nicID, linkEP); err != nil {
 		_ = mgr.Close()
@@ -120,8 +136,8 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 		{Destination: header.IPv6EmptySubnet, NIC: nicID},
 	})
 
-	// Forward all TCP connections from Android TUN into Aether multiplexed streams
-	tcpFwd := tcp.NewForwarder(s, 0, 1024, func(r *tcp.ForwarderRequest) {
+	// Forward all TCP connections using 0-RTT OpenStream + 256 KB gVisor receive window
+	tcpFwd := tcp.NewForwarder(s, 256*1024, 512, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
 		var wq waiter.Queue
 		ep, err := r.CreateEndpoint(&wq)
@@ -133,9 +149,7 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 		localConn := gonet.NewTCPConn(&wq, ep)
 		go func() {
 			defer localConn.Close()
-			dialCtx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
-			st, err := mgr.OpenStream(dialCtx, id.LocalAddress.String(), id.LocalPort)
-			cancel()
+			st, err := mgr.OpenStream(context.Background(), id.LocalAddress.String(), id.LocalPort)
 			if err != nil {
 				return
 			}
@@ -157,8 +171,15 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
 
-	// Forward all UDP datagrams (including DNS & QUIC) from Android TUN into Aether UDP relay
+	// Forward all UDP datagrams (DNS, QUIC/443, VoIP, Gaming) with bounded flows & pooled buffers
 	udpFwd := udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
+		inst.udpMu.RLock()
+		count := len(inst.udpFlows)
+		inst.udpMu.RUnlock()
+		if count >= maxUDPFlows {
+			return false
+		}
+
 		id := r.ID()
 		var wq waiter.Queue
 		ep, err := r.CreateEndpoint(&wq)
@@ -172,7 +193,10 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 		inst.udpMu.Unlock()
 
 		go func() {
+			bufPtr := udpBufPool.Get().(*[]byte)
+			buf := *bufPtr
 			defer func() {
+				udpBufPool.Put(bufPtr)
 				inst.udpMu.Lock()
 				delete(inst.udpFlows, flowID)
 				inst.udpMu.Unlock()
@@ -180,9 +204,8 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 			}()
 			dstHost := id.LocalAddress.String()
 			dstPort := id.LocalPort
-			buf := make([]byte, 64*1024)
 			for {
-				_ = localUDP.SetReadDeadline(time.Now().Add(45 * time.Second))
+				_ = localUDP.SetReadDeadline(time.Now().Add(udpIdleTTL))
 				n, err := localUDP.Read(buf)
 				if err != nil {
 					return
@@ -203,7 +226,7 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 	inst.linkEP = linkEP
 	inst.cancel = cancel
 
-	// Pump packets: Android TUN -> gVisor
+	// Pump packets: Android TUN -> gVisor (minimized allocations)
 	go func() {
 		buf := make([]byte, mtu+128)
 		for {
@@ -226,8 +249,9 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 			default:
 				continue
 			}
+			v := buffer.NewViewWithData(buf[:n])
 			pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-				Payload: buffer.MakeWithData(append([]byte(nil), buf[:n]...)),
+				Payload: buffer.MakeWithView(v),
 			})
 			linkEP.InjectInbound(protoNum, pkt)
 			pkt.DecRef()
@@ -242,8 +266,7 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 				return
 			}
 			view := pkt.ToView()
-			raw := view.AsSlice()
-			_, _ = tunFile.Write(raw)
+			_, _ = tunFile.Write(view.AsSlice())
 			view.Release()
 			pkt.DecRef()
 		}
@@ -277,8 +300,7 @@ func IsRunning() bool {
 	return active != nil
 }
 
-// OnNetworkChanged notifies the tunnel core when Android switches between Wi-Fi and 5G/LTE
-// so fresh carriers attach immediately without dropping active connections.
+// OnNetworkChanged notifies the tunnel core when Android switches between Wi-Fi and 5G/LTE.
 func OnNetworkChanged() {
 	instMu.Lock()
 	inst := active
@@ -300,4 +322,4 @@ func GetStatsJSON() string {
 	return string(b)
 }
 
-var _ net.Conn // keep net import for clarity if extended
+var _ net.Conn

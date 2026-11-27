@@ -246,6 +246,21 @@ func (s *Server) handleTCPStream(ctx context.Context, ss *serverSession, st *ses
 		return errors.New("blocked by adblock")
 	}
 
+	// For Android TUN (which connects by raw IP on port 443), peek TLS ClientHello SNI
+	// before dialing outbound so ad/tracker domains are blocked with 0ms outbound traffic!
+	var firstChunk []byte
+	if s.blocker.Enabled() && addr.Port == 443 && net.ParseIP(addr.Host) != nil {
+		peekBuf := make([]byte, 2048)
+		n, err := st.Read(peekBuf)
+		if err != nil {
+			return err
+		}
+		firstChunk = peekBuf[:n]
+		if sni, ok := adblock.ExtractTLSSNI(firstChunk); ok && s.blocker.IsBlocked(sni) {
+			return errors.New("blocked by sni adblock")
+		}
+	}
+
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
@@ -254,6 +269,13 @@ func (s *Server) handleTCPStream(ctx context.Context, ss *serverSession, st *ses
 		return err
 	}
 	ss.sess.ConfirmStreamOpen(st)
+
+	if len(firstChunk) > 0 {
+		if _, err := remote.Write(firstChunk); err != nil {
+			_ = remote.Close()
+			return err
+		}
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)

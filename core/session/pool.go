@@ -88,7 +88,7 @@ func (m *ClientManager) Start(ctx context.Context) error {
 }
 
 // TriggerRoaming is called on Android Wi-Fi <-> 5G network changes to immediately attach
-// fresh carriers on the new network interface while keeping active streams alive!
+// fresh carriers on the new network interface and retire old zombie carriers cleanly!
 func (m *ClientManager) TriggerRoaming() {
 	if m.closed.Load() {
 		return
@@ -101,10 +101,19 @@ func (m *ClientManager) TriggerRoaming() {
 		return
 	}
 	ep := m.cfg.Endpoints[epIdx]
-	log.Printf("[aether] network change detected — proactively attaching fresh carriers to %s", ep.Name)
-	for k := 0; k < m.cfg.Carriers; k++ {
-		go m.attachExtraCarrier(s, ep)
-	}
+	log.Printf("[aether] network change detected — replacing carriers cleanly on %s", ep.Name)
+	go func() {
+		var firstNewID uint64
+		for k := 0; k < m.cfg.Carriers; k++ {
+			id, err := m.attachExtraCarrierWithID(s, ep)
+			if err == nil && (firstNewID == 0 || id < firstNewID) {
+				firstNewID = id
+			}
+		}
+		if firstNewID > 0 {
+			s.ReplaceOldCarriers(firstNewID)
+		}
+	}()
 }
 
 // Session returns the currently active Session.
@@ -243,15 +252,20 @@ func (m *ClientManager) dialNewSession(ctx context.Context, ep carrier.Endpoint)
 }
 
 func (m *ClientManager) attachExtraCarrier(s *Session, ep carrier.Endpoint) error {
+	_, err := m.attachExtraCarrierWithID(s, ep)
+	return err
+}
+
+func (m *ClientManager) attachExtraCarrierWithID(s *Session, ep carrier.Endpoint) (uint64, error) {
 	if s.closed.Load() || m.closed.Load() {
-		return ErrSessionClosed
+		return 0, ErrSessionClosed
 	}
 	ctx, cancel := context.WithTimeout(m.ctx, m.cfg.DialTimeout)
 	defer cancel()
 
 	c, err := carrier.Dial(ctx, ep, m.cfg.DialTimeout)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	hello := carrier.EncodeClientHello(carrier.ClientHello{
@@ -263,29 +277,29 @@ func (m *ClientManager) attachExtraCarrier(s *Session, ep carrier.Endpoint) erro
 
 	if err := c.WritePacket(hello); err != nil {
 		_ = c.Close()
-		return err
+		return 0, err
 	}
 	respBytes, err := c.ReadPacket()
 	if err != nil {
 		_ = c.Close()
-		return err
+		return 0, err
 	}
 	sh, err := carrier.DecodeServerHello(respBytes, s.ID, m.psk)
 	if err != nil {
 		_ = c.Close()
-		return err
+		return 0, err
 	}
 	if sh.Status == carrier.StatusUnknownSession {
 		_ = c.Close()
-		return carrier.ErrUnknownSession
+		return 0, carrier.ErrUnknownSession
 	}
 	if sh.Status != carrier.StatusOK {
 		_ = c.Close()
-		return fmt.Errorf("attach rejected (status=%d)", sh.Status)
+		return 0, fmt.Errorf("attach rejected (status=%d)", sh.Status)
 	}
 
 	s.AttachCarrier(c, m.onCarrierDetach(s, ep))
-	return nil
+	return c.CarrierID(), nil
 }
 
 func (m *ClientManager) onCarrierDetach(s *Session, ep carrier.Endpoint) func(carrier.Conn, error) {

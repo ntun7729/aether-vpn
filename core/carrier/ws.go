@@ -158,7 +158,7 @@ var nextCarrierID atomic.Uint64
 func (c *Carrier) CarrierID() uint64     { return c.ID }
 func (c *Carrier) GetEndpoint() Endpoint { return c.Endpoint }
 
-// WrapConn creates a Carrier around an established WebSocket connection.
+// WrapConn creates a Carrier around an established WebSocket connection and starts a 25s ping keepalive.
 func WrapConn(conn *websocket.Conn, ep Endpoint) *Carrier {
 	conn.SetReadLimit(256 * 1024)
 	c := &Carrier{
@@ -171,6 +171,28 @@ func WrapConn(conn *websocket.Conn, ep Endpoint) *Carrier {
 		_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 		return nil
 	})
+	go func() {
+		ticker := time.NewTicker(25 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if c.closed.Load() {
+					return
+				}
+				c.writeMu.Lock()
+				_ = c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				err := c.conn.WriteMessage(websocket.PingMessage, nil)
+				c.writeMu.Unlock()
+				if err != nil {
+					_ = c.Close()
+					return
+				}
+			case <-c.closeCh:
+				return
+			}
+		}
+	}()
 	return c
 }
 
