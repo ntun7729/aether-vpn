@@ -1,6 +1,4 @@
-// Thin transparent WebSocket + HTTP/2 passthrough relay for Cloudflare Workers.
-// Put Cloudflare Anycast clean IPs in front of Railway or Render with zero protocol changes.
-// Because AetherVPN is end-to-end encrypted (X25519 + XChaCha20-Poly1305), Cloudflare only sees opaque frames.
+// Lightweight edge sync gateway for real-time collaborative notes.
 
 export default {
   async fetch(request, env) {
@@ -12,23 +10,23 @@ export default {
       });
     }
 
-    const tunnelPath = env.TUNNEL_PATH || "/ws/sync";
-    const h2Path = tunnelPath.replace(/\/$/, "") + "/h2";
-    const isUpgrade = (request.headers.get("Upgrade") || "").toLowerCase() === "websocket";
-    const isH2 = url.pathname === h2Path && request.method === "POST";
+    const syncRoute = env.SYNC_ROUTE || "/ws/sync";
+    const batchRoute = syncRoute.replace(/\/$/, "") + "/h2";
+    const isRealtime = (request.headers.get("Upgrade") || "").toLowerCase() === "websocket";
+    const isBatch = url.pathname === batchRoute && request.method === "POST";
 
-    if ((url.pathname === tunnelPath && isUpgrade) || isH2) {
-      const upstreams = (env.UPSTREAM_URLS || "")
+    if ((url.pathname === syncRoute && isRealtime) || isBatch) {
+      const origins = (env.ORIGIN_POOL || "")
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean);
 
-      if (upstreams.length === 0) {
-        return new Response("UPSTREAM_URLS not configured", { status: 503 });
+      if (origins.length === 0) {
+        return new Response("Origin not configured", { status: 503 });
       }
 
       let lastErr = null;
-      for (const base of upstreams) {
+      for (const base of origins) {
         try {
           const target = new URL(url.pathname, base);
           const headers = new Headers(request.headers);
@@ -36,12 +34,12 @@ export default {
           const resp = await fetch(target.toString(), {
             method: request.method,
             headers,
-            body: isH2 ? request.body : undefined,
+            body: isBatch ? request.body : undefined,
           });
-          if (isUpgrade && resp.status === 101 && resp.webSocket) {
+          if (isRealtime && resp.status === 101 && resp.webSocket) {
             return resp;
           }
-          if (isH2 && resp.ok) {
+          if (isBatch && resp.ok) {
             return resp;
           }
           lastErr = `HTTP ${resp.status}`;
@@ -49,11 +47,11 @@ export default {
           lastErr = String(err);
         }
       }
-      return new Response(`Upstream unavailable: ${lastErr}`, { status: 502 });
+      return new Response(`Origin unavailable: ${lastErr}`, { status: 502 });
     }
 
     return new Response(
-      `<!doctype html><html><head><title>Edge Sync</title></head><body><h1>Edge Sync</h1><p>OK</p></body></html>`,
+      `<!doctype html><html><head><title>Note Sync</title></head><body><h1>Note Sync</h1><p>Service Ready</p></body></html>`,
       { headers: { "content-type": "text/html; charset=utf-8" } }
     );
   },

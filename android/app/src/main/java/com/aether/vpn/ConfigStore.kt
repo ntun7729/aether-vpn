@@ -8,7 +8,7 @@ import org.json.JSONObject
 data class AetherConfig(
     val psk: String = "",
     val primaryUrl: String = "wss://aether-server-production.up.railway.app/ws/sync",
-    val fallbackUrl: String = "",
+    val fallbackUrl: String = "wss://sync.novv.tech/ws/sync",
     val cfCleanIp: String = "",
     val transport: String = "auto", // auto | ws | h2
     val carriers: Int = 3,
@@ -18,18 +18,25 @@ data class AetherConfig(
     fun toCoreJson(): String {
         val endpoints = JSONArray()
         if (primaryUrl.isNotBlank()) {
+            val u = primaryUrl.trim()
             endpoints.put(JSONObject().apply {
                 put("name", "railway-primary")
-                put("url", primaryUrl.trim())
-                if (cfCleanIp.isNotBlank()) put("resolve_ip", cfCleanIp.trim())
+                put("url", u)
+                if (cfCleanIp.isNotBlank() && !u.contains("railway.app", ignoreCase = true)) {
+                    put("resolve_ip", cfCleanIp.trim())
+                }
                 put("transport", transport.trim().ifBlank { "auto" })
                 put("priority", 0)
             })
         }
         if (fallbackUrl.isNotBlank()) {
+            val u = fallbackUrl.trim()
             endpoints.put(JSONObject().apply {
-                put("name", "render-fallback")
-                put("url", fallbackUrl.trim())
+                put("name", "cf-fallback")
+                put("url", u)
+                if (cfCleanIp.isNotBlank() && !u.contains("railway.app", ignoreCase = true)) {
+                    put("resolve_ip", cfCleanIp.trim())
+                }
                 put("transport", transport.trim().ifBlank { "auto" })
                 put("priority", 1)
             })
@@ -85,7 +92,7 @@ object ConfigStore {
         return AetherConfig(
             psk = p.getString("psk", "") ?: "",
             primaryUrl = p.getString("primary_url", "wss://aether-server-production.up.railway.app/ws/sync") ?: "",
-            fallbackUrl = p.getString("fallback_url", "") ?: "",
+            fallbackUrl = p.getString("fallback_url", "wss://sync.novv.tech/ws/sync") ?: "",
             cfCleanIp = p.getString("cf_clean_ip", "") ?: "",
             transport = p.getString("transport", "auto") ?: "auto",
             carriers = p.getInt("carriers", 3),
