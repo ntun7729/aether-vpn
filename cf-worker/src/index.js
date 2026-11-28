@@ -1,4 +1,4 @@
-// Lightweight edge sync gateway for real-time collaborative notes (WS, XHTTP, gRPC, H2).
+// Lightweight edge sync gateway for real-time collaborative notes (WS, XHTTP, gRPC, H2, custom paths).
 
 export default {
   async fetch(request, env) {
@@ -10,18 +10,12 @@ export default {
       });
     }
 
-    const syncRoute = env.SYNC_ROUTE || "/ws/sync";
-    const base = syncRoute.replace(/\/$/, "");
-    const batchRoute = base + "/h2";
-    const splitRoute = base + "/xhttp";
-    const rpcRoute = "/aether.v1.SyncService/Tunnel";
-
     const isRealtime = (request.headers.get("Upgrade") || "").toLowerCase() === "websocket";
-    const isBatch = url.pathname === batchRoute && request.method === "POST";
-    const isSplit = url.pathname === splitRoute && (request.method === "GET" || request.method === "POST");
-    const isRpc = url.pathname === rpcRoute && request.method === "POST";
+    const isBatch = url.pathname.endsWith("/h2") && request.method === "POST";
+    const isSplit = url.pathname.endsWith("/xhttp") && (request.method === "GET" || request.method === "POST");
+    const isRpc = url.pathname === "/aether.v1.SyncService/Tunnel" && request.method === "POST";
 
-    if ((url.pathname === syncRoute && isRealtime) || isBatch || isSplit || isRpc) {
+    if ((url.pathname !== "/" && isRealtime) || isBatch || isSplit || isRpc) {
       const origins = (env.ORIGIN_POOL || "")
         .split(",")
         .map((s) => s.trim())

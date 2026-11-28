@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -61,8 +62,26 @@ type Endpoint struct {
 	ResolveIP     string `json:"resolve_ip,omitempty"`     // Optional Cloudflare clean IP override
 	Transport     string `json:"transport,omitempty"`      // "auto" (default), "ws", "xhttp", "grpc", or "h2"
 	Fingerprint   string `json:"fingerprint,omitempty"`    // "chrome" (default), "firefox", "safari", "ios", "randomized"
+	FragmentMode  string `json:"fragment_mode,omitempty"`  // "off" (default), "balanced", "strict"
+	CustomPath    string `json:"custom_path,omitempty"`    // Optional custom camouflage path (e.g. "/api/v2/events")
 	Priority      int    `json:"priority,omitempty"`       // Lower = preferred (0=primary, 1=fallback)
 	BindInterface string `json:"bind_interface,omitempty"` // Optional Linux interface (e.g. "eth0") to bypass local TUN
+}
+
+func resolveEndpointURL(rawURL, customPath string) string {
+	cp := strings.TrimSpace(customPath)
+	if cp == "" {
+		return rawURL
+	}
+	if !strings.HasPrefix(cp, "/") {
+		cp = "/" + cp
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	u.Path = cp
+	return u.String()
 }
 
 // ClientHello is the first binary message sent on a newly established carrier.
@@ -258,8 +277,10 @@ func (c *Carrier) writerLoop() {
 	}
 }
 
-// dialUTLS performs a TLS handshake impersonating the selected browser fingerprint (chrome/firefox/safari/ios/randomized).
-func dialUTLS(ctx context.Context, rawConn net.Conn, serverName, fingerprint string, alpn []string) (net.Conn, error) {
+// dialUTLS performs a TLS handshake impersonating the selected browser fingerprint (chrome/firefox/safari/ios/randomized)
+// with optional TLS ClientHello fragmentation (off/balanced/strict) to defeat SNI-based DPI on port 443.
+func dialUTLS(ctx context.Context, rawConn net.Conn, serverName, fingerprint, fragmentMode string, alpn []string) (net.Conn, error) {
+	connForTLS := wrapTLSFragment(rawConn, fragmentMode)
 	var helloID utls.ClientHelloID
 	switch fingerprint {
 	case "firefox":
@@ -275,7 +296,7 @@ func dialUTLS(ctx context.Context, rawConn net.Conn, serverName, fingerprint str
 	}
 
 	if helloID == utls.HelloRandomizedALPN {
-		uConn := utls.UClient(rawConn, &utls.Config{ServerName: serverName, NextProtos: alpn}, helloID)
+		uConn := utls.UClient(connForTLS, &utls.Config{ServerName: serverName, NextProtos: alpn}, helloID)
 		if err := uConn.HandshakeContext(ctx); err != nil {
 			_ = rawConn.Close()
 			return nil, err
@@ -295,7 +316,7 @@ func dialUTLS(ctx context.Context, rawConn net.Conn, serverName, fingerprint str
 			}
 		}
 	}
-	uConn := utls.UClient(rawConn, &utls.Config{ServerName: serverName}, utls.HelloCustom)
+	uConn := utls.UClient(connForTLS, &utls.Config{ServerName: serverName}, utls.HelloCustom)
 	if err := uConn.ApplyPreset(&spec); err != nil {
 		_ = rawConn.Close()
 		return nil, err
@@ -336,9 +357,10 @@ func Dial(ctx context.Context, ep Endpoint, timeout time.Duration) (Conn, error)
 	}
 }
 
-// DialWS connects a WebSocket carrier using uTLS Chrome ClientHello fingerprint + TCP_NODELAY.
+// DialWS connects a WebSocket carrier using uTLS ClientHello fingerprint + optional TLS fragmentation + TCP_NODELAY.
 func DialWS(ctx context.Context, ep Endpoint, timeout time.Duration) (*Carrier, error) {
-	u, err := url.Parse(ep.URL)
+	dialURL := resolveEndpointURL(ep.URL, ep.CustomPath)
+	u, err := url.Parse(dialURL)
 	if err != nil {
 		return nil, err
 	}
@@ -386,7 +408,7 @@ func DialWS(ctx context.Context, ep Endpoint, timeout time.Duration) (*Carrier, 
 			if tc, ok := rawConn.(*net.TCPConn); ok {
 				_ = tc.SetNoDelay(true)
 			}
-			return dialUTLS(dctx, rawConn, host, ep.Fingerprint, []string{"http/1.1"})
+			return dialUTLS(dctx, rawConn, host, ep.Fingerprint, ep.FragmentMode, []string{"http/1.1"})
 		},
 	}
 
@@ -395,7 +417,7 @@ func DialWS(ctx context.Context, ep Endpoint, timeout time.Duration) (*Carrier, 
 		"Accept-Language": []string{"en-US,en;q=0.9"},
 	}
 
-	conn, resp, err := dialer.DialContext(ctx, ep.URL, headers)
+	conn, resp, err := dialer.DialContext(ctx, dialURL, headers)
 	if err != nil {
 		if resp != nil {
 			return nil, fmt.Errorf("ws dial %s failed (HTTP %d): %w", ep.URL, resp.StatusCode, err)

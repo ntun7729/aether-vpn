@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const serverVersion = "4.0.0"
+const serverVersion = "4.1.0"
 
 // handleAdminRoute authenticates /{ADMIN_KEY}/... in constant time.
 // Returns true if the request was handled as an authenticated admin route; false falls through to decoy HTML.
@@ -167,37 +167,32 @@ func (s *Server) handleAPIStats(w http.ResponseWriter, r *http.Request) {
 		"psk":               string(s.psk),
 		"sync_config":       sc,
 		"config": map[string]any{
-			"tunnel_path":  s.path,
-			"upstream_dns": sc.UpstreamDNS,
-			"block_dot":    sc.BlockDoT,
-			"adblock_sni":  sc.AdblockSNI,
-			"cipher":       sc.Cipher,
-			"transport":    sc.Transport,
-			"fingerprint":  sc.Fingerprint,
-			"padding_mode": sc.PaddingMode,
-			"carriers":     sc.Carriers,
-			"dns_preset":   sc.DNSPreset,
-			"custom_dns":   sc.CustomDNS,
-			"fallback_url": sc.FallbackURL,
-			"updated_at":   sc.UpdatedAt,
+			"tunnel_path":      s.path,
+			"protocol_profile": sc.ProtocolProfile,
+			"upstream_dns":     sc.UpstreamDNS,
+			"block_dot":        sc.BlockDoT,
+			"adblock_sni":      sc.AdblockSNI,
+			"cipher":           sc.Cipher,
+			"transport":        sc.Transport,
+			"fingerprint":      sc.Fingerprint,
+			"padding_mode":     sc.PaddingMode,
+			"fragment_mode":    sc.FragmentMode,
+			"quic_mode":        sc.QUICMode,
+			"window_profile":   sc.WindowProfile,
+			"custom_path":      sc.CustomPath,
+			"idle_power":       sc.IdlePower,
+			"carriers":         sc.Carriers,
+			"dns_preset":       sc.DNSPreset,
+			"custom_dns":       sc.CustomDNS,
+			"fallback_url":     sc.FallbackURL,
+			"updated_at":       sc.UpdatedAt,
 		},
 		"sessions": sessions,
 	})
 }
 
 func (s *Server) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		DNSPreset   string  `json:"dns_preset"`
-		CustomDNS   string  `json:"custom_dns"`
-		BlockDoT    *bool   `json:"block_dot"`
-		AdblockSNI  *bool   `json:"adblock_sni"`
-		Cipher      string  `json:"cipher"`
-		Transport   string  `json:"transport"`
-		Fingerprint string  `json:"fingerprint"`
-		PaddingMode string  `json:"padding_mode"`
-		Carriers    *int    `json:"carriers"`
-		FallbackURL *string `json:"fallback_url"`
-	}
+	var body SyncPatch
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
 		return
@@ -677,12 +672,36 @@ const dashboardHTML = `<!doctype html>
     align-items: start;
   }
 
+  .sync-col-6 {
+    grid-column: span 6;
+  }
+
   .sync-col-3 {
     grid-column: span 3;
   }
 
   .sync-col-2 {
     grid-column: span 2;
+  }
+
+  .path-presets {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+  }
+
+  .btn-xs {
+    height: 26px;
+    padding: 0 9px;
+    font-size: 11.5px;
+    border-radius: var(--radius-sm);
+  }
+
+  .btn-xs.is-active {
+    background: var(--emerald-tint);
+    border-color: var(--emerald-border);
+    color: var(--emerald-hi);
   }
 
   .seg-group.seg-wrap {
@@ -1734,6 +1753,7 @@ const dashboardHTML = `<!doctype html>
       grid-template-columns: minmax(0, 1fr);
     }
 
+    .sync-col-6,
     .sync-col-3,
     .sync-col-2 {
       grid-column: auto;
@@ -1791,7 +1811,7 @@ const dashboardHTML = `<!doctype html>
         </svg>
       </div>
       <h1 class="brand-name">AetherVPN</h1>
-      <span class="pill pill-mono" id="verPill">v4.0.0</span>
+      <span class="pill pill-mono" id="verPill">v4.1.0</span>
       <span class="status-pill" id="statusPill" data-state="ok">
         <span class="status-dot" aria-hidden="true"></span>
         <span id="statusText">OPERATIONAL</span>
@@ -1900,6 +1920,15 @@ const dashboardHTML = `<!doctype html>
 
       <div class="panel-body">
         <div class="sync-grid">
+          <fieldset class="sync-col-6">
+            <legend class="field-label">Aether Protocol Profile (1-Tap)</legend>
+            <div class="seg-group seg-wrap" role="radiogroup" aria-label="Aether protocol profile">
+              <label class="seg-pill"><input type="radio" name="protocol_profile" value="mux" data-label="Aether-Mux" checked>Aether-Mux</label>
+              <label class="seg-pill"><input type="radio" name="protocol_profile" value="fast" data-label="Aether-Fast">Aether-Fast</label>
+              <label class="seg-pill"><input type="radio" name="protocol_profile" value="ghost" data-label="Aether-Ghost">Aether-Ghost</label>
+            </div>
+          </fieldset>
+
           <fieldset class="sync-col-3">
             <legend class="field-label">Encryption Cipher</legend>
             <div class="seg-group seg-wrap" role="radiogroup" aria-label="Encryption cipher">
@@ -1951,6 +1980,68 @@ const dashboardHTML = `<!doctype html>
               <label class="seg-pill mono"><input type="radio" name="carriers" value="6" data-label="6">6</label>
             </div>
           </fieldset>
+
+          <fieldset class="sync-col-2">
+            <legend class="field-label">TLS Fragmentation (Anti-DPI)</legend>
+            <div class="seg-group seg-wrap" role="radiogroup" aria-label="TLS fragmentation">
+              <label class="seg-pill"><input type="radio" name="fragment_mode" value="off" data-label="Off" checked>Off</label>
+              <label class="seg-pill"><input type="radio" name="fragment_mode" value="balanced" data-label="Balanced 40–80B">Balanced 40–80B</label>
+              <label class="seg-pill"><input type="radio" name="fragment_mode" value="strict" data-label="Strict 10–30B">Strict 10–30B</label>
+            </div>
+          </fieldset>
+
+          <fieldset class="sync-col-2">
+            <legend class="field-label">QUIC / UDP Mode</legend>
+            <div class="seg-group seg-wrap" role="radiogroup" aria-label="QUIC and UDP mode">
+              <label class="seg-pill"><input type="radio" name="quic_mode" value="full" data-label="Full QUIC" checked>Full QUIC</label>
+              <label class="seg-pill"><input type="radio" name="quic_mode" value="force_tcp" data-label="Force TCP">Force TCP</label>
+              <label class="seg-pill"><input type="radio" name="quic_mode" value="dns_only" data-label="DNS Only">DNS Only</label>
+            </div>
+          </fieldset>
+
+          <fieldset class="sync-col-2">
+            <legend class="field-label">Chunk &amp; Window</legend>
+            <div class="seg-group seg-wrap" role="radiogroup" aria-label="Chunk and window profile">
+              <label class="seg-pill"><input type="radio" name="window_profile" value="max" data-label="Max Speed" checked>Max Speed</label>
+              <label class="seg-pill"><input type="radio" name="window_profile" value="balanced" data-label="Balanced">Balanced</label>
+              <label class="seg-pill"><input type="radio" name="window_profile" value="gaming" data-label="Gaming">Gaming</label>
+            </div>
+          </fieldset>
+
+          <div class="sync-col-3">
+            <label class="field-label" for="customPathInput">Custom Camouflage Path</label>
+            <form id="customPathForm" class="inline-form" novalidate>
+              <input
+                type="text"
+                id="customPathInput"
+                class="text-input"
+                value="/ws/sync"
+                placeholder="/ws/sync"
+                pattern="^/[a-zA-Z0-9._~/-]+$"
+                autocomplete="off"
+                spellcheck="false"
+              >
+              <button type="submit" class="btn" id="btnApplyPath">Apply Path</button>
+            </form>
+            <div class="path-presets" role="group" aria-label="Quick camouflage path presets">
+              <button type="button" class="btn btn-ghost btn-xs mono is-active" data-path-preset="/ws/sync" aria-pressed="true">/ws/sync</button>
+              <button type="button" class="btn btn-ghost btn-xs mono" data-path-preset="/api/v2/events" aria-pressed="false">/api/v2/events</button>
+              <button type="button" class="btn btn-ghost btn-xs mono" data-path-preset="/cdn/assets/sync" aria-pressed="false">/cdn/assets/sync</button>
+            </div>
+          </div>
+
+          <div class="sync-col-3">
+            <span class="field-label">Power Scaling</span>
+            <div class="switch-list" role="group" aria-label="Idle power scaling">
+              <label class="switch-row" for="chkIdlePower">
+                <span class="switch-copy">
+                  <span class="switch-title">Idle Power Mode</span>
+                  <span class="switch-desc">Scale carriers 4 → 1 when idle &gt; 60s</span>
+                </span>
+                <input type="checkbox" role="switch" id="chkIdlePower" class="toggle-switch">
+              </label>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -2665,13 +2756,37 @@ const dashboardHTML = `<!doctype html>
     return getCheckedVal('prov_mode', 'android');
   }
 
+  function updatePathPresetHighlights(activePath) {
+    var btns = document.querySelectorAll('[data-path-preset]');
+    for (var i = 0; i < btns.length; i++) {
+      var match = btns[i].getAttribute('data-path-preset') === activePath;
+      btns[i].classList.toggle('is-active', match);
+      btns[i].setAttribute('aria-pressed', match ? 'true' : 'false');
+    }
+  }
+
   function syncProfileControls(sc) {
     if (!sc) return;
+    if (sc.protocol_profile) setRadioGroup('protocol_profile', sc.protocol_profile);
     if (sc.cipher) setRadioGroup('cipher', sc.cipher);
     if (sc.transport) setRadioGroup('transport', sc.transport);
     if (sc.fingerprint) setRadioGroup('fingerprint', sc.fingerprint);
     if (sc.padding_mode) setRadioGroup('padding_mode', sc.padding_mode);
+    if (sc.fragment_mode) setRadioGroup('fragment_mode', sc.fragment_mode);
+    if (sc.quic_mode) setRadioGroup('quic_mode', sc.quic_mode);
+    if (sc.window_profile) setRadioGroup('window_profile', sc.window_profile);
     if (sc.carriers) setRadioGroup('carriers', sc.carriers);
+    var idleChk = document.getElementById('chkIdlePower');
+    if (idleChk && typeof sc.idle_power === 'boolean') {
+      idleChk.checked = sc.idle_power;
+    }
+    var pathInp = document.getElementById('customPathInput');
+    if (pathInp && sc.custom_path && document.activeElement !== pathInp) {
+      pathInp.value = sc.custom_path;
+    }
+    if (sc.custom_path) {
+      updatePathPresetHighlights(sc.custom_path);
+    }
   }
 
   function renderLinks() {
@@ -2679,26 +2794,54 @@ const dashboardHTML = `<!doctype html>
     var sc = lastData.sync_config || lastData.config || {};
     var fb = document.getElementById('fallbackInput').value.trim();
     var cip = document.getElementById('cleanIpInput').value.trim();
+    var protocolProfile = sc.protocol_profile || getCheckedVal('protocol_profile', 'mux');
     var cipher = sc.cipher || getCheckedVal('cipher', 'xchacha20-poly1305');
     var transport = sc.transport || getCheckedVal('transport', 'auto');
     var fingerprint = sc.fingerprint || getCheckedVal('fingerprint', 'chrome');
     var paddingMode = sc.padding_mode || getCheckedVal('padding_mode', 'balanced');
+    var fragmentMode = sc.fragment_mode || getCheckedVal('fragment_mode', 'off');
+    var quicMode = sc.quic_mode || getCheckedVal('quic_mode', 'full');
+    var windowProfile = sc.window_profile || getCheckedVal('window_profile', 'max');
+    var defaultPath = (lastData.config && lastData.config.tunnel_path) || '/ws/sync';
+    var pathInp = document.getElementById('customPathInput');
+    var customPath = sc.custom_path || (pathInp ? pathInp.value.trim() : '') || defaultPath;
+    var idleChk = document.getElementById('chkIdlePower');
+    var idlePower = typeof sc.idle_power === 'boolean' ? sc.idle_power : Boolean(idleChk && idleChk.checked);
     var carriers = (Number.isFinite(sc.carriers) && sc.carriers > 0) ? sc.carriers : getSelectedCarriers();
     var mode = getProvisionMode();
 
+    var summaryParts = [
+      protocolProfile,
+      cipher,
+      transport,
+      fingerprint,
+      'pad:' + paddingMode,
+      'frag:' + fragmentMode,
+      'quic:' + quicMode,
+      'win:' + windowProfile,
+      carriers + 'c'
+    ];
+    if (idlePower) summaryParts.push('idle-pwr');
+
     var summaryEl = document.getElementById('provProfileSummary');
     if (summaryEl) {
-      summaryEl.textContent = cipher + ' · ' + transport + ' · ' + fingerprint + ' · ' + paddingMode + ' · ' + carriers + 'c';
+      summaryEl.textContent = summaryParts.join(' · ');
     }
 
     var obj = {
       psk: lastData.psk,
       primary_url: lastData.ws_url,
+      protocol_profile: protocolProfile,
       carriers: carriers,
       cipher: cipher,
       transport: transport,
       fingerprint: fingerprint,
-      padding_mode: paddingMode
+      padding_mode: paddingMode,
+      fragment_mode: fragmentMode,
+      quic_mode: quicMode,
+      window_profile: windowProfile,
+      custom_path: customPath,
+      idle_power: idlePower
     };
     if (fb) obj.fallback_url = fb;
     if (cip) obj.cf_clean_ip = cip;
@@ -2710,6 +2853,10 @@ const dashboardHTML = `<!doctype html>
       ' -transport ' + transport +
       ' -fingerprint ' + fingerprint +
       ' -padding ' + paddingMode;
+    if (fragmentMode && fragmentMode !== 'off') cliFlags += ' -fragment ' + fragmentMode;
+    if (windowProfile && windowProfile !== 'max') cliFlags += ' -window ' + windowProfile;
+    if (customPath && customPath !== defaultPath) cliFlags += ' -path ' + customPath;
+    if (idlePower) cliFlags += ' -idle-power';
     if (fb) cliFlags += ' -fallback ' + fb;
 
     rawCliCmd = './aether-client -server ' + lastData.ws_url + ' -psk "' + lastData.psk + '"' + cliFlags;
@@ -2736,7 +2883,7 @@ const dashboardHTML = `<!doctype html>
   // ── API Actions ─────────────────────────────────────────────────────────
   async function setSyncField(field, rawVal, settingLabel) {
     lastLocalMutationAt = Date.now();
-    var val = field === 'carriers' ? parseInt(rawVal, 10) : rawVal;
+    var val = field === 'carriers' ? parseInt(rawVal, 10) : (field === 'idle_power' ? Boolean(rawVal) : rawVal);
     var payload = {};
     payload[field] = val;
 
@@ -2744,6 +2891,9 @@ const dashboardHTML = `<!doctype html>
       if (!lastData.sync_config) lastData.sync_config = {};
       lastData.sync_config[field] = val;
       if (lastData.config) lastData.config[field] = val;
+      if (field === 'custom_path' && val) {
+        document.getElementById('tunnelPathPill').textContent = val;
+      }
       renderLinks();
     }
 
@@ -2761,6 +2911,9 @@ const dashboardHTML = `<!doctype html>
       var res = await r.json();
       if (lastData && res && res.sync_config) {
         lastData.sync_config = res.sync_config;
+        if (res.sync_config.custom_path) {
+          document.getElementById('tunnelPathPill').textContent = res.sync_config.custom_path;
+        }
         syncProfileControls(res.sync_config);
         renderLinks();
       }
@@ -2973,8 +3126,9 @@ const dashboardHTML = `<!doctype html>
         d.mem_alloc_mb.toFixed(1) + ' / ' + d.mem_sys_mb.toFixed(1) + ' MB RAM · ' + d.goroutines + ' goroutines';
 
       document.getElementById('cacheCountMeta').textContent = d.dns_cache_size + ' cached records';
-      if (d.config && d.config.tunnel_path) {
-        document.getElementById('tunnelPathPill').textContent = d.config.tunnel_path;
+      var activePath = sc.custom_path || (d.config && (d.config.custom_path || d.config.tunnel_path));
+      if (activePath) {
+        document.getElementById('tunnelPathPill').textContent = activePath;
       }
 
       // Live throughput directly from server's smooth 3-second monotonic sliding window
@@ -3030,10 +3184,16 @@ const dashboardHTML = `<!doctype html>
         syncProfileControls(sc);
 
         var nextSyncSig = [
+          sc.protocol_profile || '',
           sc.cipher || '',
           sc.transport || '',
           sc.fingerprint || '',
           sc.padding_mode || '',
+          sc.fragment_mode || '',
+          sc.quic_mode || '',
+          sc.window_profile || '',
+          sc.custom_path || '',
+          sc.idle_power ? '1' : '0',
           sc.carriers || '',
           d.fallback_default || ''
         ].join('|');
@@ -3106,10 +3266,14 @@ const dashboardHTML = `<!doctype html>
   document.getElementById('cleanIpInput').addEventListener('input', renderLinks);
 
   var syncGroups = [
+    { name: 'protocol_profile', title: 'Protocol Profile' },
     { name: 'cipher', title: 'Cipher' },
     { name: 'transport', title: 'Transport' },
     { name: 'fingerprint', title: 'Fingerprint' },
     { name: 'padding_mode', title: 'Padding' },
+    { name: 'fragment_mode', title: 'TLS Fragmentation' },
+    { name: 'quic_mode', title: 'QUIC / UDP' },
+    { name: 'window_profile', title: 'Chunk & Window' },
     { name: 'carriers', title: 'Carriers' }
   ];
   for (var sg = 0; sg < syncGroups.length; sg++) {
@@ -3123,6 +3287,42 @@ const dashboardHTML = `<!doctype html>
         });
       }
     })(syncGroups[sg]);
+  }
+
+  document.getElementById('chkIdlePower').addEventListener('change', function (ev) {
+    setSyncField('idle_power', ev.target.checked, 'Idle Power (' + (ev.target.checked ? 'On' : 'Off') + ')');
+  });
+
+  function applyCustomPath(raw) {
+    var val = (raw || '').trim();
+    if (!val) {
+      toast('Enter a camouflage path (e.g. /ws/sync)', 'warn');
+      return;
+    }
+    if (val.charAt(0) !== '/') val = '/' + val;
+    val = val.replace(/\/+$/, '');
+    if (!val || val === '/health' || !/^\/[a-zA-Z0-9._~/-]+$/.test(val)) {
+      toast('Invalid camouflage path (avoid /health or spaces)', 'warn');
+      return;
+    }
+    var inp = document.getElementById('customPathInput');
+    if (inp) inp.value = val;
+    updatePathPresetHighlights(val);
+    setSyncField('custom_path', val, 'Camouflage Path (' + val + ')');
+  }
+
+  document.getElementById('customPathForm').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var inp = document.getElementById('customPathInput');
+    applyCustomPath(inp ? inp.value : '');
+  });
+
+  var pathPresetBtns = document.querySelectorAll('[data-path-preset]');
+  for (var pp = 0; pp < pathPresetBtns.length; pp++) {
+    pathPresetBtns[pp].addEventListener('click', function (ev) {
+      var presetPath = ev.currentTarget.getAttribute('data-path-preset');
+      applyCustomPath(presetPath);
+    });
   }
 
   var modeRadios = document.querySelectorAll('input[name="prov_mode"]');

@@ -48,11 +48,14 @@ var udpBufPool = sync.Pool{
 }
 
 type MobileConfig struct {
-	PSK         string             `json:"psk"`
-	Carriers    int                `json:"carriers"`
-	Cipher      string             `json:"cipher"`
-	PaddingMode string             `json:"padding_mode"`
-	Endpoints   []carrier.Endpoint `json:"endpoints"`
+	PSK           string             `json:"psk"`
+	Carriers      int                `json:"carriers"`
+	Cipher        string             `json:"cipher"`
+	PaddingMode   string             `json:"padding_mode"`
+	WindowProfile string             `json:"window_profile"`
+	QUICMode      string             `json:"quic_mode"`
+	IdlePower     bool               `json:"idle_power"`
+	Endpoints     []carrier.Endpoint `json:"endpoints"`
 }
 
 type udpFlowEntry struct {
@@ -71,6 +74,7 @@ type vpnInstance struct {
 	udpMu     sync.RWMutex
 	udpFlows  map[uint32]*udpFlowEntry
 	nextFlow  atomic.Uint32
+	quicMode  atomic.Value // string: full | force_tcp | dns_only
 	syncMu    sync.RWMutex
 	syncJSON  string
 	syncSeq   atomic.Int64
@@ -104,14 +108,42 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 		udpFlows: make(map[uint32]*udpFlowEntry),
 		dnsCache: adns.NewUDPCache(60 * time.Second),
 	}
+	if cfg.QUICMode == "" {
+		cfg.QUICMode = "full"
+	}
+	inst.quicMode.Store(cfg.QUICMode)
 
 	mgr, err := session.NewClientManager(session.ClientConfig{
-		PSK:         cfg.PSK,
-		Endpoints:   cfg.Endpoints,
-		Carriers:    cfg.Carriers,
-		Cipher:      cfg.Cipher,
-		PaddingMode: cfg.PaddingMode,
+		PSK:           cfg.PSK,
+		Endpoints:     cfg.Endpoints,
+		Carriers:      cfg.Carriers,
+		Cipher:        cfg.Cipher,
+		PaddingMode:   cfg.PaddingMode,
+		WindowProfile: cfg.WindowProfile,
+		IdlePower:     cfg.IdlePower,
 		OnConfigSync: func(payload []byte) {
+			var p struct {
+				PaddingMode   string `json:"padding_mode"`
+				WindowProfile string `json:"window_profile"`
+				QUICMode      string `json:"quic_mode"`
+				IdlePower     *bool  `json:"idle_power"`
+			}
+			if json.Unmarshal(payload, &p) == nil {
+				if p.QUICMode != "" {
+					inst.quicMode.Store(p.QUICMode)
+				}
+				if inst.mgr != nil {
+					if p.PaddingMode != "" {
+						inst.mgr.SetPaddingMode(p.PaddingMode)
+					}
+					if p.WindowProfile != "" {
+						inst.mgr.SetWindowProfile(p.WindowProfile)
+					}
+					if p.IdlePower != nil {
+						inst.mgr.SetIdlePower(*p.IdlePower)
+					}
+				}
+			}
 			inst.syncMu.Lock()
 			inst.syncJSON = string(payload)
 			inst.syncMu.Unlock()
@@ -213,12 +245,16 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
 
-	// Forward UDP datagrams: 0.1ms local cache of AdGuard DNS answers, 4s DNS TTL, 65s QUIC TTL
+	// Forward UDP datagrams: 0.1ms local cache of AdGuard DNS answers, 4s DNS TTL, 65s QUIC TTL, live QUIC mode enforcement
 	udpFwd := udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
 		id := r.ID()
 		isDNS := id.LocalPort == 53
 
 		if !isDNS {
+			qm, _ := inst.quicMode.Load().(string)
+			if qm == "dns_only" || (qm == "force_tcp" && id.LocalPort == 443) {
+				return false
+			}
 			inst.udpMu.RLock()
 			count := len(inst.udpFlows)
 			inst.udpMu.RUnlock()
@@ -426,10 +462,24 @@ func PushConfigJSON(configJSON string) error {
 		return errors.New("vpn is not running")
 	}
 	var p struct {
-		PaddingMode string `json:"padding_mode"`
+		PaddingMode   string `json:"padding_mode"`
+		WindowProfile string `json:"window_profile"`
+		QUICMode      string `json:"quic_mode"`
+		IdlePower     *bool  `json:"idle_power"`
 	}
-	if err := json.Unmarshal([]byte(configJSON), &p); err == nil && p.PaddingMode != "" {
-		inst.mgr.SetPaddingMode(p.PaddingMode)
+	if err := json.Unmarshal([]byte(configJSON), &p); err == nil {
+		if p.PaddingMode != "" {
+			inst.mgr.SetPaddingMode(p.PaddingMode)
+		}
+		if p.WindowProfile != "" {
+			inst.mgr.SetWindowProfile(p.WindowProfile)
+		}
+		if p.QUICMode != "" {
+			inst.quicMode.Store(p.QUICMode)
+		}
+		if p.IdlePower != nil {
+			inst.mgr.SetIdlePower(*p.IdlePower)
+		}
 	}
 	return inst.mgr.SendConfigSync([]byte(configJSON))
 }

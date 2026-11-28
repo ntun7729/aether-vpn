@@ -63,7 +63,7 @@ func (c *XHTTPCarrier) notifyWritten(n int) {
 
 // DialXHTTP establishes a SplitHTTP carrier (GET downlink + batched POST uplink).
 func DialXHTTP(ctx context.Context, ep Endpoint, timeout time.Duration) (*XHTTPCarrier, error) {
-	rawURL := ep.URL
+	rawURL := resolveEndpointURL(ep.URL, ep.CustomPath)
 	rawURL = strings.Replace(rawURL, "wss://", "https://", 1)
 	rawURL = strings.Replace(rawURL, "ws://", "http://", 1)
 	if !strings.HasSuffix(rawURL, "/xhttp") {
@@ -121,7 +121,7 @@ func DialXHTTP(ctx context.Context, ep Endpoint, timeout time.Duration) (*XHTTPC
 			if tc, ok := rawConn.(*net.TCPConn); ok {
 				_ = tc.SetNoDelay(true)
 			}
-			return dialUTLS(dctx, rawConn, host, ep.Fingerprint, []string{"http/1.1"})
+			return dialUTLS(dctx, rawConn, host, ep.Fingerprint, ep.FragmentMode, []string{"http/1.1"})
 		},
 		TLSClientConfig: &tls.Config{ServerName: host},
 	}

@@ -60,18 +60,43 @@ type udpRelay struct {
 }
 
 type SyncConfig struct {
-	UpdatedAt   int64    `json:"updated_at"`
-	DNSPreset   string   `json:"dns_preset"`
-	UpstreamDNS []string `json:"upstream_dns"`
-	CustomDNS   string   `json:"custom_dns,omitempty"`
-	BlockDoT    bool     `json:"block_dot"`
-	AdblockSNI  bool     `json:"adblock_sni"`
-	Cipher      string   `json:"cipher"`
-	Transport   string   `json:"transport"`
-	Fingerprint string   `json:"fingerprint"`
-	PaddingMode string   `json:"padding_mode"`
-	Carriers    int      `json:"carriers"`
-	FallbackURL string   `json:"fallback_url"`
+	UpdatedAt       int64    `json:"updated_at"`
+	ProtocolProfile string   `json:"protocol_profile"` // mux | fast | ghost | custom
+	DNSPreset       string   `json:"dns_preset"`
+	UpstreamDNS     []string `json:"upstream_dns"`
+	CustomDNS       string   `json:"custom_dns,omitempty"`
+	BlockDoT        bool     `json:"block_dot"`
+	AdblockSNI      bool     `json:"adblock_sni"`
+	Cipher          string   `json:"cipher"`
+	Transport       string   `json:"transport"`
+	Fingerprint     string   `json:"fingerprint"`
+	PaddingMode     string   `json:"padding_mode"`
+	FragmentMode    string   `json:"fragment_mode"`   // off | balanced | strict
+	QUICMode        string   `json:"quic_mode"`       // full | force_tcp | dns_only
+	WindowProfile   string   `json:"window_profile"`  // max | balanced | gaming
+	CustomPath      string   `json:"custom_path"`     // e.g. /ws/sync, /api/v2/events, /cdn/assets/sync
+	IdlePower       bool     `json:"idle_power"`
+	Carriers        int      `json:"carriers"`
+	FallbackURL     string   `json:"fallback_url"`
+}
+
+type SyncPatch struct {
+	ProtocolProfile string  `json:"protocol_profile"`
+	DNSPreset       string  `json:"dns_preset"`
+	CustomDNS       string  `json:"custom_dns"`
+	BlockDoT        *bool   `json:"block_dot"`
+	AdblockSNI      *bool   `json:"adblock_sni"`
+	Cipher          string  `json:"cipher"`
+	Transport       string  `json:"transport"`
+	Fingerprint     string  `json:"fingerprint"`
+	PaddingMode     string  `json:"padding_mode"`
+	FragmentMode    string  `json:"fragment_mode"`
+	QUICMode        string  `json:"quic_mode"`
+	WindowProfile   string  `json:"window_profile"`
+	CustomPath      *string `json:"custom_path"`
+	IdlePower       *bool   `json:"idle_power"`
+	Carriers        *int    `json:"carriers"`
+	FallbackURL     *string `json:"fallback_url"`
 }
 
 type rateSample struct {
@@ -94,20 +119,26 @@ type Server struct {
 	upgrader    websocket.Upgrader
 
 	// Runtime-configurable settings protected by cfgMu (synced bidirectionally with clients!)
-	cfgMu       sync.RWMutex
-	upstreamDNS []string
-	dnsPreset   string
-	customDNS   string
-	blockDoT    bool
-	adblockSNI  bool
-	blocker     *adblock.Blocker
-	cipherName  string
-	transport   string
-	fingerprint string
-	paddingMode string
-	carriers    int
-	fallbackURL string
-	cfgUpdated  int64
+	cfgMu           sync.RWMutex
+	upstreamDNS     []string
+	dnsPreset       string
+	customDNS       string
+	blockDoT        bool
+	adblockSNI      bool
+	blocker         *adblock.Blocker
+	protocolProfile string
+	cipherName      string
+	transport       string
+	fingerprint     string
+	paddingMode     string
+	fragmentMode    string
+	quicMode        string
+	windowProfile   string
+	customPath      string
+	idlePower       bool
+	carriers        int
+	fallbackURL     string
+	cfgUpdated      int64
 
 	// Smooth 3-second rolling throughput meter (eliminates Envoy burst & browser poll jitter!)
 	rateMu       sync.RWMutex
@@ -169,16 +200,22 @@ func NewServer(psk, adminKey, tunnelPath string, allowPrivate, adblockSNI, block
 		udpDNSCache: adns.NewUDPCache(60 * time.Second),
 		upstreamDNS: upstreamDNS,
 		dnsPreset:   preset,
-		blockDoT:    blockDoT,
-		adblockSNI:  adblockSNI,
-		blocker:     adblock.New(adblockSNI),
-		cipherName:  "xchacha20-poly1305",
-		transport:   "auto",
-		fingerprint: "chrome",
-		paddingMode: "balanced",
-		carriers:    4,
-		fallbackURL: fallback,
-		cfgUpdated:  time.Now().UnixMilli(),
+		blockDoT:        blockDoT,
+		adblockSNI:      adblockSNI,
+		blocker:         adblock.New(adblockSNI),
+		protocolProfile: "mux",
+		cipherName:      "xchacha20-poly1305",
+		transport:       "auto",
+		fingerprint:     "chrome",
+		paddingMode:     "balanced",
+		fragmentMode:    "off",
+		quicMode:        "full",
+		windowProfile:   "max",
+		customPath:      tunnelPath,
+		idlePower:       false,
+		carriers:        4,
+		fallbackURL:     fallback,
+		cfgUpdated:      time.Now().UnixMilli(),
 		decoyProxy:  proxy,
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:    256 * 1024,
@@ -234,28 +271,35 @@ func (s *Server) getSyncConfig() SyncConfig {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
 	return SyncConfig{
-		UpdatedAt:   s.cfgUpdated,
-		DNSPreset:   s.dnsPreset,
-		UpstreamDNS: append([]string(nil), s.upstreamDNS...),
-		CustomDNS:   s.customDNS,
-		BlockDoT:    s.blockDoT,
-		AdblockSNI:  s.adblockSNI,
-		Cipher:      s.cipherName,
-		Transport:   s.transport,
-		Fingerprint: s.fingerprint,
-		PaddingMode: s.paddingMode,
-		Carriers:    s.carriers,
-		FallbackURL: s.fallbackURL,
+		UpdatedAt:       s.cfgUpdated,
+		ProtocolProfile: s.protocolProfile,
+		DNSPreset:       s.dnsPreset,
+		UpstreamDNS:     append([]string(nil), s.upstreamDNS...),
+		CustomDNS:       s.customDNS,
+		BlockDoT:        s.blockDoT,
+		AdblockSNI:      s.adblockSNI,
+		Cipher:          s.cipherName,
+		Transport:       s.transport,
+		Fingerprint:     s.fingerprint,
+		PaddingMode:     s.paddingMode,
+		FragmentMode:    s.fragmentMode,
+		QUICMode:        s.quicMode,
+		WindowProfile:   s.windowProfile,
+		CustomPath:      s.customPath,
+		IdlePower:       s.idlePower,
+		Carriers:        s.carriers,
+		FallbackURL:     s.fallbackURL,
 	}
 }
 
 func (s *Server) broadcastSyncConfig(excludeID [16]byte, hasExclude bool) {
-	raw, err := json.Marshal(s.getSyncConfig())
+	cfg := s.getSyncConfig()
+	raw, err := json.Marshal(cfg)
 	if err != nil {
 		return
 	}
 	padBytes := 24
-	switch s.getSyncConfig().PaddingMode {
+	switch cfg.PaddingMode {
 	case "off":
 		padBytes = 0
 	case "stealth":
@@ -265,6 +309,7 @@ func (s *Server) broadcastSyncConfig(excludeID [16]byte, hasExclude bool) {
 	targets := make([]*session.Session, 0, len(s.sessions))
 	for id, ss := range s.sessions {
 		ss.sess.SetMaxPad(padBytes)
+		ss.sess.SetWindowProfile(cfg.WindowProfile)
 		if hasExclude && id == excludeID {
 			continue
 		}
@@ -278,19 +323,56 @@ func (s *Server) broadcastSyncConfig(excludeID [16]byte, hasExclude bool) {
 	}
 }
 
-func (s *Server) applySyncPatch(patch struct {
-	DNSPreset   string `json:"dns_preset"`
-	CustomDNS   string `json:"custom_dns"`
-	BlockDoT    *bool  `json:"block_dot"`
-	AdblockSNI  *bool  `json:"adblock_sni"`
-	Cipher      string `json:"cipher"`
-	Transport   string `json:"transport"`
-	Fingerprint string `json:"fingerprint"`
-	PaddingMode string `json:"padding_mode"`
-	Carriers    *int   `json:"carriers"`
-	FallbackURL *string `json:"fallback_url"`
-}, excludeID [16]byte, hasExclude bool) SyncConfig {
+func sanitizeTunnelPath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return ""
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	p = strings.TrimSuffix(p, "/")
+	if p == "" || p == "/health" {
+		return ""
+	}
+	return p
+}
+
+func (s *Server) applySyncPatch(patch SyncPatch, excludeID [16]byte, hasExclude bool) SyncConfig {
 	s.cfgMu.Lock()
+	// Apply 1-tap Aether Protocol Profile presets first (individual fields below can still override)
+	if patch.ProtocolProfile != "" {
+		switch strings.ToLower(strings.TrimSpace(patch.ProtocolProfile)) {
+		case "fast":
+			s.protocolProfile = "fast"
+			s.cipherName = "none"
+			s.transport = "ws"
+			s.paddingMode = "off"
+			s.fragmentMode = "off"
+			s.windowProfile = "max"
+			s.carriers = 4
+		case "ghost":
+			s.protocolProfile = "ghost"
+			s.cipherName = "xchacha20-poly1305"
+			s.transport = "xhttp"
+			s.fingerprint = "randomized"
+			s.paddingMode = "stealth"
+			s.fragmentMode = "strict"
+			s.windowProfile = "balanced"
+			s.carriers = 4
+		case "mux":
+			s.protocolProfile = "mux"
+			s.cipherName = "xchacha20-poly1305"
+			s.transport = "auto"
+			s.fingerprint = "chrome"
+			s.paddingMode = "balanced"
+			s.fragmentMode = "off"
+			s.windowProfile = "max"
+			s.carriers = 4
+		case "custom":
+			s.protocolProfile = "custom"
+		}
+	}
 	if patch.DNSPreset != "" {
 		switch strings.ToLower(strings.TrimSpace(patch.DNSPreset)) {
 		case "adguard":
@@ -339,6 +421,32 @@ func (s *Server) applySyncPatch(patch struct {
 			s.paddingMode = strings.ToLower(strings.TrimSpace(patch.PaddingMode))
 		}
 	}
+	if patch.FragmentMode != "" {
+		switch strings.ToLower(strings.TrimSpace(patch.FragmentMode)) {
+		case "off", "balanced", "strict":
+			s.fragmentMode = strings.ToLower(strings.TrimSpace(patch.FragmentMode))
+		}
+	}
+	if patch.QUICMode != "" {
+		switch strings.ToLower(strings.TrimSpace(patch.QUICMode)) {
+		case "full", "force_tcp", "dns_only":
+			s.quicMode = strings.ToLower(strings.TrimSpace(patch.QUICMode))
+		}
+	}
+	if patch.WindowProfile != "" {
+		switch strings.ToLower(strings.TrimSpace(patch.WindowProfile)) {
+		case "max", "balanced", "gaming":
+			s.windowProfile = strings.ToLower(strings.TrimSpace(patch.WindowProfile))
+		}
+	}
+	if patch.CustomPath != nil {
+		if clean := sanitizeTunnelPath(*patch.CustomPath); clean != "" {
+			s.customPath = clean
+		}
+	}
+	if patch.IdlePower != nil {
+		s.idlePower = *patch.IdlePower
+	}
 	if patch.Carriers != nil {
 		n := *patch.Carriers
 		if n < 1 {
@@ -359,7 +467,30 @@ func (s *Server) applySyncPatch(patch struct {
 	return s.getSyncConfig()
 }
 
+func (s *Server) matchTunnelPaths(reqPath string) (isWS, isH2, isXHTTP bool) {
+	s.cfgMu.RLock()
+	cp := s.customPath
+	s.cfgMu.RUnlock()
+	bases := []string{strings.TrimSuffix(s.path, "/")}
+	if cp != "" && cp != s.path {
+		bases = append(bases, strings.TrimSuffix(cp, "/"))
+	}
+	for _, b := range bases {
+		switch reqPath {
+		case b:
+			return true, false, false
+		case b + "/h2":
+			return false, true, false
+		case b + "/xhttp":
+			return false, false, true
+		}
+	}
+	return false, false, false
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	isWSPath, isH2Path, isXHTTPPath := s.matchTunnelPaths(r.URL.Path)
+
 	switch {
 	case r.URL.Path == "/health":
 		w.Header().Set("Content-Type", "application/json")
@@ -371,7 +502,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 
-	case r.URL.Path == s.path && websocket.IsWebSocketUpgrade(r):
+	case isWSPath && websocket.IsWebSocketUpgrade(r):
 		conn, err := s.upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -380,7 +511,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveCarrier(carrier.WrapConn(conn, carrier.Endpoint{Name: r.RemoteAddr}))
 		return
 
-	case r.URL.Path == s.h2Path && r.Method == http.MethodPost:
+	case isH2Path && r.Method == http.MethodPost:
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -394,7 +525,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveCarrier(carrier.WrapH2Server(r, w, flusher, carrier.Endpoint{Name: r.RemoteAddr}))
 		return
 
-	case r.URL.Path == s.xhttpPath && r.Method == http.MethodGet:
+	case isXHTTPPath && r.Method == http.MethodGet:
 		id := r.URL.Query().Get("id")
 		if len(id) < 8 || len(id) > 64 {
 			http.Error(w, "bad stream id", http.StatusBadRequest)
@@ -424,7 +555,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveCarrier(xc)
 		return
 
-	case r.URL.Path == s.xhttpPath && r.Method == http.MethodPost:
+	case isXHTTPPath && r.Method == http.MethodPost:
 		id := r.URL.Query().Get("id")
 		s.xhttpMu.Lock()
 		xc, ok := s.xhttpMap[id]
@@ -555,7 +686,7 @@ func (s *Server) serveCarrier(c carrier.Conn) {
 			s.handleUDPPacket(ss, flowID, addr, payload)
 		},
 	)
-	// Apply current server padding mode and wire bidirectional live config sync!
+	// Apply current server padding & window profile and wire bidirectional live config sync!
 	curCfg := s.getSyncConfig()
 	switch curCfg.PaddingMode {
 	case "off":
@@ -565,19 +696,9 @@ func (s *Server) serveCarrier(c carrier.Conn) {
 	default:
 		sess.SetMaxPad(session.DefaultMaxPad)
 	}
+	sess.SetWindowProfile(curCfg.WindowProfile)
 	sess.SetConfigSyncHandler(func(payload []byte) {
-		var patch struct {
-			DNSPreset   string  `json:"dns_preset"`
-			CustomDNS   string  `json:"custom_dns"`
-			BlockDoT    *bool   `json:"block_dot"`
-			AdblockSNI  *bool   `json:"adblock_sni"`
-			Cipher      string  `json:"cipher"`
-			Transport   string  `json:"transport"`
-			Fingerprint string  `json:"fingerprint"`
-			PaddingMode string  `json:"padding_mode"`
-			Carriers    *int    `json:"carriers"`
-			FallbackURL *string `json:"fallback_url"`
-		}
+		var patch SyncPatch
 		if err := json.Unmarshal(payload, &patch); err == nil {
 			s.applySyncPatch(patch, ch.SessionID, true)
 		}
@@ -726,6 +847,7 @@ func (s *Server) handleUDPPacket(ss *serverSession, flowID uint32, addr proto.Ad
 	s.cfgMu.RLock()
 	blockDoT := s.blockDoT
 	upstreams := s.upstreamDNS
+	quicMode := s.quicMode
 	s.cfgMu.RUnlock()
 
 	if blockDoT && addr.Port == 853 {
@@ -735,6 +857,10 @@ func (s *Server) handleUDPPacket(ss *serverSession, flowID uint32, addr proto.Ad
 	if addr.Port == 53 && len(upstreams) > 0 {
 		qCopy := append([]byte(nil), payload...)
 		go s.resolveUDP53(ss, flowID, addr, qCopy, upstreams)
+		return
+	}
+
+	if quicMode == "dns_only" || (quicMode == "force_tcp" && addr.Port == 443) {
 		return
 	}
 

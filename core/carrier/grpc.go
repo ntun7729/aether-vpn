@@ -80,7 +80,7 @@ func DialGRPC(ctx context.Context, ep Endpoint, timeout time.Duration) (*GRPCCar
 			if u.Scheme == "http" {
 				return rawConn, nil
 			}
-			return dialUTLS(dctx, rawConn, host, ep.Fingerprint, []string{"h2"})
+			return dialUTLS(dctx, rawConn, host, ep.Fingerprint, ep.FragmentMode, []string{"h2"})
 		},
 	}
 

@@ -157,6 +157,8 @@ type Session struct {
 	onUDP        UDPHandler
 	onConfigSync atomic.Value // ConfigSyncHandler
 	maxPad       atomic.Int32
+	chunkSize    atomic.Int32
+	initWindow   atomic.Int64
 
 	// Carrier pool
 	carrierMu   sync.RWMutex
@@ -206,7 +208,61 @@ func New(id [16]byte, cipher *acrypto.SessionCipher, isServer bool, onOpen Strea
 	}
 	s.endpoint.Store("")
 	s.maxPad.Store(DefaultMaxPad)
+	s.chunkSize.Store(StreamChunkSize)
+	s.initWindow.Store(InitialStreamWindow)
 	return s
+}
+
+// SetWindowProfile adjusts chunk size & initial per-stream flow window live:
+//   - "gaming":   16 KB chunks / 1 MB window (lowest jitter)
+//   - "balanced": 32 KB chunks / 4 MB window
+//   - "max":      60 KB chunks / 8 MB window (highest throughput, default)
+func (s *Session) SetWindowProfile(profile string) {
+	switch profile {
+	case "gaming", "low_latency":
+		s.chunkSize.Store(16 * 1024)
+		s.initWindow.Store(1 << 20)
+	case "balanced":
+		s.chunkSize.Store(32 * 1024)
+		s.initWindow.Store(4 << 20)
+	default:
+		s.chunkSize.Store(StreamChunkSize)
+		s.initWindow.Store(InitialStreamWindow)
+	}
+}
+
+func (s *Session) getChunkSize() int {
+	v := int(s.chunkSize.Load())
+	if v <= 0 {
+		return StreamChunkSize
+	}
+	return v
+}
+
+func (s *Session) getInitialWindow() int64 {
+	v := s.initWindow.Load()
+	if v <= 0 {
+		return InitialStreamWindow
+	}
+	return v
+}
+
+// ScaleDownCarriers gracefully closes excess carriers down to keepN (used by Idle Power Mode).
+func (s *Session) ScaleDownCarriers(keepN int) {
+	if keepN < 1 {
+		keepN = 1
+	}
+	s.carrierMu.Lock()
+	if len(s.carriers) <= keepN {
+		s.carrierMu.Unlock()
+		return
+	}
+	excess := append([]carrier.Conn(nil), s.carriers[keepN:]...)
+	s.carriers = s.carriers[:keepN]
+	s.carrierMu.Unlock()
+	for _, c := range excess {
+		_ = c.Close()
+	}
 }
 
 // SetConfigSyncHandler registers a callback invoked on incoming FrameConfigSync frames.
@@ -523,15 +579,20 @@ func (s *Session) sendWindowUpdate(st *Stream, delta uint32) {
 }
 
 // Ping sends an encrypted in-band RTT keepalive probe on EVERY active carrier.
+// In stealth padding mode (maxPad >= 64), adds random chaff padding so idle heartbeats vary in size.
 func (s *Session) Ping() error {
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], uint64(time.Now().UnixNano()))
 	f := &proto.Frame{Type: proto.FramePing, Payload: buf[:]}
+	pad := 0
+	if s.getMaxPad() >= 64 {
+		pad = s.getMaxPad()
+	}
 	s.carrierMu.RLock()
 	carriers := append([]carrier.Conn(nil), s.carriers...)
 	s.carrierMu.RUnlock()
 	for _, c := range carriers {
-		_ = s.sendOnCarrier(c, f, 0, true)
+		_ = s.sendOnCarrier(c, f, pad, true)
 	}
 	return nil
 }
@@ -714,7 +775,7 @@ func newStream(sess *Session, id uint32, pinned carrier.Conn, striped bool) *Str
 		striped:     striped,
 		pinned:      pinned,
 		nextRecvSeq: 1,
-		sendWindow:  InitialStreamWindow,
+		sendWindow:  sess.getInitialWindow(),
 	}
 	st.readCond = sync.NewCond(&st.readMu)
 	st.winCond = sync.NewCond(&st.winMu)
@@ -921,10 +982,11 @@ func (st *Stream) Write(p []byte) (int, error) {
 	defer st.writeMu.Unlock()
 
 	total := 0
+	chunkLimit := st.sess.getChunkSize()
 	for len(p) > 0 {
 		chunk := p
-		if len(chunk) > StreamChunkSize {
-			chunk = p[:StreamChunkSize]
+		if len(chunk) > chunkLimit {
+			chunk = p[:chunkLimit]
 		}
 
 		st.winMu.Lock()

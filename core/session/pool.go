@@ -19,14 +19,16 @@ import (
 
 // ClientConfig configures the multi-endpoint Aether client manager.
 type ClientConfig struct {
-	PSK          string             `json:"psk"`
-	Endpoints    []carrier.Endpoint `json:"endpoints"` // Ordered by priority: Railway (0), CF Worker / Render (1)
-	Carriers     int                `json:"carriers"`  // Parallel carriers per session (default 4)
-	Cipher       string             `json:"cipher"`    // xchacha20-poly1305 | aes-256-gcm | aes-128-gcm | chacha20-poly1305 | none
-	PaddingMode  string             `json:"padding_mode"` // balanced (default) | stealth | off
-	DialTimeout  time.Duration      `json:"-"`
-	MaxPad       int                `json:"max_pad"`
-	OnConfigSync ConfigSyncHandler  `json:"-"`
+	PSK           string             `json:"psk"`
+	Endpoints     []carrier.Endpoint `json:"endpoints"`      // Ordered by priority: Railway (0), CF Worker / Render (1)
+	Carriers      int                `json:"carriers"`       // Parallel carriers per session (default 4)
+	Cipher        string             `json:"cipher"`         // xchacha20-poly1305 | aes-256-gcm | aes-128-gcm | chacha20-poly1305 | none
+	PaddingMode   string             `json:"padding_mode"`   // balanced (default) | stealth | off
+	WindowProfile string             `json:"window_profile"` // max (default) | balanced | gaming
+	IdlePower     bool               `json:"idle_power"`     // Auto-scale carriers 4->1 when idle >60s
+	DialTimeout   time.Duration      `json:"-"`
+	MaxPad        int                `json:"max_pad"`
+	OnConfigSync  ConfigSyncHandler  `json:"-"`
 }
 
 func paddingBytesForMode(mode string, fallback int) int {
@@ -56,6 +58,10 @@ type ClientManager struct {
 	failoverMu sync.Mutex
 	sess       *Session
 	epIndex    int
+
+	lastActivity atomic.Int64
+	idleMode     atomic.Bool
+	idlePower    atomic.Bool
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -88,13 +94,16 @@ func NewClientManager(cfg ClientConfig, onUDP UDPHandler) (*ClientManager, error
 	cfg.Endpoints = eps
 
 	ctx, cancel := context.WithCancel(context.Background())
-	return &ClientManager{
+	cm := &ClientManager{
 		cfg:    cfg,
 		psk:    []byte(cfg.PSK),
 		onUDP:  onUDP,
 		ctx:    ctx,
 		cancel: cancel,
-	}, nil
+	}
+	cm.lastActivity.Store(time.Now().Unix())
+	cm.idlePower.Store(cfg.IdlePower)
+	return cm, nil
 }
 
 // Start establishes the initial session + parallel carrier pool and starts the watchdog.
@@ -143,21 +152,51 @@ func (m *ClientManager) Session() (*Session, error) {
 }
 
 // OpenStream opens a multiplexed TCP stream on the active session.
+// If Idle Power Mode had scaled carriers down to 1, immediately bursts back to full carrier count!
 func (m *ClientManager) OpenStream(ctx context.Context, host string, port uint16) (*Stream, error) {
+	m.lastActivity.Store(time.Now().Unix())
 	s, err := m.Session()
 	if err != nil {
 		return nil, err
+	}
+	if m.idleMode.Swap(false) {
+		m.mu.RLock()
+		ep := m.cfg.Endpoints[m.epIndex]
+		m.mu.RUnlock()
+		missing := m.cfg.Carriers - s.ActiveCarriers()
+		for k := 0; k < missing; k++ {
+			go m.attachExtraCarrier(s, ep)
+		}
 	}
 	return s.OpenStream(ctx, host, port)
 }
 
 // SendUDP sends a UDP datagram on the active session.
 func (m *ClientManager) SendUDP(flowID uint32, host string, port uint16, payload []byte) error {
+	m.lastActivity.Store(time.Now().Unix())
 	s, err := m.Session()
 	if err != nil {
 		return err
 	}
 	return s.SendUDP(flowID, host, port, payload)
+}
+
+// SetWindowProfile updates chunk size & stream window profile live without reconnecting.
+func (m *ClientManager) SetWindowProfile(profile string) {
+	m.mu.RLock()
+	s := m.sess
+	m.mu.RUnlock()
+	if s != nil {
+		s.SetWindowProfile(profile)
+	}
+}
+
+// SetIdlePower toggles Idle Power Mode live.
+func (m *ClientManager) SetIdlePower(enabled bool) {
+	m.idlePower.Store(enabled)
+	if !enabled {
+		m.idleMode.Store(false)
+	}
 }
 
 // SendConfigSync pushes a live encrypted JSON config update to the server over the active session.
@@ -282,6 +321,7 @@ func (m *ClientManager) dialNewSession(ctx context.Context, ep carrier.Endpoint)
 
 	s := New(sessID, cipher, false, nil, m.onUDP)
 	s.SetMaxPad(paddingBytesForMode(m.cfg.PaddingMode, m.cfg.MaxPad))
+	s.SetWindowProfile(m.cfg.WindowProfile)
 	if m.cfg.OnConfigSync != nil {
 		s.SetConfigSyncHandler(m.cfg.OnConfigSync)
 	}
@@ -432,6 +472,12 @@ func (m *ClientManager) watchdogLoop() {
 		select {
 		case <-pingTicker.C:
 			if s, err := m.Session(); err == nil {
+				if m.idleMode.Load() {
+					// In idle power mode, ping every 3rd tick (~45s) to save phone battery!
+					if (time.Now().Unix()/15)%3 != 0 {
+						continue
+					}
+				}
 				_ = s.Ping()
 			}
 		case <-healTicker.C:
@@ -447,7 +493,17 @@ func (m *ClientManager) watchdogLoop() {
 				ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
 				_ = m.failover(ctx)
 				cancel()
-			} else if active < m.cfg.Carriers {
+				continue
+			}
+			// Idle Power Mode: when no streams are active for >60s, scale carriers 4 -> 1!
+			if m.idlePower.Load() && s.Stats().ActiveStreams == 0 && time.Now().Unix()-m.lastActivity.Load() > 60 {
+				if !m.idleMode.Swap(true) && active > 1 {
+					s.ScaleDownCarriers(1)
+					log.Printf("[aether] idle power mode active — scaled carriers %d -> 1", active)
+				}
+				continue
+			}
+			if !m.idleMode.Load() && active < m.cfg.Carriers {
 				ep := m.cfg.Endpoints[epIdx]
 				go m.attachExtraCarrier(s, ep)
 			}

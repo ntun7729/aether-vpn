@@ -316,6 +316,67 @@ private fun paddingLabel(mode: String): String = when (mode.lowercase(Locale.US)
     else -> "Balanced"
 }
 
+private fun protocolProfileLabel(profile: String): String = when (profile.lowercase(Locale.US)) {
+    "fast" -> "Aether-Fast"
+    "ghost" -> "Aether-Ghost"
+    "custom" -> "Custom"
+    else -> "Aether-Mux"
+}
+
+private fun fragmentLabel(mode: String): String = when (mode.lowercase(Locale.US)) {
+    "balanced" -> "Balanced"
+    "strict" -> "Strict"
+    else -> "Off"
+}
+
+private fun quicLabel(mode: String): String = when (mode.lowercase(Locale.US)) {
+    "force_tcp" -> "Force TCP"
+    "dns_only" -> "DNS Only"
+    else -> "Full QUIC"
+}
+
+private fun windowProfileShort(profile: String): String = when (profile.lowercase(Locale.US)) {
+    "balanced" -> "Balanced"
+    "gaming" -> "Gaming"
+    else -> "Max Speed"
+}
+
+private fun windowProfileDetail(profile: String): String = when (profile.lowercase(Locale.US)) {
+    "balanced" -> "32KB / 4MB"
+    "gaming" -> "16KB / 1MB"
+    else -> "60KB / 8MB"
+}
+
+private fun normalizedPath(path: String): String {
+    val trimmed = path.trim()
+    if (trimmed.isEmpty()) return "/ws/sync"
+    return if (trimmed.startsWith("/")) trimmed else "/$trimmed"
+}
+
+private fun inferProtocolProfile(c: AetherConfig): String = when {
+    c.cipher.equals("none", ignoreCase = true) &&
+        c.transport.equals("ws", ignoreCase = true) &&
+        c.paddingMode.equals("off", ignoreCase = true) &&
+        c.fragmentMode.equals("off", ignoreCase = true) &&
+        c.windowProfile.equals("max", ignoreCase = true) &&
+        c.carriers == 4 -> "fast"
+    c.cipher.equals("xchacha20-poly1305", ignoreCase = true) &&
+        c.transport.equals("xhttp", ignoreCase = true) &&
+        c.fingerprint.equals("randomized", ignoreCase = true) &&
+        c.paddingMode.equals("stealth", ignoreCase = true) &&
+        c.fragmentMode.equals("strict", ignoreCase = true) &&
+        c.windowProfile.equals("balanced", ignoreCase = true) &&
+        c.carriers == 4 -> "ghost"
+    c.cipher.equals("xchacha20-poly1305", ignoreCase = true) &&
+        c.transport.equals("auto", ignoreCase = true) &&
+        c.fingerprint.equals("chrome", ignoreCase = true) &&
+        c.paddingMode.equals("balanced", ignoreCase = true) &&
+        c.fragmentMode.equals("off", ignoreCase = true) &&
+        c.windowProfile.equals("max", ignoreCase = true) &&
+        c.carriers == 4 -> "mux"
+    else -> "custom"
+}
+
 private fun dnsLabel(preset: String): String = when (preset.lowercase(Locale.US)) {
     "cloudflare" -> "Cloudflare"
     "google" -> "Google"
@@ -739,6 +800,8 @@ private fun AetherApp(
                                                     imported.cipher != cfg.cipher ||
                                                     imported.transport != cfg.transport ||
                                                     imported.fingerprint != cfg.fingerprint ||
+                                                    imported.fragmentMode != cfg.fragmentMode ||
+                                                    imported.customPath != cfg.customPath ||
                                                     imported.carriers != cfg.carriers ||
                                                     imported.psk != cfg.psk
                                                 cfg = imported
@@ -772,7 +835,11 @@ private fun AetherApp(
                                         cfg = cfg,
                                         onApplyAndSync = { updated ->
                                             val reconnect = updated.transport != cfg.transport ||
-                                                updated.carriers != cfg.carriers
+                                                updated.carriers != cfg.carriers ||
+                                                updated.cipher != cfg.cipher ||
+                                                updated.fingerprint != cfg.fingerprint ||
+                                                updated.fragmentMode != cfg.fragmentMode ||
+                                                updated.customPath != cfg.customPath
                                             syncToRailway(updated, reconnectIfNeeded = reconnect)
                                         }
                                     )
@@ -781,7 +848,9 @@ private fun AetherApp(
                                         cfg = cfg,
                                         onApplyAndSync = { updated ->
                                             val reconnect = updated.cipher != cfg.cipher ||
-                                                updated.fingerprint != cfg.fingerprint
+                                                updated.fingerprint != cfg.fingerprint ||
+                                                updated.fragmentMode != cfg.fragmentMode ||
+                                                updated.customPath != cfg.customPath
                                             syncToRailway(updated, reconnectIfNeeded = reconnect)
                                         }
                                     )
@@ -917,7 +986,7 @@ private fun TopBrandBar(running: Boolean) {
                     .padding(horizontal = 6.dp, vertical = 2.dp)
             ) {
                 Text(
-                    text = "v4.0",
+                    text = "v4.1",
                     fontSize = 10.sp,
                     fontFamily = FontFamily.Monospace,
                     fontWeight = FontWeight.Medium,
@@ -1150,9 +1219,9 @@ private fun TunnelTab(
                 )
                 Text(
                     text = if (telemetry.running) {
-                        "${telemetry.endpoint} · ${shortCipherName(cfg.cipher)} · ${transportLabel(cfg.transport)} · ${fmtDuration(telemetry.connectedSec)}"
+                        "${telemetry.endpoint} · ${protocolProfileLabel(cfg.protocolProfile)} · ${transportLabel(cfg.transport)} · ${fmtDuration(telemetry.connectedSec)}"
                     } else {
-                        "${shortCipherName(cfg.cipher)} · ${transportLabel(cfg.transport)} · uTLS ${fingerprintLabel(cfg.fingerprint)}"
+                        "${protocolProfileLabel(cfg.protocolProfile)} · ${shortCipherName(cfg.cipher)} · ${transportLabel(cfg.transport)} · uTLS ${fingerprintLabel(cfg.fingerprint)}"
                     },
                     fontSize = 10.5.sp,
                     fontFamily = FontFamily.Monospace,
@@ -1874,19 +1943,19 @@ private fun MenuHubTab(
         )
         MenuHubRow(
             title = "Protocol & Transport",
-            subtitle = "${transportLabel(cfg.transport)} · ${cfg.carriers} Carriers",
+            subtitle = "${protocolProfileLabel(cfg.protocolProfile)} · ${transportLabel(cfg.transport)} · ${cfg.carriers}C · ${windowProfileShort(cfg.windowProfile)}${if (cfg.idlePower) " · Idle" else ""}",
             icon = { ProtocolIcon(color = SignalEmeraldBright, modifier = Modifier.size(18.dp)) },
             onClick = { onOpen(MenuRoute.PROTOCOL) }
         )
         MenuHubRow(
             title = "Encryption & Stealth",
-            subtitle = "${shortCipherName(cfg.cipher)} · ${fingerprintLabel(cfg.fingerprint)} · ${paddingLabel(cfg.paddingMode)}",
+            subtitle = "${shortCipherName(cfg.cipher)} · ${fingerprintLabel(cfg.fingerprint)} · Frag ${fragmentLabel(cfg.fragmentMode)} · ${normalizedPath(cfg.customPath)}",
             icon = { ShieldLockIcon(color = SignalEmeraldBright, modifier = Modifier.size(18.dp)) },
             onClick = { onOpen(MenuRoute.ENCRYPTION) }
         )
         MenuHubRow(
             title = "DNS & Shield",
-            subtitle = "${dnsLabel(cfg.dnsPreset)} · ${if (cfg.blockDot) "DoT Blocked" else "DoT Open"} · ${if (cfg.autoSync) "Sync ON" else "Sync OFF"}",
+            subtitle = "${dnsLabel(cfg.dnsPreset)} · ${quicLabel(cfg.quicMode)} · ${if (cfg.blockDot) "DoT Blocked" else "DoT Open"}",
             icon = { DnsGlobeIcon(color = SignalEmeraldBright, modifier = Modifier.size(18.dp)) },
             onClick = { onOpen(MenuRoute.DNS_SHIELD) }
         )
@@ -1898,7 +1967,7 @@ private fun MenuHubTab(
         )
         MenuHubRow(
             title = "Access Key & Engine",
-            subtitle = "${if (cfg.psk.isNotBlank()) "PSK Configured" else "PSK Missing"} · Aether v4.0",
+            subtitle = "${if (cfg.psk.isNotBlank()) "PSK Configured" else "PSK Missing"} · Aether v4.1",
             icon = { KeyIcon(color = SignalEmeraldBright, modifier = Modifier.size(18.dp)) },
             onClick = { onOpen(MenuRoute.ACCESS_KEY) }
         )
@@ -2287,8 +2356,17 @@ private fun ProtocolSubScreen(
     cfg: AetherConfig,
     onApplyAndSync: (AetherConfig) -> Unit
 ) {
+    val activeProfile = cfg.protocolProfile.ifBlank { "mux" }
     var selectedTransport by remember(cfg.transport) { mutableStateOf(cfg.transport.ifBlank { "auto" }) }
     var selectedCarriers by remember(cfg.carriers) { mutableIntStateOf(cfg.carriers.coerceIn(1, 6)) }
+    var selectedWindow by remember(cfg.windowProfile) { mutableStateOf(cfg.windowProfile.ifBlank { "max" }) }
+    var idlePower by remember(cfg.idlePower) { mutableStateOf(cfg.idlePower) }
+
+    val protocolModes = listOf(
+        Triple("mux", "Aether-Mux", "Default X25519 + AEAD multi-path (Auto · Chrome · Balanced)"),
+        Triple("fast", "Aether-Fast", "Max speed, zero double-encrypt (TLS-Only · WS · Off pad · 60KB/8MB)"),
+        Triple("ghost", "Aether-Ghost", "Heavy anti-DPI stealth (XHTTP · Random uTLS · Strict TLS Frag · Stealth pad)")
+    )
 
     val transports = listOf(
         Triple("auto", "AUTO", "Smart fallback (WS → XHTTP → gRPC → H2)"),
@@ -2298,7 +2376,41 @@ private fun ProtocolSubScreen(
         Triple("h2", "HTTP/2", "Direct HTTP/2 duplex tunnel")
     )
 
+    val windows = listOf(
+        Triple("max", "Max Speed", "60KB / 8MB"),
+        Triple("balanced", "Balanced", "32KB / 4MB"),
+        Triple("gaming", "Gaming", "16KB / 1MB")
+    )
+
     Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        SectionCard(
+            title = "1-TAP AETHER PROTOCOL MODE",
+            trailing = {
+                Text(
+                    text = protocolProfileLabel(activeProfile),
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.SemiBold,
+                    color = SignalEmeraldBright
+                )
+            }
+        ) {
+            protocolModes.forEach { (key, title, desc) ->
+                SelectableOptionCard(
+                    title = title,
+                    description = desc,
+                    selected = activeProfile.equals(key, ignoreCase = true),
+                    onClick = {
+                        val applied = cfg.withProtocolProfile(key)
+                        selectedTransport = applied.transport
+                        selectedCarriers = applied.carriers
+                        selectedWindow = applied.windowProfile
+                        onApplyAndSync(applied)
+                    }
+                )
+            }
+        }
+
         SectionCard(title = "TRANSPORT PROTOCOL") {
             transports.forEach { (key, title, desc) ->
                 SelectableOptionCard(
@@ -2367,15 +2479,52 @@ private fun ProtocolSubScreen(
             }
         }
 
+        SectionCard(
+            title = "CHUNK & WINDOW PROFILE",
+            trailing = {
+                Text(
+                    text = windowProfileDetail(selectedWindow),
+                    fontSize = 10.5.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = SignalEmeraldBright
+                )
+            }
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                windows.forEach { (key, title, detail) ->
+                    SegmentedChipWithSub(
+                        label = title,
+                        sublabel = detail,
+                        selected = selectedWindow.equals(key, ignoreCase = true),
+                        onClick = { selectedWindow = key },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+        }
+
+        SectionCard(title = "POWER & CARRIER SCALING") {
+            SwitchSettingRow(
+                title = "Idle Power Mode",
+                subtitle = "Scale 4 → 1 carrier when idle > 60s to save battery",
+                checked = idlePower,
+                onCheckedChange = { idlePower = it }
+            )
+        }
+
         PrimaryActionButton(
             label = "Apply & Sync",
             onClick = {
-                onApplyAndSync(
-                    cfg.copy(
-                        transport = selectedTransport,
-                        carriers = selectedCarriers.coerceIn(1, 6)
-                    )
+                val next = cfg.copy(
+                    transport = selectedTransport,
+                    carriers = selectedCarriers.coerceIn(1, 6),
+                    windowProfile = selectedWindow,
+                    idlePower = idlePower
                 )
+                onApplyAndSync(next.copy(protocolProfile = inferProtocolProfile(next)))
             }
         )
     }
@@ -2393,6 +2542,8 @@ private fun EncryptionSubScreen(
     var selectedCipher by remember(cfg.cipher) { mutableStateOf(cfg.cipher.ifBlank { "xchacha20-poly1305" }) }
     var selectedFingerprint by remember(cfg.fingerprint) { mutableStateOf(cfg.fingerprint.ifBlank { "chrome" }) }
     var selectedPadding by remember(cfg.paddingMode) { mutableStateOf(cfg.paddingMode.ifBlank { "balanced" }) }
+    var selectedFragment by remember(cfg.fragmentMode) { mutableStateOf(cfg.fragmentMode.ifBlank { "off" }) }
+    var customPathDraft by remember(cfg.customPath) { mutableStateOf(normalizedPath(cfg.customPath)) }
 
     val ciphers = listOf(
         Triple("xchacha20-poly1305", "XChaCha20-Poly1305", "Default, balanced ARM64 speed"),
@@ -2401,6 +2552,14 @@ private fun EncryptionSubScreen(
         Triple("chacha20-poly1305", "ChaCha20-Poly1305", "Standard RFC 8439 AEAD"),
         Triple("none", "TLS-Only (VLESS)", "Zero double-encryption, max speed over uTLS 1.3")
     )
+
+    val fragments = listOf(
+        Triple("off", "Off", "Standard"),
+        Triple("balanced", "Balanced", "40–80B"),
+        Triple("strict", "Strict", "10–30B")
+    )
+
+    val pathPresets = listOf("/ws/sync", "/api/v2/events", "/cdn/assets/sync")
 
     Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
         SectionCard(title = "CIPHER SUITE") {
@@ -2463,16 +2622,76 @@ private fun EncryptionSubScreen(
             }
         }
 
+        SectionCard(title = "TLS CLIENTHELLO FRAGMENTATION") {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                fragments.forEach { (key, label, range) ->
+                    SegmentedChipWithSub(
+                        label = label,
+                        sublabel = range,
+                        selected = selectedFragment.equals(key, ignoreCase = true),
+                        onClick = { selectedFragment = key },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+        }
+
+        SectionCard(title = "CUSTOM CAMOUFLAGE PATH") {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(7.dp)
+            ) {
+                pathPresets.forEach { preset ->
+                    val sel = normalizedPath(customPathDraft).equals(preset, ignoreCase = true)
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(if (sel) SignalEmerald.copy(alpha = 0.14f) else SurfaceRecessed)
+                            .border(
+                                width = 1.dp,
+                                color = if (sel) SignalEmerald else BorderHairline,
+                                shape = RoundedCornerShape(10.dp)
+                            )
+                            .clickable { customPathDraft = preset }
+                            .padding(horizontal = 6.dp, vertical = 9.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = preset,
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = if (sel) FontWeight.Bold else FontWeight.Medium,
+                            color = if (sel) SignalEmeraldBright else TextSecondary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+
+            AetherTextField(
+                value = customPathDraft,
+                onValueChange = { customPathDraft = it },
+                label = "Custom Endpoint Path",
+                placeholder = "/ws/sync"
+            )
+        }
+
         PrimaryActionButton(
             label = "Apply & Sync",
             onClick = {
-                onApplyAndSync(
-                    cfg.copy(
-                        cipher = selectedCipher,
-                        fingerprint = selectedFingerprint,
-                        paddingMode = selectedPadding
-                    )
+                val next = cfg.copy(
+                    cipher = selectedCipher,
+                    fingerprint = selectedFingerprint,
+                    paddingMode = selectedPadding,
+                    fragmentMode = selectedFragment,
+                    customPath = normalizedPath(customPathDraft)
                 )
+                onApplyAndSync(next.copy(protocolProfile = inferProtocolProfile(next)))
             }
         )
     }
@@ -2490,6 +2709,7 @@ private fun DnsShieldSubScreen(
 ) {
     var selectedDns by remember(cfg.dnsPreset) { mutableStateOf(cfg.dnsPreset.ifBlank { "adguard" }) }
     var customDns by remember(cfg.customDns) { mutableStateOf(cfg.customDns) }
+    var selectedQuic by remember(cfg.quicMode) { mutableStateOf(cfg.quicMode.ifBlank { "full" }) }
     var blockDot by remember(cfg.blockDot) { mutableStateOf(cfg.blockDot) }
     var adblockSni by remember(cfg.adblockSni) { mutableStateOf(cfg.adblockSni) }
     var autoSync by remember(cfg.autoSync) { mutableStateOf(cfg.autoSync) }
@@ -2500,6 +2720,12 @@ private fun DnsShieldSubScreen(
         Triple("cloudflare", "Cloudflare", "1.1.1.1 · Ultra-low-latency resolver"),
         Triple("google", "Google", "8.8.8.8 · Global Anycast resolver"),
         Triple("custom", "Custom", "Use your own upstream DNS server(s)")
+    )
+
+    val quicModes = listOf(
+        Triple("full", "Full QUIC", "All UDP"),
+        Triple("force_tcp", "Force TCP", "Block UDP 443"),
+        Triple("dns_only", "DNS Only", "UDP 53 Only")
     )
 
     Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
@@ -2520,6 +2746,46 @@ private fun DnsShieldSubScreen(
                     label = "Custom DNS Servers",
                     placeholder = "9.9.9.9:53, 149.112.112.112:53"
                 )
+            }
+        }
+
+        SectionCard(
+            title = "QUIC / UDP MODE",
+            trailing = {
+                Text(
+                    text = "LIVE · NO RESTART",
+                    fontSize = 9.5.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.SemiBold,
+                    color = SignalEmeraldBright
+                )
+            }
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                quicModes.forEach { (key, title, detail) ->
+                    SegmentedChipWithSub(
+                        label = title,
+                        sublabel = detail,
+                        selected = selectedQuic.equals(key, ignoreCase = true),
+                        onClick = {
+                            selectedQuic = key
+                            onSyncToRailway(
+                                cfg.copy(
+                                    dnsPreset = selectedDns,
+                                    customDns = customDns.trim(),
+                                    quicMode = key,
+                                    blockDot = blockDot,
+                                    adblockSni = adblockSni,
+                                    autoSync = autoSync
+                                )
+                            )
+                        },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
             }
         }
 
@@ -2553,6 +2819,7 @@ private fun DnsShieldSubScreen(
                     cfg.copy(
                         dnsPreset = selectedDns,
                         customDns = customDns.trim(),
+                        quicMode = selectedQuic,
                         blockDot = blockDot,
                         adblockSni = adblockSni,
                         autoSync = autoSync
@@ -3029,13 +3296,15 @@ private fun AccessKeySubScreen(
 
         SectionCard(title = "ENGINE SPECIFICATION") {
             val specs = listOf(
-                "Protocol" to "Aether v4 · 0-RTT",
+                "Protocol" to "Aether v4.1 · ${protocolProfileLabel(cfg.protocolProfile)}",
                 "Active Cipher" to fullCipherName(cfg.cipher),
                 "Transport" to "${transportLabel(cfg.transport)} · ${cfg.carriers} Carriers",
-                "Stealth uTLS" to "${fingerprintLabel(cfg.fingerprint)} · ${paddingLabel(cfg.paddingMode)}",
+                "Window & Power" to "${windowProfileShort(cfg.windowProfile)} (${windowProfileDetail(cfg.windowProfile)}) · ${if (cfg.idlePower) "Idle Save" else "Full Pool"}",
+                "Stealth uTLS" to "${fingerprintLabel(cfg.fingerprint)} · ${paddingLabel(cfg.paddingMode)} · Frag ${fragmentLabel(cfg.fragmentMode)}",
+                "Camouflage Path" to normalizedPath(cfg.customPath),
                 "DNS Cache" to "${dnsLabel(cfg.dnsPreset)} · 60s Hedged",
-                "UDP / QUIC" to "Full-Cone · MTU 1500",
-                "Build" to "v4.0.0 (14)"
+                "UDP / QUIC" to "${quicLabel(cfg.quicMode)} · MTU 1500",
+                "Build" to "v4.1.0 (15)"
             )
             Column {
                 specs.forEachIndexed { idx, (key, value) ->
@@ -3200,6 +3469,48 @@ private fun SelectableChip(
             fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
             color = if (selected) SignalEmeraldBright else TextSecondary,
             maxLines = 1
+        )
+    }
+}
+
+@Composable
+private fun SegmentedChipWithSub(
+    label: String,
+    sublabel: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(11.dp))
+            .background(if (selected) SignalEmerald.copy(alpha = 0.14f) else SurfaceRecessed)
+            .border(
+                width = 1.dp,
+                color = if (selected) SignalEmerald else BorderHairline,
+                shape = RoundedCornerShape(11.dp)
+            )
+            .clickable(onClick = onClick)
+            .padding(horizontal = 6.dp, vertical = 9.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(2.dp)
+    ) {
+        Text(
+            text = label,
+            fontSize = 11.5.sp,
+            fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold,
+            color = if (selected) SignalEmeraldBright else TextPrimary,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        Text(
+            text = sublabel,
+            fontSize = 9.sp,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Medium,
+            color = if (selected) SignalEmeraldBright.copy(alpha = 0.9f) else TextDim,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
         )
     }
 }

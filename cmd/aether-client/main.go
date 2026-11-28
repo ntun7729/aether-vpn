@@ -322,7 +322,11 @@ func main() {
 	transport := flag.String("transport", "auto", "Carrier transport: auto, ws, xhttp, grpc, or h2")
 	cipherName := flag.String("cipher", "xchacha20-poly1305", "AEAD cipher: xchacha20-poly1305, aes-256-gcm, aes-128-gcm, chacha20-poly1305, or none")
 	fingerprint := flag.String("fingerprint", "chrome", "uTLS fingerprint: chrome, firefox, safari, ios, or randomized")
+	fragmentMode := flag.String("fragment", "off", "TLS ClientHello fragmentation: off, balanced, or strict")
 	paddingMode := flag.String("padding", "balanced", "Anti-DPI padding: balanced, stealth, or off")
+	windowProfile := flag.String("window", "max", "Chunk/window profile: max, balanced, or gaming")
+	customPath := flag.String("path", "", "Optional custom camouflage tunnel path (e.g. /api/v2/events)")
+	idlePower := flag.Bool("idle-power", false, "Auto-scale carriers down to 1 when idle >60s")
 	psk := flag.String("psk", "", "Pre-shared secret key")
 	carriers := flag.Int("carriers", 4, "Number of parallel carriers")
 	bindIface := flag.String("iface", "", "Optional Linux network interface (e.g. eth0) to bypass local TUN VPN")
@@ -350,10 +354,10 @@ func main() {
 			PaddingMode: *paddingMode,
 		}
 		if *serverURL != "" {
-			cfg.Endpoints = append(cfg.Endpoints, carrier.Endpoint{Name: "primary", URL: *serverURL, Transport: *transport, Fingerprint: *fingerprint, Priority: 0})
+			cfg.Endpoints = append(cfg.Endpoints, carrier.Endpoint{Name: "primary", URL: *serverURL, Transport: *transport, Fingerprint: *fingerprint, FragmentMode: *fragmentMode, CustomPath: *customPath, Priority: 0})
 		}
 		if *fallbackURL != "" {
-			cfg.Endpoints = append(cfg.Endpoints, carrier.Endpoint{Name: "fallback", URL: *fallbackURL, Transport: *transport, Fingerprint: *fingerprint, Priority: 1})
+			cfg.Endpoints = append(cfg.Endpoints, carrier.Endpoint{Name: "fallback", URL: *fallbackURL, Transport: *transport, Fingerprint: *fingerprint, FragmentMode: *fragmentMode, CustomPath: *customPath, Priority: 1})
 		}
 	}
 	if *bindIface != "" {
@@ -391,22 +395,34 @@ func main() {
 	var proxy *ProxyServer
 	var mgr *session.ClientManager
 	mgr, err := session.NewClientManager(session.ClientConfig{
-		PSK:         cfg.PSK,
-		Endpoints:   cfg.Endpoints,
-		Carriers:    cfg.Carriers,
-		Cipher:      cfg.Cipher,
-		PaddingMode: cfg.PaddingMode,
+		PSK:           cfg.PSK,
+		Endpoints:     cfg.Endpoints,
+		Carriers:      cfg.Carriers,
+		Cipher:        cfg.Cipher,
+		PaddingMode:   cfg.PaddingMode,
+		WindowProfile: *windowProfile,
+		IdlePower:     *idlePower,
 		OnConfigSync: func(payload []byte) {
 			var sc struct {
-				PaddingMode string `json:"padding_mode"`
-				DNSPreset   string `json:"dns_preset"`
-				Cipher      string `json:"cipher"`
+				PaddingMode   string `json:"padding_mode"`
+				WindowProfile string `json:"window_profile"`
+				DNSPreset     string `json:"dns_preset"`
+				Cipher        string `json:"cipher"`
+				IdlePower     *bool  `json:"idle_power"`
 			}
 			if json.Unmarshal(payload, &sc) == nil {
-				if mgr != nil && sc.PaddingMode != "" {
-					mgr.SetPaddingMode(sc.PaddingMode)
+				if mgr != nil {
+					if sc.PaddingMode != "" {
+						mgr.SetPaddingMode(sc.PaddingMode)
+					}
+					if sc.WindowProfile != "" {
+						mgr.SetWindowProfile(sc.WindowProfile)
+					}
+					if sc.IdlePower != nil {
+						mgr.SetIdlePower(*sc.IdlePower)
+					}
 				}
-				log.Printf("[aether] synced server config (dns=%s cipher=%s padding=%s)", sc.DNSPreset, sc.Cipher, sc.PaddingMode)
+				log.Printf("[aether] synced server config (dns=%s cipher=%s padding=%s window=%s)", sc.DNSPreset, sc.Cipher, sc.PaddingMode, sc.WindowProfile)
 			}
 		},
 	}, func(flowID uint32, addr proto.Address, payload []byte) {

@@ -115,9 +115,9 @@ func (c *H2ServerCarrier) Close() error {
 	return c.body.Close()
 }
 
-// DialH2 opens a full-duplex HTTP/2 streaming carrier using uTLS Chrome fingerprint.
+// DialH2 opens a full-duplex HTTP/2 streaming carrier using uTLS fingerprint.
 func DialH2(ctx context.Context, ep Endpoint, timeout time.Duration) (*H2Carrier, error) {
-	rawURL := ep.URL
+	rawURL := resolveEndpointURL(ep.URL, ep.CustomPath)
 	rawURL = strings.Replace(rawURL, "wss://", "https://", 1)
 	rawURL = strings.Replace(rawURL, "ws://", "http://", 1)
 	if !strings.HasSuffix(rawURL, "/h2") {
@@ -157,7 +157,7 @@ func DialH2(ctx context.Context, ep Endpoint, timeout time.Duration) (*H2Carrier
 			if u.Scheme == "http" {
 				return rawConn, nil
 			}
-			return dialUTLS(dctx, rawConn, host, ep.Fingerprint, []string{"h2"})
+			return dialUTLS(dctx, rawConn, host, ep.Fingerprint, ep.FragmentMode, []string{"h2"})
 		},
 	}
 
