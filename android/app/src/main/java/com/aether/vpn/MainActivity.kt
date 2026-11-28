@@ -273,7 +273,7 @@ private fun AetherApp(
                         color = TextPrimary
                     )
                     Text(
-                        "v3.0 · Multi-Path uTLS · AdGuard DNS",
+                        "v3.1 · Striped Multi-Path uTLS · AdGuard DNS",
                         fontSize = 11.sp,
                         color = TextMuted
                     )
@@ -638,7 +638,7 @@ private fun NodesTab(
             ) {
                 Column {
                     Text("Parallel Carriers", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = TextPrimary)
-                    Text("Recommended: 3 for balanced speed", fontSize = 11.sp, color = TextMuted)
+                    Text("Recommended: 4 for max striped speed", fontSize = 11.sp, color = TextMuted)
                 }
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     OutlinedButton(

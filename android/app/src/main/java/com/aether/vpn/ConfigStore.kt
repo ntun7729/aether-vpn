@@ -11,7 +11,7 @@ data class AetherConfig(
     val fallbackUrl: String = "wss://sync.novv.tech/ws/sync",
     val cfCleanIp: String = "",
     val transport: String = "auto", // auto | ws | h2
-    val carriers: Int = 3,
+    val carriers: Int = 4,
     val bypassLan: Boolean = true,
     val bypassApps: String = "" // comma-separated Android package names
 ) {
@@ -95,7 +95,7 @@ object ConfigStore {
             fallbackUrl = p.getString("fallback_url", "wss://sync.novv.tech/ws/sync") ?: "",
             cfCleanIp = p.getString("cf_clean_ip", "") ?: "",
             transport = p.getString("transport", "auto") ?: "auto",
-            carriers = p.getInt("carriers", 3),
+            carriers = p.getInt("carriers", 4),
             bypassLan = p.getBoolean("bypass_lan", true),
             bypassApps = p.getString("bypass_apps", "") ?: ""
         )

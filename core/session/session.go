@@ -18,14 +18,15 @@ import (
 )
 
 const (
-	StreamChunkSize       = 60 * 1024 // 60 KB bulk chunks
+	StreamChunkSize       = 32 * 1024 // 32 KB chunks (2 exact TLS 1.3 records — ideal for multi-carrier striping)
 	DefaultMaxPad         = 24
-	InitialStreamWindow   = 4 << 20   // 4 MB per-stream flow control window
-	WindowUpdateThreshold = 512 << 10 // Send WINDOW_UPDATE every 512 KB drained
-	MaxStreamBuffer       = 6 << 20   // 6 MB hard cap per stream ring buffer
+	InitialStreamWindow   = 8 << 20   // 8 MB per-stream flow control window (high BDP across 3-4 carriers)
+	WindowUpdateThreshold = 256 << 10 // Send WINDOW_UPDATE every 256 KB drained
+	MaxStreamBuffer       = 12 << 20  // 12 MB hard cap per stream (ringBuffer + reorderBuf)
+	ReorderStallTimeout   = 3500 * time.Millisecond
 )
 
-// CopyBufPool provides reusable 64 KB buffers for io.CopyBuffer across server & mobile.
+// CopyBufPool provides reusable 64 KB buffers for io.CopyBuffer across server, desktop, & mobile.
 var CopyBufPool = sync.Pool{
 	New: func() any {
 		b := make([]byte, 64*1024)
@@ -58,7 +59,7 @@ type StreamOpenHandler func(ctx context.Context, s *Stream, addr proto.Address) 
 // UDPHandler is invoked when a UDP datagram arrives.
 type UDPHandler func(flowID uint32, addr proto.Address, payload []byte)
 
-// ringBuffer is a compact, non-leaking circular byte buffer.
+// ringBuffer is a compact, non-leaking circular byte buffer that avoids thrashing on active streams.
 type ringBuffer struct {
 	buf  []byte
 	head int
@@ -75,8 +76,8 @@ func (r *ringBuffer) write(p []byte) {
 	need := r.size + len(p)
 	if need > len(r.buf) {
 		newCap := len(r.buf) * 2
-		if newCap < 8192 {
-			newCap = 8192
+		if newCap < 64*1024 {
+			newCap = 64 * 1024
 		}
 		for newCap < need {
 			newCap *= 2
@@ -125,7 +126,8 @@ func (r *ringBuffer) read(p []byte) int {
 	if r.size == 0 {
 		r.head = 0
 		r.tail = 0
-		if len(r.buf) > 64*1024 {
+		// Only shrink huge spike buffers (>1 MB); keep <=1 MB warm to eliminate reallocation thrashing!
+		if len(r.buf) > 1<<20 {
 			r.buf = nil
 		}
 	}
@@ -139,9 +141,8 @@ func (r *ringBuffer) reset() {
 	r.size = 0
 }
 
-// Session is an Aether v2 multiplexed encrypted tunnel spanning 1..N carriers.
-// Every Stream is strictly pinned to a single carrier.Conn instance for its entire lifetime
-// so Open -> Data -> Fin ALWAYS arrive in exact FIFO order even while other carriers join/leave.
+// Session is an Aether v3 multiplexed encrypted tunnel spanning 1..N carriers with
+// true per-stream ordered multi-carrier striping and zero-copy AEAD framing.
 type Session struct {
 	ID       [16]byte
 	IsServer bool
@@ -182,7 +183,7 @@ func NewSessionID() [16]byte {
 	return id
 }
 
-// New creates a new Aether v2 logical Session.
+// New creates a new Aether v3 logical Session.
 func New(id [16]byte, cipher *acrypto.SessionCipher, isServer bool, onOpen StreamOpenHandler, onUDP UDPHandler) *Session {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Session{
@@ -263,15 +264,20 @@ func (s *Session) removeCarrier(c carrier.Conn) {
 			break
 		}
 	}
+	var replacement carrier.Conn
+	if len(s.carriers) > 0 {
+		replacement = s.carriers[0]
+	}
 	s.carrierMu.Unlock()
 	_ = c.Close()
 
-	// Reset any streams that were pinned exclusively to this dead carrier so they fail fast
-	// instead of hanging forever waiting for a FIN that will never arrive.
+	// Re-pin surviving streams to an active carrier if one remains; reset only if no carriers survive.
 	s.streamMu.RLock()
 	var dead []*Stream
 	for _, st := range s.streams {
-		if st.pinned != nil && st.pinned.CarrierID() == c.CarrierID() {
+		if replacement != nil {
+			st.repinIfMatch(c.CarrierID(), replacement)
+		} else {
 			dead = append(dead, st)
 		}
 	}
@@ -281,7 +287,7 @@ func (s *Session) removeCarrier(c carrier.Conn) {
 	}
 }
 
-// pickHealthyCarrier selects a healthy carrier for a new stream or UDP flow.
+// pickHealthyCarrier selects a healthy non-degraded carrier round-robin.
 func (s *Session) pickHealthyCarrier() carrier.Conn {
 	s.carrierMu.RLock()
 	defer s.carrierMu.RUnlock()
@@ -310,6 +316,7 @@ func (s *Session) pickCarrierForFlow(flowID uint32) carrier.Conn {
 	return s.carriers[uint64(flowID)%uint64(n)]
 }
 
+// sendOnCarrier performs fused 1-allocation Frame encode + in-place XChaCha20-Poly1305 seal.
 func (s *Session) sendOnCarrier(c carrier.Conn, f *proto.Frame, pad int, highPriority bool) error {
 	if s.closed.Load() {
 		return ErrSessionClosed
@@ -317,11 +324,20 @@ func (s *Session) sendOnCarrier(c carrier.Conn, f *proto.Frame, pad int, highPri
 	if c == nil || c.IsClosed() {
 		return ErrNoCarriers
 	}
-	raw, err := f.Encode(pad)
+	if pad < 0 {
+		pad = 0
+	}
+	if pad > proto.MaxPaddingSize {
+		pad = proto.MaxPaddingSize
+	}
+
+	maxPlain := proto.HeaderSize + len(f.Payload) + pad
+	buf := make([]byte, 8+maxPlain, 8+maxPlain+acrypto.TagSize)
+	plainLen, err := f.EncodeInto(buf[8:], pad)
 	if err != nil {
 		return err
 	}
-	wire := s.Cipher.Seal(raw)
+	wire := s.Cipher.SealInPlace(buf[:8+plainLen], plainLen)
 	if err := c.WritePacketPriority(wire, highPriority); err != nil {
 		s.removeCarrier(c)
 		return err
@@ -347,17 +363,18 @@ func (s *Session) readLoop(c carrier.Conn, onDetach func(carrier.Conn, error)) {
 		}
 		s.rxBytes.Add(uint64(len(wire)))
 
-		plain, err := s.Cipher.Open(wire)
+		// Zero-allocation in-place decryption + zero-copy frame decode!
+		plain, err := s.Cipher.OpenInPlace(wire)
 		if err != nil {
 			exitErr = err
 			return
 		}
-		frame, err := proto.DecodeFrame(plain)
+		frame, err := proto.DecodeFrameZeroCopy(plain)
 		if err != nil {
 			exitErr = err
 			return
 		}
-		s.handleFrame(c, frame)
+		s.handleFrame(c, &frame)
 	}
 }
 
@@ -401,11 +418,10 @@ func (s *Session) handleFrame(src carrier.Conn, f *proto.Frame) {
 			_ = s.sendOnCarrier(src, &proto.Frame{Type: proto.FrameStreamRst, StreamID: f.StreamID}, 0, true)
 			return
 		}
-		// Pin server stream to the exact carrier that delivered FrameStreamOpen!
-		st := s.registerStream(f.StreamID, src)
+		st := s.registerStream(f.StreamID, src, f.Seq > 0)
 		go func() {
 			if err := s.onStreamOpen(s.ctx, st, addr); err != nil {
-				_ = s.sendOnCarrier(src, &proto.Frame{Type: proto.FrameStreamRst, StreamID: f.StreamID}, 0, true)
+				_ = s.sendOnCarrier(st.getPinnedOrHealthy(), &proto.Frame{Type: proto.FrameStreamRst, StreamID: f.StreamID}, 0, true)
 				_ = st.Close()
 			}
 		}()
@@ -419,12 +435,12 @@ func (s *Session) handleFrame(src carrier.Conn, f *proto.Frame) {
 
 	case proto.FrameStreamData:
 		if st := s.getStream(f.StreamID); st != nil {
-			st.deliverData(f.Payload)
+			st.deliverData(f.Seq, f.Payload)
 		}
 
 	case proto.FrameStreamFin:
 		if st := s.getStream(f.StreamID); st != nil {
-			st.deliverEOF()
+			st.deliverEOF(f.Seq)
 		}
 
 	case proto.FrameStreamRst:
@@ -437,7 +453,7 @@ func (s *Session) handleFrame(src carrier.Conn, f *proto.Frame) {
 func (s *Session) sendWindowUpdate(st *Stream, delta uint32) {
 	var buf [4]byte
 	binary.BigEndian.PutUint32(buf[:], delta)
-	_ = s.sendOnCarrier(st.pinned, &proto.Frame{
+	_ = s.sendOnCarrier(st.getPinnedOrHealthy(), &proto.Frame{
 		Type:     proto.FrameWindowUpdate,
 		StreamID: st.ID,
 		Payload:  buf[:],
@@ -471,7 +487,7 @@ func (s *Session) SendUDP(flowID uint32, host string, port uint16, payload []byt
 	}, 0, true)
 }
 
-// OpenStream opens a 0-RTT multiplexed TCP stream pinned to one healthy carrier for its lifetime.
+// OpenStream opens a 0-RTT multiplexed TCP stream with multi-carrier ordered striping.
 func (s *Session) OpenStream(ctx context.Context, host string, port uint16) (*Stream, error) {
 	if s.closed.Load() {
 		return nil, ErrSessionClosed
@@ -498,13 +514,14 @@ func (s *Session) OpenStream(ctx context.Context, host string, port uint16) (*St
 	}
 
 	id := s.nextStreamID.Add(1)
-	st := s.registerStream(id, c)
+	st := s.registerStream(id, c, true)
 
 	err := s.sendOnCarrier(c, &proto.Frame{
 		Type:     proto.FrameStreamOpen,
 		StreamID: id,
+		Seq:      1, // Signals ordered multi-carrier striping capability to server
 		Payload:  proto.EncodeAddress(host, port),
-	}, s.MaxPad, false) // FIFO stream lane so Open strictly precedes Data & Fin!
+	}, s.MaxPad, false)
 	if err != nil {
 		s.removeStream(id)
 		return nil, err
@@ -512,11 +529,11 @@ func (s *Session) OpenStream(ctx context.Context, host string, port uint16) (*St
 	return st, nil
 }
 
-// ConfirmStreamOpen is a no-op in Aether v2 0-RTT mode.
+// ConfirmStreamOpen is a no-op in Aether 0-RTT mode.
 func (s *Session) ConfirmStreamOpen(st *Stream) {}
 
-func (s *Session) registerStream(id uint32, pinned carrier.Conn) *Stream {
-	st := newStream(s, id, pinned)
+func (s *Session) registerStream(id uint32, pinned carrier.Conn, striped bool) *Stream {
+	st := newStream(s, id, pinned, striped)
 	s.streamMu.Lock()
 	s.streams[id] = st
 	s.streamMu.Unlock()
@@ -588,18 +605,32 @@ func (s *Session) Close() error {
 	return nil
 }
 
-// Stream implements net.Conn pinned to a single carrier.Conn with a zero-leak ringBuffer.
+// Stream implements net.Conn with ordered multi-carrier striping and zero-thrash ringBuffer.
 type Stream struct {
-	ID     uint32
-	sess   *Session
+	ID      uint32
+	sess    *Session
+	striped bool
+
+	pinMu  sync.RWMutex
 	pinned carrier.Conn
 
-	readMu      sync.Mutex
-	readCond    *sync.Cond
-	rb          ringBuffer
-	readDrained int
-	readEOF     bool
-	readReset   bool
+	// TX serialization & monotonic per-stream sequence numbers for ordered striping
+	writeMu     sync.Mutex
+	nextSendSeq uint64
+
+	// RX ordered reassembly + ringBuffer
+	readMu         sync.Mutex
+	readCond       *sync.Cond
+	rb             ringBuffer
+	nextRecvSeq    uint64
+	finSeq         uint64
+	reorderBuf     map[uint64][]byte
+	reorderBytes   int
+	reorderTimer   *time.Timer
+	reorderWaitSeq uint64
+	readDrained    int
+	readEOF        bool
+	readReset      bool
 
 	winMu      sync.Mutex
 	winCond    *sync.Cond
@@ -609,16 +640,36 @@ type Stream struct {
 	closed      atomic.Bool
 }
 
-func newStream(sess *Session, id uint32, pinned carrier.Conn) *Stream {
+func newStream(sess *Session, id uint32, pinned carrier.Conn, striped bool) *Stream {
 	st := &Stream{
-		ID:         id,
-		sess:       sess,
-		pinned:     pinned,
-		sendWindow: InitialStreamWindow,
+		ID:          id,
+		sess:        sess,
+		striped:     striped,
+		pinned:      pinned,
+		nextRecvSeq: 1,
+		sendWindow:  InitialStreamWindow,
 	}
 	st.readCond = sync.NewCond(&st.readMu)
 	st.winCond = sync.NewCond(&st.winMu)
 	return st
+}
+
+func (st *Stream) getPinnedOrHealthy() carrier.Conn {
+	st.pinMu.RLock()
+	c := st.pinned
+	st.pinMu.RUnlock()
+	if c != nil && !c.IsClosed() {
+		return c
+	}
+	return st.sess.pickHealthyCarrier()
+}
+
+func (st *Stream) repinIfMatch(deadID uint64, replacement carrier.Conn) {
+	st.pinMu.Lock()
+	if st.pinned != nil && st.pinned.CarrierID() == deadID {
+		st.pinned = replacement
+	}
+	st.pinMu.Unlock()
 }
 
 func (st *Stream) addSendWindow(delta int64) {
@@ -628,28 +679,139 @@ func (st *Stream) addSendWindow(delta int64) {
 	st.winMu.Unlock()
 }
 
-func (st *Stream) deliverData(data []byte) {
+func (st *Stream) armReorderTimerLocked() {
+	if st.reorderTimer != nil {
+		return
+	}
+	waitSeq := st.nextRecvSeq
+	st.reorderWaitSeq = waitSeq
+	st.reorderTimer = time.AfterFunc(ReorderStallTimeout, func() {
+		st.checkReorderStall(waitSeq)
+	})
+}
+
+func (st *Stream) stopReorderTimerLocked() {
+	if st.reorderTimer != nil {
+		st.reorderTimer.Stop()
+		st.reorderTimer = nil
+	}
+}
+
+func (st *Stream) checkReorderStall(expectedSeq uint64) {
 	st.readMu.Lock()
-	if !st.readEOF && !st.readReset {
-		if st.rb.len()+len(data) <= MaxStreamBuffer {
-			st.rb.write(data)
-			st.readCond.Signal()
-		}
+	st.reorderTimer = nil
+	if st.readEOF || st.readReset {
+		st.readMu.Unlock()
+		return
+	}
+	hasGap := len(st.reorderBuf) > 0 || (st.finSeq > 0 && st.nextRecvSeq < st.finSeq)
+	if hasGap && st.nextRecvSeq == expectedSeq {
+		// Missing frame was lost on a detached carrier — fail fast cleanly instead of hanging!
+		st.readReset = true
+		st.rb.reset()
+		st.reorderBuf = nil
+		st.reorderBytes = 0
+		st.readCond.Broadcast()
+		st.readMu.Unlock()
+		st.winMu.Lock()
+		st.winCond.Broadcast()
+		st.winMu.Unlock()
+		return
+	}
+	if hasGap {
+		st.armReorderTimerLocked()
 	}
 	st.readMu.Unlock()
 }
 
-func (st *Stream) deliverEOF() {
+func (st *Stream) deliverData(seq uint64, data []byte) {
 	st.readMu.Lock()
-	st.readEOF = true
-	st.readCond.Broadcast()
+	if st.readEOF || st.readReset {
+		st.readMu.Unlock()
+		return
+	}
+
+	// Legacy unsequenced peer (seq == 0): direct FIFO write
+	if seq == 0 {
+		if st.rb.len()+len(data) <= MaxStreamBuffer {
+			st.rb.write(data)
+			st.readCond.Signal()
+		}
+		st.readMu.Unlock()
+		return
+	}
+
+	if seq < st.nextRecvSeq {
+		st.readMu.Unlock()
+		return
+	}
+
+	if seq == st.nextRecvSeq {
+		if st.rb.len()+len(data) <= MaxStreamBuffer {
+			st.rb.write(data)
+		}
+		st.nextRecvSeq++
+		for len(st.reorderBuf) > 0 {
+			next, ok := st.reorderBuf[st.nextRecvSeq]
+			if !ok {
+				break
+			}
+			delete(st.reorderBuf, st.nextRecvSeq)
+			st.reorderBytes -= len(next)
+			if st.rb.len()+len(next) <= MaxStreamBuffer {
+				st.rb.write(next)
+			}
+			st.nextRecvSeq++
+		}
+		if len(st.reorderBuf) == 0 && (st.finSeq == 0 || st.nextRecvSeq >= st.finSeq) {
+			st.stopReorderTimerLocked()
+		}
+		if st.finSeq > 0 && st.nextRecvSeq >= st.finSeq {
+			st.readEOF = true
+			st.readCond.Broadcast()
+		} else {
+			st.readCond.Signal()
+		}
+		st.readMu.Unlock()
+		return
+	}
+
+	// Out-of-order striped frame (seq > nextRecvSeq): copy & buffer until missing seq arrives.
+	if st.rb.len()+st.reorderBytes+len(data) <= MaxStreamBuffer {
+		if st.reorderBuf == nil {
+			st.reorderBuf = make(map[uint64][]byte, 8)
+		}
+		if _, exists := st.reorderBuf[seq]; !exists {
+			cp := make([]byte, len(data))
+			copy(cp, data)
+			st.reorderBuf[seq] = cp
+			st.reorderBytes += len(cp)
+		}
+		st.armReorderTimerLocked()
+	}
+	st.readMu.Unlock()
+}
+
+func (st *Stream) deliverEOF(seq uint64) {
+	st.readMu.Lock()
+	if seq == 0 || seq <= st.nextRecvSeq {
+		st.readEOF = true
+		st.stopReorderTimerLocked()
+		st.readCond.Broadcast()
+	} else {
+		st.finSeq = seq
+		st.armReorderTimerLocked()
+	}
 	st.readMu.Unlock()
 }
 
 func (st *Stream) deliverReset() {
 	st.readMu.Lock()
 	st.readReset = true
+	st.stopReorderTimerLocked()
 	st.rb.reset()
+	st.reorderBuf = nil
+	st.reorderBytes = 0
 	st.readCond.Broadcast()
 	st.readMu.Unlock()
 	st.winMu.Lock()
@@ -688,6 +850,9 @@ func (st *Stream) Write(p []byte) (int, error) {
 	if st.closed.Load() || st.writeClosed.Load() {
 		return 0, net.ErrClosed
 	}
+	st.writeMu.Lock()
+	defer st.writeMu.Unlock()
+
 	total := 0
 	for len(p) > 0 {
 		chunk := p
@@ -706,15 +871,28 @@ func (st *Stream) Write(p []byte) (int, error) {
 		st.sendWindow -= int64(len(chunk))
 		st.winMu.Unlock()
 
+		st.nextSendSeq++
+		seq := st.nextSendSeq
+
+		// Legacy non-striped peers (or client's first Seq==1 chunk behind StreamOpen) stay on st.pinned.
+		// Striped bulk chunks round-robin across ALL healthy carriers!
+		var c carrier.Conn
+		if !st.striped || (!st.sess.IsServer && seq == 1) {
+			c = st.getPinnedOrHealthy()
+		} else {
+			c = st.sess.pickHealthyCarrier()
+		}
+
 		pad := st.sess.MaxPad
 		if len(chunk) >= 1024 {
 			pad = 0
 		}
-		err := st.sess.sendOnCarrier(st.pinned, &proto.Frame{
+		err := st.sess.sendOnCarrier(c, &proto.Frame{
 			Type:     proto.FrameStreamData,
 			StreamID: st.ID,
+			Seq:      seq,
 			Payload:  chunk,
-		}, pad, false) // FIFO stream lane!
+		}, pad, false)
 		if err != nil {
 			return total, err
 		}
@@ -731,10 +909,17 @@ func (st *Stream) CloseWrite() error {
 	st.winMu.Lock()
 	st.winCond.Broadcast()
 	st.winMu.Unlock()
-	return st.sess.sendOnCarrier(st.pinned, &proto.Frame{
+
+	st.writeMu.Lock()
+	st.nextSendSeq++
+	finSeq := st.nextSendSeq
+	st.writeMu.Unlock()
+
+	return st.sess.sendOnCarrier(st.getPinnedOrHealthy(), &proto.Frame{
 		Type:     proto.FrameStreamFin,
 		StreamID: st.ID,
-	}, 0, false) // FIFO stream lane!
+		Seq:      finSeq,
+	}, 0, false)
 }
 
 func (st *Stream) Close() error {
@@ -743,14 +928,22 @@ func (st *Stream) Close() error {
 	}
 	st.sess.removeStream(st.ID)
 	if !st.writeClosed.Swap(true) {
-		_ = st.sess.sendOnCarrier(st.pinned, &proto.Frame{
+		st.writeMu.Lock()
+		st.nextSendSeq++
+		finSeq := st.nextSendSeq
+		st.writeMu.Unlock()
+		_ = st.sess.sendOnCarrier(st.getPinnedOrHealthy(), &proto.Frame{
 			Type:     proto.FrameStreamFin,
 			StreamID: st.ID,
+			Seq:      finSeq,
 		}, 0, false)
 	}
 	st.readMu.Lock()
 	st.readEOF = true
+	st.stopReorderTimerLocked()
 	st.rb.reset()
+	st.reorderBuf = nil
+	st.reorderBytes = 0
 	st.readCond.Broadcast()
 	st.readMu.Unlock()
 	st.winMu.Lock()

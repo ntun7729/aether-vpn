@@ -52,11 +52,12 @@ type Conn interface {
 
 // Endpoint describes a server URL (Railway, Render, or Cloudflare Worker relay).
 type Endpoint struct {
-	Name      string `json:"name"`
-	URL       string `json:"url"`                  // e.g. wss://my-app.up.railway.app/ws/sync
-	ResolveIP string `json:"resolve_ip,omitempty"` // Optional Cloudflare clean IP override
-	Transport string `json:"transport,omitempty"`  // "auto" (default), "ws", or "h2"
-	Priority  int    `json:"priority,omitempty"`   // Lower = preferred (0=primary, 1=fallback)
+	Name          string `json:"name"`
+	URL           string `json:"url"`                      // e.g. wss://my-app.up.railway.app/ws/sync
+	ResolveIP     string `json:"resolve_ip,omitempty"`     // Optional Cloudflare clean IP override
+	Transport     string `json:"transport,omitempty"`      // "auto" (default), "ws", or "h2"
+	Priority      int    `json:"priority,omitempty"`       // Lower = preferred (0=primary, 1=fallback)
+	BindInterface string `json:"bind_interface,omitempty"` // Optional Linux interface (e.g. "eth0") to bypass local TUN
 }
 
 // ClientHello is the first binary message sent on a newly established carrier.
@@ -166,18 +167,20 @@ func (c *Carrier) CarrierID() uint64     { return c.ID }
 func (c *Carrier) GetEndpoint() Endpoint { return c.Endpoint }
 func (c *Carrier) Degraded() bool        { return c.degraded.Load() }
 
-// WrapConn creates a Carrier with async priority write lanes and 25s ping / 5s pong timeout.
+// WrapConn creates a Carrier with high-throughput async priority write lanes.
 func WrapConn(conn *websocket.Conn, ep Endpoint) *Carrier {
 	conn.SetReadLimit(256 * 1024)
 	if tc, ok := conn.UnderlyingConn().(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
+		_ = tc.SetReadBuffer(2 << 20)
+		_ = tc.SetWriteBuffer(2 << 20)
 	}
 	c := &Carrier{
 		ID:       nextCarrierID.Add(1),
 		Endpoint: ep,
 		conn:     conn,
-		highCh:   make(chan []byte, 128),
-		bulkCh:   make(chan []byte, 48), // Balanced 48-frame queue (~2.8MB max) — fast browsing + zero burst stalls!
+		highCh:   make(chan []byte, 256),
+		bulkCh:   make(chan []byte, 128),
 		pongCh:   make(chan struct{}, 1),
 		closeCh:  make(chan struct{}),
 	}
@@ -196,14 +199,18 @@ func WrapConn(conn *websocket.Conn, ep Endpoint) *Carrier {
 }
 
 func (c *Carrier) writerLoop() {
+	var lastDeadline time.Time
 	writeBin := func(data []byte) bool {
 		t0 := time.Now()
-		_ = c.conn.SetWriteDeadline(t0.Add(15 * time.Second))
+		if t0.Sub(lastDeadline) > 2*time.Second {
+			_ = c.conn.SetWriteDeadline(t0.Add(15 * time.Second))
+			lastDeadline = t0
+		}
 		if err := c.conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
 			_ = c.Close()
 			return false
 		}
-		c.degraded.Store(time.Since(t0) > 1500*time.Millisecond)
+		c.degraded.Store(time.Since(t0) > 800*time.Millisecond)
 		return true
 	}
 
@@ -275,11 +282,12 @@ func DialWS(ctx context.Context, ep Endpoint, timeout time.Duration) (*Carrier, 
 		Timeout:   timeout,
 		KeepAlive: 25 * time.Second,
 	}
+	setDialerInterface(netDialer, ep.BindInterface)
 
 	dialer := &websocket.Dialer{
 		HandshakeTimeout:  timeout,
-		ReadBufferSize:    64 * 1024,
-		WriteBufferSize:   64 * 1024,
+		ReadBufferSize:    256 * 1024,
+		WriteBufferSize:   256 * 1024,
 		EnableCompression: false,
 		NetDialContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
 			target := addr
@@ -289,6 +297,8 @@ func DialWS(ctx context.Context, ep Endpoint, timeout time.Duration) (*Carrier, 
 			conn, err := netDialer.DialContext(dctx, network, target)
 			if tc, ok := conn.(*net.TCPConn); ok {
 				_ = tc.SetNoDelay(true)
+				_ = tc.SetReadBuffer(2 << 20)
+				_ = tc.SetWriteBuffer(2 << 20)
 			}
 			return conn, err
 		},
@@ -303,6 +313,8 @@ func DialWS(ctx context.Context, ep Endpoint, timeout time.Duration) (*Carrier, 
 			}
 			if tc, ok := rawConn.(*net.TCPConn); ok {
 				_ = tc.SetNoDelay(true)
+				_ = tc.SetReadBuffer(2 << 20)
+				_ = tc.SetWriteBuffer(2 << 20)
 			}
 			spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
 			if err != nil {

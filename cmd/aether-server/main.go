@@ -121,8 +121,8 @@ func NewServer(psk, adminKey, tunnelPath string, allowPrivate, adblockSNI, block
 		blocker:     adblock.New(adblockSNI),
 		decoyProxy:  proxy,
 		upgrader: websocket.Upgrader{
-			ReadBufferSize:    64 * 1024,
-			WriteBufferSize:   64 * 1024,
+			ReadBufferSize:    256 * 1024,
+			WriteBufferSize:   256 * 1024,
 			EnableCompression: false,
 			CheckOrigin:       func(r *http.Request) bool { return true },
 		},

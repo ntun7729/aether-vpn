@@ -129,6 +129,7 @@ func DialH2(ctx context.Context, ep Endpoint, timeout time.Duration) (*H2Carrier
 	}
 
 	netDialer := &net.Dialer{Timeout: timeout, KeepAlive: 25 * time.Second}
+	setDialerInterface(netDialer, ep.BindInterface)
 	tr := &http2.Transport{
 		AllowHTTP: u.Scheme == "http",
 		DialTLSContext: func(dctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
@@ -139,6 +140,11 @@ func DialH2(ctx context.Context, ep Endpoint, timeout time.Duration) (*H2Carrier
 			rawConn, err := netDialer.DialContext(dctx, network, target)
 			if err != nil {
 				return nil, err
+			}
+			if tc, ok := rawConn.(*net.TCPConn); ok {
+				_ = tc.SetNoDelay(true)
+				_ = tc.SetReadBuffer(2 << 20)
+				_ = tc.SetWriteBuffer(2 << 20)
 			}
 			if u.Scheme == "http" {
 				return rawConn, nil

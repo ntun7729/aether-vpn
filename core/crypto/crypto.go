@@ -137,6 +137,19 @@ func (sc *SessionCipher) Seal(plaintext []byte) []byte {
 	return sc.sendAEAD.Seal(out, nonce[:], plaintext, nil)
 }
 
+// SealInPlace encrypts plaintext already written at buf[8 : 8+plainLen] in-place,
+// writing the 8-byte nonce counter into buf[:8] and the Poly1305 tag immediately after.
+// Caller must guarantee cap(buf) >= 8 + plainLen + TagSize. Zero heap allocations!
+func (sc *SessionCipher) SealInPlace(buf []byte, plainLen int) []byte {
+	seq := sc.sendSeq.Add(1)
+	var nonce [NonceSize]byte
+	copy(nonce[:16], sc.sendSalt[:])
+	binary.BigEndian.PutUint64(nonce[16:], seq)
+
+	binary.BigEndian.PutUint64(buf[:8], seq)
+	return sc.sendAEAD.Seal(buf[:8], nonce[:], buf[8:8+plainLen], nil)
+}
+
 // Open decrypts a sealed packet produced by Seal.
 func (sc *SessionCipher) Open(packet []byte) ([]byte, error) {
 	if len(packet) < 8+TagSize {
@@ -148,6 +161,24 @@ func (sc *SessionCipher) Open(packet []byte) ([]byte, error) {
 	binary.BigEndian.PutUint64(nonce[16:], seq)
 
 	plain, err := sc.recvAEAD.Open(nil, nonce[:], packet[8:], nil)
+	if err != nil {
+		return nil, ErrDecryptFailed
+	}
+	return plain, nil
+}
+
+// OpenInPlace decrypts a sealed packet in-place into packet[8:], returning the plaintext slice.
+// Zero heap allocations! Caller must not retain packet after reuse.
+func (sc *SessionCipher) OpenInPlace(packet []byte) ([]byte, error) {
+	if len(packet) < 8+TagSize {
+		return nil, ErrShortMessage
+	}
+	seq := binary.BigEndian.Uint64(packet[:8])
+	var nonce [NonceSize]byte
+	copy(nonce[:16], sc.recvSalt[:])
+	binary.BigEndian.PutUint64(nonce[16:], seq)
+
+	plain, err := sc.recvAEAD.Open(packet[8:8], nonce[:], packet[8:], nil)
 	if err != nil {
 		return nil, ErrDecryptFailed
 	}

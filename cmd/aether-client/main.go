@@ -82,7 +82,12 @@ func (p *ProxyServer) OnRemoteUDP(flowID uint32, addr proto.Address, payload []b
 
 func (p *ProxyServer) HandleConn(conn net.Conn) {
 	defer conn.Close()
-	br := bufio.NewReader(conn)
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+		_ = tc.SetReadBuffer(2 << 20)
+		_ = tc.SetWriteBuffer(2 << 20)
+	}
+	br := bufio.NewReaderSize(conn, 64*1024)
 	first, err := br.Peek(1)
 	if err != nil {
 		return
@@ -237,12 +242,16 @@ func splice(local net.Conn, localReader io.Reader, remote *session.Stream) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(remote, localReader)
+		bufPtr := session.CopyBufPool.Get().(*[]byte)
+		defer session.CopyBufPool.Put(bufPtr)
+		_, _ = io.CopyBuffer(remote, localReader, *bufPtr)
 		_ = remote.CloseWrite()
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(local, remote)
+		bufPtr := session.CopyBufPool.Get().(*[]byte)
+		defer session.CopyBufPool.Put(bufPtr)
+		_, _ = io.CopyBuffer(local, remote, *bufPtr)
 		if tc, ok := local.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()
 		}
@@ -312,7 +321,8 @@ func main() {
 	fallbackURL := flag.String("fallback", "", "Optional fallback URL (e.g. Render or CF Worker)")
 	transport := flag.String("transport", "auto", "Carrier transport: auto, ws, or h2")
 	psk := flag.String("psk", "", "Pre-shared secret key")
-	carriers := flag.Int("carriers", 3, "Number of parallel carriers")
+	carriers := flag.Int("carriers", 4, "Number of parallel carriers")
+	bindIface := flag.String("iface", "", "Optional Linux network interface (e.g. eth0) to bypass local TUN VPN")
 	exportURI := flag.Bool("export-uri", false, "Print aether:// share URI for 1-tap Android import and exit")
 	flag.Parse()
 
@@ -339,6 +349,11 @@ func main() {
 		}
 		if *fallbackURL != "" {
 			cfg.Endpoints = append(cfg.Endpoints, carrier.Endpoint{Name: "fallback", URL: *fallbackURL, Transport: *transport, Priority: 1})
+		}
+	}
+	if *bindIface != "" {
+		for i := range cfg.Endpoints {
+			cfg.Endpoints[i].BindInterface = *bindIface
 		}
 	}
 	if cfg.Listen == "" {

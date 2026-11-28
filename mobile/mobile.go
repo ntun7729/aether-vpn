@@ -129,8 +129,8 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 	}
 	startCancel()
 
-	// Build low-latency, high-BDP gVisor TCP/IP stack (CUBIC + SACK + NoDelay + 2MB/4MB windows)
-	linkEP := channel.New(2048, uint32(mtu), "")
+	// Build low-latency, high-BDP gVisor TCP/IP stack (CUBIC + SACK + NoDelay + 4MB/8MB windows)
+	linkEP := channel.New(4096, uint32(mtu), "")
 	s := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
@@ -142,9 +142,9 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &cc)
 	delay := tcpip.TCPDelayEnabled(false)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &delay)
-	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 64 * 1024, Default: 1 << 20, Max: 4 << 20}
+	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 64 * 1024, Default: 2 << 20, Max: 8 << 20}
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcvBuf)
-	sndBuf := tcpip.TCPSendBufferSizeRangeOption{Min: 64 * 1024, Default: 1 << 20, Max: 4 << 20}
+	sndBuf := tcpip.TCPSendBufferSizeRangeOption{Min: 64 * 1024, Default: 2 << 20, Max: 8 << 20}
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sndBuf)
 
 	if err := s.CreateNIC(nicID, linkEP); err != nil {
@@ -159,7 +159,7 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 	})
 
 	// Forward all TCP connections with TCP_NODELAY + 0-RTT OpenStream + 64 KB pooled buffers
-	tcpFwd := tcp.NewForwarder(s, 2<<20, 1024, func(r *tcp.ForwarderRequest) {
+	tcpFwd := tcp.NewForwarder(s, 4<<20, 1024, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
 		var wq waiter.Queue
 		ep, err := r.CreateEndpoint(&wq)

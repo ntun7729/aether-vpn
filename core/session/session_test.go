@@ -225,3 +225,62 @@ func TestAutomaticFailoverPrimaryToFallback(t *testing.T) {
 		t.Fatalf("failover stream failed: out=%q err=%v", out, err)
 	}
 }
+
+func TestOrderedStripingOutOfOrderAnd4MB(t *testing.T) {
+	// 1. Direct out-of-order reassembly + FIN arriving BEFORE missing chunks
+	s := New(NewSessionID(), nil, false, nil, nil)
+	st := newStream(s, 1, nil, true)
+	st.deliverEOF(4)               // FIN arrives early!
+	st.deliverData(3, []byte("CC")) // Seq 3 arrives before 1 & 2
+	st.deliverData(1, []byte("AA"))
+	st.deliverData(2, []byte("BB"))
+	got, err := io.ReadAll(st)
+	if err != nil {
+		t.Fatalf("out-of-order ReadAll failed: %v", err)
+	}
+	if string(got) != "AABBCC" {
+		t.Fatalf("out-of-order mismatch: got %q, want %q", got, "AABBCC")
+	}
+
+	// 2. Full 4 MB striped echo over 4 live parallel WebSocket carriers
+	psk := "stripe-4mb-psk"
+	srv, kill := startMockServer(t, psk)
+	defer kill()
+	mgr, err := NewClientManager(ClientConfig{
+		PSK:      psk,
+		Carriers: 4,
+		Endpoints: []carrier.Endpoint{
+			{Name: "primary", URL: "ws" + strings.TrimPrefix(srv.URL, "http"), Priority: 0},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	defer mgr.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && mgr.Stats().ActiveCarriers < 4 {
+		time.Sleep(25 * time.Millisecond)
+	}
+	stream, err := mgr.OpenStream(ctx, "speed.test", 443)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	payload := make([]byte, 4*1024*1024)
+	_, _ = rand.Read(payload)
+	go func() {
+		_, _ = stream.Write(payload)
+		_ = stream.CloseWrite()
+	}()
+	echoed, err := io.ReadAll(stream)
+	if err != nil {
+		t.Fatalf("4MB striped read failed: %v", err)
+	}
+	if !bytes.Equal(echoed, payload) {
+		t.Fatalf("4MB striped data mismatch: got %d bytes, want %d bytes", len(echoed), len(payload))
+	}
+}

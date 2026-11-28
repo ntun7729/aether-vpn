@@ -12,7 +12,7 @@ import (
 	"github.com/aether-vpn/aether/core/adblock"
 )
 
-const serverVersion = "2.3.0"
+const serverVersion = "3.1.0"
 
 // handleAdminRoute authenticates /{ADMIN_KEY}/... in constant time.
 // Returns true if the request was handled as an authenticated admin route; false falls through to decoy HTML.

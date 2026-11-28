@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math/big"
 )
 
 // Protocol version and frame types.
@@ -51,53 +50,86 @@ type Frame struct {
 	Payload  []byte
 }
 
-// Encode serializes a Frame with optional anti-DPI random padding (0..maxPad bytes).
-func (f *Frame) Encode(maxPad int) ([]byte, error) {
+// EncodeInto serializes a Frame directly into dst (which must have len >= HeaderSize+len(Payload)+maxPad)
+// and returns the exact number of bytes written. Zero heap allocations!
+func (f *Frame) EncodeInto(dst []byte, maxPad int) (int, error) {
 	if len(f.Payload) > MaxPayloadSize {
-		return nil, ErrFrameTooLarge
+		return 0, ErrFrameTooLarge
 	}
 	padLen := 0
 	if maxPad > 0 {
 		if maxPad > MaxPaddingSize {
 			maxPad = MaxPaddingSize
 		}
-		n, err := rand.Int(rand.Reader, big.NewInt(int64(maxPad+1)))
-		if err == nil {
-			padLen = int(n.Int64())
+		var b [1]byte
+		if _, err := rand.Read(b[:]); err == nil {
+			padLen = int(b[0]) % (maxPad + 1)
 		}
 	}
-
-	buf := make([]byte, HeaderSize+len(f.Payload)+padLen)
-	buf[0] = f.Type
-	binary.BigEndian.PutUint32(buf[1:5], f.StreamID)
-	binary.BigEndian.PutUint64(buf[5:13], f.Seq)
-	binary.BigEndian.PutUint16(buf[13:15], uint16(len(f.Payload)))
-	buf[15] = byte(padLen)
-	copy(buf[HeaderSize:HeaderSize+len(f.Payload)], f.Payload)
-	if padLen > 0 {
-		_, _ = rand.Read(buf[HeaderSize+len(f.Payload):])
+	total := HeaderSize + len(f.Payload) + padLen
+	if len(dst) < total {
+		return 0, ErrFrameTooLarge
 	}
-	return buf, nil
+	dst[0] = f.Type
+	binary.BigEndian.PutUint32(dst[1:5], f.StreamID)
+	binary.BigEndian.PutUint64(dst[5:13], f.Seq)
+	binary.BigEndian.PutUint16(dst[13:15], uint16(len(f.Payload)))
+	dst[15] = byte(padLen)
+	copy(dst[HeaderSize:HeaderSize+len(f.Payload)], f.Payload)
+	if padLen > 0 {
+		_, _ = rand.Read(dst[HeaderSize+len(f.Payload) : total])
+	}
+	return total, nil
 }
 
-// DecodeFrame parses a Frame from raw bytes, stripping anti-DPI padding.
-func DecodeFrame(data []byte) (*Frame, error) {
+// Encode serializes a Frame with optional anti-DPI random padding (0..maxPad bytes).
+func (f *Frame) Encode(maxPad int) ([]byte, error) {
+	if len(f.Payload) > MaxPayloadSize {
+		return nil, ErrFrameTooLarge
+	}
+	if maxPad > MaxPaddingSize {
+		maxPad = MaxPaddingSize
+	}
+	if maxPad < 0 {
+		maxPad = 0
+	}
+	buf := make([]byte, HeaderSize+len(f.Payload)+maxPad)
+	n, err := f.EncodeInto(buf, maxPad)
+	if err != nil {
+		return nil, err
+	}
+	return buf[:n], nil
+}
+
+// DecodeFrameZeroCopy parses a Frame from raw bytes without copying Payload.
+// Caller must consume or copy Payload before reusing data.
+func DecodeFrameZeroCopy(data []byte) (Frame, error) {
 	if len(data) < HeaderSize {
-		return nil, ErrTruncatedFrame
+		return Frame{}, ErrTruncatedFrame
 	}
 	payloadLen := int(binary.BigEndian.Uint16(data[13:15]))
 	padLen := int(data[15])
 	if len(data) < HeaderSize+payloadLen+padLen {
-		return nil, ErrTruncatedFrame
+		return Frame{}, ErrTruncatedFrame
 	}
-	payload := make([]byte, payloadLen)
-	copy(payload, data[HeaderSize:HeaderSize+payloadLen])
-	return &Frame{
+	return Frame{
 		Type:     data[0],
 		StreamID: binary.BigEndian.Uint32(data[1:5]),
 		Seq:      binary.BigEndian.Uint64(data[5:13]),
-		Payload:  payload,
+		Payload:  data[HeaderSize : HeaderSize+payloadLen],
 	}, nil
+}
+
+// DecodeFrame parses a Frame from raw bytes, stripping anti-DPI padding.
+func DecodeFrame(data []byte) (*Frame, error) {
+	f, err := DecodeFrameZeroCopy(data)
+	if err != nil {
+		return nil, err
+	}
+	payload := make([]byte, len(f.Payload))
+	copy(payload, f.Payload)
+	f.Payload = payload
+	return &f, nil
 }
 
 // Address represents a network destination (domain, IPv4, or IPv6 + port).
