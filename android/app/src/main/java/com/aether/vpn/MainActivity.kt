@@ -226,6 +226,7 @@ private enum class MenuRoute(val title: String) {
 
 private data class LiveTelemetry(
     val running: Boolean = false,
+    val connecting: Boolean = false,
     val endpoint: String = "Disconnected",
     val carriers: Int = 0,
     val streams: Int = 0,
@@ -559,10 +560,13 @@ private fun AetherApp(
         var lastSyncSeq = 0L
 
         while (true) {
-            val isRun = try {
-                Aethermobile.isRunning()
-            } catch (_: Throwable) {
-                false
+            val isConnectingNow = AetherVpnService.isConnecting
+            val isRun = withContext(Dispatchers.IO) {
+                try {
+                    Aethermobile.isRunning()
+                } catch (_: Throwable) {
+                    false
+                }
             }
             errorText = AetherVpnService.lastError
 
@@ -571,7 +575,10 @@ private fun AetherApp(
                 if (startElapsedMs == 0L) startElapsedMs = nowMs
 
                 try {
-                    val j = JSONObject(Aethermobile.getStatsJSON())
+                    val statsRaw = withContext(Dispatchers.IO) {
+                        Aethermobile.getStatsJSON()
+                    }
+                    val j = JSONObject(statsRaw)
                     val tx = j.optLong("tx_bytes")
                     val rx = j.optLong("rx_bytes")
 
@@ -598,6 +605,7 @@ private fun AetherApp(
 
                     telemetry = LiveTelemetry(
                         running = true,
+                        connecting = false,
                         endpoint = j.optString("endpoint", "connected"),
                         carriers = j.optInt("active_carriers"),
                         streams = j.optInt("active_streams"),
@@ -610,23 +618,27 @@ private fun AetherApp(
                         connectedSec = ((nowMs - startElapsedMs) / 1000L).coerceAtLeast(0L)
                     )
                 } catch (_: Throwable) {
-                    telemetry = telemetry.copy(running = true)
+                    telemetry = telemetry.copy(running = true, connecting = false)
                 }
 
                 // Auto-apply live config updates pushed from Railway over the encrypted tunnel
-                val seq = try {
-                    Aethermobile.getSyncedConfigSeq()
-                } catch (_: Throwable) {
-                    0L
+                val seq = withContext(Dispatchers.IO) {
+                    try {
+                        Aethermobile.getSyncedConfigSeq()
+                    } catch (_: Throwable) {
+                        0L
+                    }
                 }
                 if (seq > lastSyncSeq) {
                     lastSyncSeq = seq
                     val current = latestCfg
                     if (current.autoSync) {
-                        val rawSync = try {
-                            Aethermobile.getSyncedConfigJSON()
-                        } catch (_: Throwable) {
-                            ""
+                        val rawSync = withContext(Dispatchers.IO) {
+                            try {
+                                Aethermobile.getSyncedConfigJSON()
+                            } catch (_: Throwable) {
+                                ""
+                            }
                         }
                         if (rawSync.isNotBlank()) {
                             val (merged, needsReconnect) = current.mergeFromServerSync(rawSync)
@@ -652,18 +664,21 @@ private fun AetherApp(
                 if (peakMbps != 0.0) peakMbps = 0.0
                 if (downHistory.any { it > 0f }) downHistory = List(30) { 0f }
                 if (upHistory.any { it > 0f }) upHistory = List(30) { 0f }
-                telemetry = LiveTelemetry(running = false)
+                telemetry = LiveTelemetry(
+                    running = false,
+                    connecting = isConnectingNow
+                )
             }
 
-            delay(1000)
+            delay(if (isConnectingNow && !isRun) 250L else 1000L)
         }
     }
 
     val ambientGlowColor by animateColorAsState(
-        targetValue = if (telemetry.running) {
-            SignalEmerald.copy(alpha = if (tab == 0) 0.14f else 0.07f)
-        } else {
-            TextDim.copy(alpha = if (tab == 0) 0.08f else 0.04f)
+        targetValue = when {
+            telemetry.running -> SignalEmerald.copy(alpha = if (tab == 0) 0.14f else 0.07f)
+            telemetry.connecting -> SignalAmber.copy(alpha = if (tab == 0) 0.13f else 0.06f)
+            else -> TextDim.copy(alpha = if (tab == 0) 0.08f else 0.04f)
         },
         animationSpec = tween(durationMillis = 550),
         label = "ambientGlow"
@@ -700,7 +715,7 @@ private fun AetherApp(
                     .fillMaxSize()
                     .statusBarsPadding()
             ) {
-                TopBrandBar(running = telemetry.running)
+                TopBrandBar(running = telemetry.running, connecting = telemetry.connecting)
 
                 // Pinned Back Bar for Menu Sub-Screens
                 if (tab == 1 && menuSubPage != null) {
@@ -735,7 +750,7 @@ private fun AetherApp(
                                     peakMbps = peakMbps,
                                     errorText = errorText,
                                     onToggle = {
-                                        if (telemetry.running) onDisconnect() else onConnect(cfg)
+                                        if (telemetry.running || telemetry.connecting) onDisconnect() else onConnect(cfg)
                                     }
                                 )
                                 Spacer(Modifier.height(98.dp))
@@ -956,7 +971,7 @@ private fun AetherApp(
 // ---------------------------------------------------------------------------
 
 @Composable
-private fun TopBrandBar(running: Boolean) {
+private fun TopBrandBar(running: Boolean, connecting: Boolean = false) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -986,7 +1001,7 @@ private fun TopBrandBar(running: Boolean) {
                     .padding(horizontal = 6.dp, vertical = 2.dp)
             ) {
                 Text(
-                    text = "v4.1",
+                    text = "v4.1.1",
                     fontSize = 10.sp,
                     fontFamily = FontFamily.Monospace,
                     fontWeight = FontWeight.Medium,
@@ -994,7 +1009,7 @@ private fun TopBrandBar(running: Boolean) {
                 )
             }
         }
-        StatusBadge(running = running)
+        StatusBadge(running = running, connecting = connecting)
     }
 }
 
@@ -1042,7 +1057,7 @@ private fun SubPageTopBar(
 }
 
 @Composable
-private fun StatusBadge(running: Boolean) {
+private fun StatusBadge(running: Boolean, connecting: Boolean = false) {
     val infinite = rememberInfiniteTransition(label = "badgePulse")
     val dotAlpha by infinite.animateFloat(
         initialValue = 1f,
@@ -1055,17 +1070,29 @@ private fun StatusBadge(running: Boolean) {
     )
 
     val bg by animateColorAsState(
-        targetValue = if (running) SignalEmerald.copy(alpha = 0.14f) else SurfaceCard,
+        targetValue = when {
+            running -> SignalEmerald.copy(alpha = 0.14f)
+            connecting -> SignalAmber.copy(alpha = 0.14f)
+            else -> SurfaceCard
+        },
         animationSpec = tween(350),
         label = "badgeBg"
     )
     val border by animateColorAsState(
-        targetValue = if (running) SignalEmerald.copy(alpha = 0.45f) else BorderHairline,
+        targetValue = when {
+            running -> SignalEmerald.copy(alpha = 0.45f)
+            connecting -> SignalAmber.copy(alpha = 0.50f)
+            else -> BorderHairline
+        },
         animationSpec = tween(350),
         label = "badgeBorder"
     )
     val labelColor by animateColorAsState(
-        targetValue = if (running) SignalEmeraldBright else TextSecondary,
+        targetValue = when {
+            running -> SignalEmeraldBright
+            connecting -> SignalAmber
+            else -> TextSecondary
+        },
         animationSpec = tween(350),
         label = "badgeText"
     )
@@ -1083,10 +1110,20 @@ private fun StatusBadge(running: Boolean) {
             modifier = Modifier
                 .size(7.dp)
                 .clip(CircleShape)
-                .background(if (running) SignalEmeraldBright.copy(alpha = dotAlpha) else TextDim)
+                .background(
+                    when {
+                        running -> SignalEmeraldBright.copy(alpha = dotAlpha)
+                        connecting -> SignalAmber.copy(alpha = dotAlpha)
+                        else -> TextDim
+                    }
+                )
         )
         Text(
-            text = if (running) "PROTECTED" else "STANDBY",
+            text = when {
+                running -> "PROTECTED"
+                connecting -> "LINKING"
+                else -> "STANDBY"
+            },
             fontSize = 10.sp,
             fontWeight = FontWeight.Bold,
             fontFamily = FontFamily.Monospace,
@@ -1174,7 +1211,11 @@ private fun TunnelTab(
     onToggle: () -> Unit
 ) {
     val titleColor by animateColorAsState(
-        targetValue = if (telemetry.running) SignalEmeraldBright else TextPrimary,
+        targetValue = when {
+            telemetry.running -> SignalEmeraldBright
+            telemetry.connecting -> SignalAmber
+            else -> TextPrimary
+        },
         animationSpec = tween(350),
         label = "statusTitleColor"
     )
@@ -1187,6 +1228,7 @@ private fun TunnelTab(
         // Machined 200dp Hero Power Dial
         MachinedPowerDial(
             running = telemetry.running,
+            connecting = telemetry.connecting,
             onToggle = onToggle
         )
 
@@ -1196,7 +1238,11 @@ private fun TunnelTab(
             verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             Text(
-                text = if (telemetry.running) "Tunnel Protected" else "Ready to Connect",
+                text = when {
+                    telemetry.running -> "Tunnel Protected"
+                    telemetry.connecting -> "Connecting (${transportLabel(cfg.transport)})..."
+                    else -> "Ready to Connect"
+                },
                 fontSize = 19.sp,
                 fontWeight = FontWeight.Bold,
                 letterSpacing = (-0.4).sp,
@@ -1215,13 +1261,19 @@ private fun TunnelTab(
                     modifier = Modifier
                         .size(6.dp)
                         .clip(CircleShape)
-                        .background(if (telemetry.running) SignalEmerald else TextDim)
+                        .background(
+                            when {
+                                telemetry.running -> SignalEmerald
+                                telemetry.connecting -> SignalAmber
+                                else -> TextDim
+                            }
+                        )
                 )
                 Text(
-                    text = if (telemetry.running) {
-                        "${telemetry.endpoint} · ${protocolProfileLabel(cfg.protocolProfile)} · ${transportLabel(cfg.transport)} · ${fmtDuration(telemetry.connectedSec)}"
-                    } else {
-                        "${protocolProfileLabel(cfg.protocolProfile)} · ${shortCipherName(cfg.cipher)} · ${transportLabel(cfg.transport)} · uTLS ${fingerprintLabel(cfg.fingerprint)}"
+                    text = when {
+                        telemetry.running -> "${telemetry.endpoint} · ${protocolProfileLabel(cfg.protocolProfile)} · ${transportLabel(cfg.transport)} · ${fmtDuration(telemetry.connectedSec)}"
+                        telemetry.connecting -> "Establishing ${transportLabel(cfg.transport)} · tap dial to cancel"
+                        else -> "${protocolProfileLabel(cfg.protocolProfile)} · ${shortCipherName(cfg.cipher)} · ${transportLabel(cfg.transport)} · uTLS ${fingerprintLabel(cfg.fingerprint)}"
                     },
                     fontSize = 10.5.sp,
                     fontFamily = FontFamily.Monospace,
@@ -1281,6 +1333,7 @@ private fun TunnelTab(
 @Composable
 private fun MachinedPowerDial(
     running: Boolean,
+    connecting: Boolean = false,
     onToggle: () -> Unit
 ) {
     val haptic = LocalHapticFeedback.current
@@ -1307,27 +1360,47 @@ private fun MachinedPowerDial(
     )
 
     val glyphColor by animateColorAsState(
-        targetValue = if (running) SignalEmeraldBright else TextPrimary,
+        targetValue = when {
+            running -> SignalEmeraldBright
+            connecting -> SignalAmber
+            else -> TextPrimary
+        },
         animationSpec = tween(350),
         label = "glyphColor"
     )
     val rimTopColor by animateColorAsState(
-        targetValue = if (running) SignalEmeraldBright.copy(alpha = 0.65f) else Color(0xFF3F3F46),
+        targetValue = when {
+            running -> SignalEmeraldBright.copy(alpha = 0.65f)
+            connecting -> SignalAmber.copy(alpha = 0.65f)
+            else -> Color(0xFF3F3F46)
+        },
         animationSpec = tween(350),
         label = "rimTopColor"
     )
     val rimBottomColor by animateColorAsState(
-        targetValue = if (running) SignalEmerald.copy(alpha = 0.18f) else BorderHairline,
+        targetValue = when {
+            running -> SignalEmerald.copy(alpha = 0.18f)
+            connecting -> SignalAmber.copy(alpha = 0.18f)
+            else -> BorderHairline
+        },
         animationSpec = tween(350),
         label = "rimBottomColor"
     )
     val coreTop by animateColorAsState(
-        targetValue = if (running) Color(0xFF10241D) else Color(0xFF1C1C21),
+        targetValue = when {
+            running -> Color(0xFF10241D)
+            connecting -> Color(0xFF231B0E)
+            else -> Color(0xFF1C1C21)
+        },
         animationSpec = tween(350),
         label = "coreTop"
     )
     val coreBottom by animateColorAsState(
-        targetValue = if (running) Color(0xFF09120F) else Color(0xFF0C0C0F),
+        targetValue = when {
+            running -> Color(0xFF09120F)
+            connecting -> Color(0xFF120E09)
+            else -> Color(0xFF0C0C0F)
+        },
         animationSpec = tween(350),
         label = "coreBottom"
     )
@@ -1343,12 +1416,13 @@ private fun MachinedPowerDial(
             val tickInnerMajor = size.minDimension * 0.422f
             val sweepRadius = size.minDimension * 0.392f
 
-            if (running) {
+            if (running || connecting) {
                 val baseR = size.minDimension * 0.34f
                 val maxR = size.minDimension * 0.495f
                 val waveR = baseR + (maxR - baseR) * radarProgress
+                val pulseColor = if (running) SignalEmerald else SignalAmber
                 drawCircle(
-                    color = SignalEmerald.copy(alpha = (1f - radarProgress) * 0.26f),
+                    color = pulseColor.copy(alpha = (1f - radarProgress) * 0.26f),
                     radius = waveR,
                     center = center,
                     style = Stroke(width = 1.5.dp.toPx())
@@ -1364,10 +1438,10 @@ private fun MachinedPowerDial(
                 val isMajor = i % 9 == 0
                 val innerR = if (isMajor) tickInnerMajor else tickInnerMinor
 
-                val tickColor = if (running) {
-                    if (isMajor) SignalEmeraldBright.copy(alpha = 0.75f) else SignalEmerald.copy(alpha = 0.30f)
-                } else {
-                    if (isMajor) TextDim.copy(alpha = 0.65f) else BorderHairline
+                val tickColor = when {
+                    running -> if (isMajor) SignalEmeraldBright.copy(alpha = 0.75f) else SignalEmerald.copy(alpha = 0.30f)
+                    connecting -> if (isMajor) SignalAmber.copy(alpha = 0.75f) else SignalAmber.copy(alpha = 0.30f)
+                    else -> if (isMajor) TextDim.copy(alpha = 0.65f) else BorderHairline
                 }
 
                 drawLine(
@@ -1380,17 +1454,23 @@ private fun MachinedPowerDial(
             }
 
             drawCircle(
-                color = if (running) SignalEmerald.copy(alpha = 0.14f) else BorderHairline.copy(alpha = 0.7f),
+                color = when {
+                    running -> SignalEmerald.copy(alpha = 0.14f)
+                    connecting -> SignalAmber.copy(alpha = 0.18f)
+                    else -> BorderHairline.copy(alpha = 0.7f)
+                },
                 radius = sweepRadius,
                 center = center,
                 style = Stroke(width = 2.dp.toPx())
             )
 
-            if (running) {
+            if (running || connecting) {
                 val arcTopLeft = Offset(center.x - sweepRadius, center.y - sweepRadius)
                 val arcSize = Size(sweepRadius * 2f, sweepRadius * 2f)
+                val tailColor = if (running) SignalEmerald.copy(alpha = 0.35f) else SignalAmber.copy(alpha = 0.35f)
+                val headColor = if (running) SignalEmeraldBright else SignalAmber
                 drawArc(
-                    color = SignalEmerald.copy(alpha = 0.35f),
+                    color = tailColor,
                     startAngle = sweepAngle - 95f,
                     sweepAngle = 95f,
                     useCenter = false,
@@ -1399,7 +1479,7 @@ private fun MachinedPowerDial(
                     style = Stroke(width = 3.dp.toPx(), cap = StrokeCap.Round)
                 )
                 drawArc(
-                    color = SignalEmeraldBright,
+                    color = headColor,
                     startAngle = sweepAngle - 28f,
                     sweepAngle = 28f,
                     useCenter = false,
@@ -1460,12 +1540,20 @@ private fun MachinedPowerDial(
                     }
                     Spacer(Modifier.height(5.dp))
                     Text(
-                        text = if (running) "ACTIVE" else "ENGAGE",
+                        text = when {
+                            running -> "ACTIVE"
+                            connecting -> "CANCEL"
+                            else -> "ENGAGE"
+                        },
                         fontSize = 9.sp,
                         fontFamily = FontFamily.Monospace,
                         fontWeight = FontWeight.Bold,
                         letterSpacing = 1.6.sp,
-                        color = if (running) SignalEmeraldBright else TextDim
+                        color = when {
+                            running -> SignalEmeraldBright
+                            connecting -> SignalAmber
+                            else -> TextDim
+                        }
                     )
                 }
             }
@@ -3304,7 +3392,7 @@ private fun AccessKeySubScreen(
                 "Camouflage Path" to normalizedPath(cfg.customPath),
                 "DNS Cache" to "${dnsLabel(cfg.dnsPreset)} · 60s Hedged",
                 "UDP / QUIC" to "${quicLabel(cfg.quicMode)} · MTU 1500",
-                "Build" to "v4.1.0 (15)"
+                "Build" to "v4.1.1 (16)"
             )
             Column {
                 specs.forEachIndexed { idx, (key, value) ->

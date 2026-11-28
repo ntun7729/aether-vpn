@@ -2,9 +2,12 @@ package carrier
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -24,20 +27,28 @@ const (
 	MaxGRPCPacketSize = 256 * 1024
 )
 
-// GRPCCarrier implements an Xray-style gRPC binary streaming carrier over HTTP/2
-// using standard 5-byte gRPC length-prefixed message framing ([compressed=0][len:4][payload]).
+// GRPCCarrier implements an HTTP/2 gRPC-framed full-duplex carrier multiplexed over a single
+// HTTP/2 TLS connection:
+//   - GET  /aether.v1.SyncService/Tunnel?id=<id>  streams server -> client 5-byte gRPC frames
+//   - POST /aether.v1.SyncService/Tunnel?id=<id>  uploads batched client -> server 5-byte gRPC frames
+// Works seamlessly over Railway Envoy, Cloudflare Workers, Render, and native HTTP/2 servers!
 type GRPCCarrier struct {
 	id        uint64
 	endpoint  Endpoint
-	pw        *io.PipeWriter
+	postURL   string
+	tr        *http2.Transport
 	respBody  io.ReadCloser
 	br        *bufio.Reader
-	writeMu   sync.Mutex
+	highCh    chan []byte
+	bulkCh    chan []byte
 	onWritten atomic.Value // func(int)
+	degraded  atomic.Bool
 	closed    atomic.Bool
+	closeOnce sync.Once
+	closeCh   chan struct{}
 }
 
-// DialGRPC opens a gRPC-framed HTTP/2 streaming carrier using uTLS fingerprinting.
+// DialGRPC opens an HTTP/2 gRPC-framed carrier using uTLS fingerprinting + optional TLS fragmentation.
 func DialGRPC(ctx context.Context, ep Endpoint, timeout time.Duration) (*GRPCCarrier, error) {
 	rawURL := ep.URL
 	rawURL = strings.Replace(rawURL, "wss://", "https://", 1)
@@ -48,7 +59,7 @@ func DialGRPC(ctx context.Context, ep Endpoint, timeout time.Duration) (*GRPCCar
 	}
 	u.Path = GRPCPath
 	u.RawQuery = ""
-	targetURL := u.String()
+	baseURL := u.String()
 
 	host := u.Hostname()
 	port := u.Port()
@@ -59,6 +70,10 @@ func DialGRPC(ctx context.Context, ep Endpoint, timeout time.Duration) (*GRPCCar
 			port = "80"
 		}
 	}
+
+	var sid [12]byte
+	_, _ = rand.Read(sid[:])
+	fullURL := baseURL + "?id=" + hex.EncodeToString(sid[:])
 
 	netDialer := &net.Dialer{Timeout: timeout, KeepAlive: 25 * time.Second}
 	setDialerInterface(netDialer, ep.BindInterface)
@@ -84,15 +99,15 @@ func DialGRPC(ctx context.Context, ep Endpoint, timeout time.Duration) (*GRPCCar
 		},
 	}
 
-	pr, pw := io.Pipe()
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, targetURL, pr)
+	reqCtx, reqCancel := context.WithCancel(context.Background())
+	getReq, err := http.NewRequestWithContext(reqCtx, http.MethodGet, fullURL, nil)
 	if err != nil {
-		_ = pw.Close()
+		reqCancel()
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/grpc")
-	req.Header.Set("TE", "trailers")
-	req.Header.Set("User-Agent", "grpc-go/1.69.0")
+	getReq.Header.Set("Content-Type", "application/grpc")
+	getReq.Header.Set("TE", "trailers")
+	getReq.Header.Set("User-Agent", "grpc-go/1.69.0")
 
 	type doRes struct {
 		resp *http.Response
@@ -100,39 +115,57 @@ func DialGRPC(ctx context.Context, ep Endpoint, timeout time.Duration) (*GRPCCar
 	}
 	resCh := make(chan doRes, 1)
 	go func() {
-		resp, err := tr.RoundTrip(req)
+		resp, err := tr.RoundTrip(getReq)
 		resCh <- doRes{resp, err}
 	}()
 
+	var resp *http.Response
 	select {
 	case res := <-resCh:
 		if res.err != nil {
-			_ = pw.Close()
-			return nil, fmt.Errorf("grpc dial %s failed: %w", targetURL, res.err)
+			reqCancel()
+			tr.CloseIdleConnections()
+			return nil, fmt.Errorf("grpc dial %s failed: %w", baseURL, res.err)
 		}
-		if res.resp.StatusCode != http.StatusOK {
-			_ = res.resp.Body.Close()
-			_ = pw.Close()
-			return nil, fmt.Errorf("grpc dial %s returned HTTP %d", targetURL, res.resp.StatusCode)
-		}
-		return &GRPCCarrier{
-			id:       nextCarrierID.Add(1),
-			endpoint: ep,
-			pw:       pw,
-			respBody: res.resp.Body,
-			br:       bufio.NewReaderSize(res.resp.Body, 256*1024),
-		}, nil
+		resp = res.resp
 	case <-ctx.Done():
-		_ = pw.Close()
+		reqCancel()
+		tr.CloseIdleConnections()
 		return nil, ctx.Err()
 	}
+
+	if resp.StatusCode != http.StatusOK {
+		_ = resp.Body.Close()
+		reqCancel()
+		tr.CloseIdleConnections()
+		return nil, fmt.Errorf("grpc dial %s returned HTTP %d", baseURL, resp.StatusCode)
+	}
+
+	c := &GRPCCarrier{
+		id:       nextCarrierID.Add(1),
+		endpoint: ep,
+		postURL:  fullURL,
+		tr:       tr,
+		respBody: resp.Body,
+		br:       bufio.NewReaderSize(resp.Body, 256*1024),
+		highCh:   make(chan []byte, 256),
+		bulkCh:   make(chan []byte, 48),
+		closeCh:  make(chan struct{}),
+	}
+	go func() {
+		<-c.closeCh
+		reqCancel()
+		tr.CloseIdleConnections()
+	}()
+	go c.writerLoop()
+	return c, nil
 }
 
 func (c *GRPCCarrier) CarrierID() uint64     { return c.id }
 func (c *GRPCCarrier) GetEndpoint() Endpoint { return c.endpoint }
 func (c *GRPCCarrier) IsClosed() bool        { return c.closed.Load() }
-func (c *GRPCCarrier) Degraded() bool        { return false }
-func (c *GRPCCarrier) QueueLen() int         { return 0 }
+func (c *GRPCCarrier) Degraded() bool        { return c.degraded.Load() }
+func (c *GRPCCarrier) QueueLen() int         { return len(c.bulkCh) }
 
 func (c *GRPCCarrier) SetOnWritten(fn func(int)) {
 	if fn != nil {
@@ -140,27 +173,120 @@ func (c *GRPCCarrier) SetOnWritten(fn func(int)) {
 	}
 }
 
-func (c *GRPCCarrier) WritePacketPriority(data []byte, _ bool) error { return c.WritePacket(data) }
+func (c *GRPCCarrier) notifyWritten(n int) {
+	if fn, ok := c.onWritten.Load().(func(int)); ok && fn != nil {
+		fn(n)
+	}
+}
+
+func (c *GRPCCarrier) writerLoop() {
+	var batch bytes.Buffer
+	appendFrame := func(pkt []byte) {
+		var hdr [5]byte
+		hdr[0] = 0 // uncompressed gRPC frame
+		binary.BigEndian.PutUint32(hdr[1:5], uint32(len(pkt)))
+		batch.Write(hdr[:])
+		batch.Write(pkt)
+	}
+
+	flush := func(payloadBytes int) bool {
+		t0 := time.Now()
+		pctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		req, err := http.NewRequestWithContext(pctx, http.MethodPost, c.postURL, bytes.NewReader(batch.Bytes()))
+		if err != nil {
+			cancel()
+			_ = c.Close()
+			return false
+		}
+		req.Header.Set("Content-Type", "application/grpc")
+		req.Header.Set("TE", "trailers")
+		req.Header.Set("User-Agent", "grpc-go/1.69.0")
+		resp, err := c.tr.RoundTrip(req)
+		cancel()
+		if err != nil {
+			_ = c.Close()
+			return false
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			_ = c.Close()
+			return false
+		}
+		c.degraded.Store(time.Since(t0) > 1200*time.Millisecond)
+		c.notifyWritten(payloadBytes)
+		batch.Reset()
+		return true
+	}
+
+	for {
+		batch.Reset()
+		payloadBytes := 0
+		select {
+		case <-c.closeCh:
+			return
+		case pkt := <-c.highCh:
+			appendFrame(pkt)
+			payloadBytes += len(pkt)
+		default:
+			select {
+			case <-c.closeCh:
+				return
+			case pkt := <-c.highCh:
+				appendFrame(pkt)
+				payloadBytes += len(pkt)
+			case pkt := <-c.bulkCh:
+				appendFrame(pkt)
+				payloadBytes += len(pkt)
+			}
+		}
+
+		for batch.Len() < 256*1024 {
+			select {
+			case pkt := <-c.highCh:
+				appendFrame(pkt)
+				payloadBytes += len(pkt)
+				continue
+			default:
+			}
+			select {
+			case pkt := <-c.bulkCh:
+				appendFrame(pkt)
+				payloadBytes += len(pkt)
+				continue
+			default:
+			}
+			break
+		}
+
+		if !flush(payloadBytes) {
+			return
+		}
+	}
+}
 
 func (c *GRPCCarrier) WritePacket(data []byte) error {
+	return c.WritePacketPriority(data, true)
+}
+
+func (c *GRPCCarrier) WritePacketPriority(data []byte, high bool) error {
 	if c.closed.Load() {
 		return net.ErrClosed
 	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	var hdr [5]byte
-	hdr[0] = 0 // uncompressed gRPC frame
-	binary.BigEndian.PutUint32(hdr[1:5], uint32(len(data)))
-	if _, err := c.pw.Write(hdr[:]); err != nil {
-		return err
+	if high {
+		select {
+		case c.highCh <- data:
+			return nil
+		case <-c.closeCh:
+			return net.ErrClosed
+		}
 	}
-	if _, err := c.pw.Write(data); err != nil {
-		return err
+	select {
+	case c.bulkCh <- data:
+		return nil
+	case <-c.closeCh:
+		return net.ErrClosed
 	}
-	if fn, ok := c.onWritten.Load().(func(int)); ok && fn != nil {
-		fn(len(data))
-	}
-	return nil
 }
 
 func (c *GRPCCarrier) ReadPacket() ([]byte, error) {
@@ -180,35 +306,39 @@ func (c *GRPCCarrier) ReadPacket() ([]byte, error) {
 }
 
 func (c *GRPCCarrier) Close() error {
-	if c.closed.Swap(true) {
-		return nil
-	}
-	_ = c.pw.Close()
-	return c.respBody.Close()
+	c.closeOnce.Do(func() {
+		c.closed.Store(true)
+		close(c.closeCh)
+		if c.respBody != nil {
+			_ = c.respBody.Close()
+		}
+	})
+	return nil
 }
 
-// GRPCServerCarrier is the server-side counterpart to GRPCCarrier.
+// GRPCServerCarrier pairs a persistent gRPC GET downlink with incoming gRPC POST uplink frames.
 type GRPCServerCarrier struct {
 	id        uint64
 	endpoint  Endpoint
-	br        *bufio.Reader
-	body      io.ReadCloser
 	w         http.ResponseWriter
 	flusher   http.Flusher
 	writeMu   sync.Mutex
+	inCh      chan []byte
 	onWritten atomic.Value // func(int)
 	closed    atomic.Bool
+	closeOnce sync.Once
+	closeCh   chan struct{}
 }
 
-// WrapGRPCServer wraps an incoming gRPC HTTP/2 stream on the server side.
-func WrapGRPCServer(r *http.Request, w http.ResponseWriter, flusher http.Flusher, ep Endpoint) *GRPCServerCarrier {
+// NewGRPCServerCarrier creates a server-side HTTP/2 gRPC carrier for an incoming GET downlink.
+func NewGRPCServerCarrier(w http.ResponseWriter, flusher http.Flusher, ep Endpoint) *GRPCServerCarrier {
 	return &GRPCServerCarrier{
 		id:       nextCarrierID.Add(1),
 		endpoint: ep,
-		br:       bufio.NewReaderSize(r.Body, 256*1024),
-		body:     r.Body,
 		w:        w,
 		flusher:  flusher,
+		inCh:     make(chan []byte, 256),
+		closeCh:  make(chan struct{}),
 	}
 }
 
@@ -238,9 +368,11 @@ func (c *GRPCServerCarrier) WritePacket(data []byte) error {
 	hdr[0] = 0
 	binary.BigEndian.PutUint32(hdr[1:5], uint32(len(data)))
 	if _, err := c.w.Write(hdr[:]); err != nil {
+		_ = c.Close()
 		return err
 	}
 	if _, err := c.w.Write(data); err != nil {
+		_ = c.Close()
 		return err
 	}
 	c.flusher.Flush()
@@ -250,25 +382,47 @@ func (c *GRPCServerCarrier) WritePacket(data []byte) error {
 	return nil
 }
 
-func (c *GRPCServerCarrier) ReadPacket() ([]byte, error) {
+// FeedPostBody parses 5-byte gRPC length-prefixed frames from a client POST uplink.
+func (c *GRPCServerCarrier) FeedPostBody(r io.Reader) error {
+	br := bufio.NewReaderSize(r, 64*1024)
 	var hdr [5]byte
-	if _, err := io.ReadFull(c.br, hdr[:]); err != nil {
-		return nil, err
+	for {
+		_, err := io.ReadFull(br, hdr[:])
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		n := binary.BigEndian.Uint32(hdr[1:5])
+		if n == 0 || n > MaxGRPCPacketSize {
+			return errors.New("aether/grpc: invalid uplink frame size")
+		}
+		pkt := make([]byte, n)
+		if _, err := io.ReadFull(br, pkt); err != nil {
+			return err
+		}
+		select {
+		case c.inCh <- pkt:
+		case <-c.closeCh:
+			return net.ErrClosed
+		}
 	}
-	n := binary.BigEndian.Uint32(hdr[1:5])
-	if n == 0 || n > MaxGRPCPacketSize {
-		return nil, fmt.Errorf("aether/grpc: invalid packet size %d", n)
+}
+
+func (c *GRPCServerCarrier) ReadPacket() ([]byte, error) {
+	select {
+	case pkt := <-c.inCh:
+		return pkt, nil
+	case <-c.closeCh:
+		return nil, io.EOF
 	}
-	buf := make([]byte, n)
-	if _, err := io.ReadFull(c.br, buf); err != nil {
-		return nil, err
-	}
-	return buf, nil
 }
 
 func (c *GRPCServerCarrier) Close() error {
-	if c.closed.Swap(true) {
-		return nil
-	}
-	return c.body.Close()
+	c.closeOnce.Do(func() {
+		c.closed.Store(true)
+		close(c.closeCh)
+	})
+	return nil
 }

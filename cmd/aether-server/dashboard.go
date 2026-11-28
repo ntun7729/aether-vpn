@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const serverVersion = "4.1.0"
+const serverVersion = "4.1.1"
 
 // handleAdminRoute authenticates /{ADMIN_KEY}/... in constant time.
 // Returns true if the request was handled as an authenticated admin route; false falls through to decoy HTML.

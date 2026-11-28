@@ -11,9 +11,9 @@ export default {
     }
 
     const isRealtime = (request.headers.get("Upgrade") || "").toLowerCase() === "websocket";
-    const isBatch = url.pathname.endsWith("/h2") && request.method === "POST";
+    const isBatch = url.pathname.endsWith("/h2") && (request.method === "GET" || request.method === "POST");
     const isSplit = url.pathname.endsWith("/xhttp") && (request.method === "GET" || request.method === "POST");
-    const isRpc = url.pathname === "/aether.v1.SyncService/Tunnel" && request.method === "POST";
+    const isRpc = url.pathname === "/aether.v1.SyncService/Tunnel" && (request.method === "GET" || request.method === "POST");
 
     if ((url.pathname !== "/" && isRealtime) || isBatch || isSplit || isRpc) {
       const origins = (env.ORIGIN_POOL || "")

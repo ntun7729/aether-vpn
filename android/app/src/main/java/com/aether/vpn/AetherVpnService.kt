@@ -29,6 +29,9 @@ class AetherVpnService : VpnService() {
 
         @Volatile
         var lastError: String? = null
+
+        @Volatile
+        var isConnecting: Boolean = false
     }
 
     private var tunInterface: ParcelFileDescriptor? = null
@@ -37,11 +40,17 @@ class AetherVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
-                stopTunnel()
-                stopSelf()
+                isConnecting = false
+                Thread {
+                    stopTunnel()
+                    stopSelf()
+                }.start()
                 return START_NOT_STICKY
             }
             ACTION_START -> {
+                if (isConnecting) return START_STICKY
+                isConnecting = true
+                lastError = null
                 startForeground(NOTIF_ID, buildNotification("Connecting to AetherVPN..."))
                 Thread { startTunnel() }.start()
                 return START_STICKY
@@ -51,6 +60,7 @@ class AetherVpnService : VpnService() {
     }
 
     private fun startTunnel() {
+        var detachedFd = -1
         try {
             lastError = null
             val cfg = ConfigStore.load(this)
@@ -94,16 +104,25 @@ class AetherVpnService : VpnService() {
             val pfd = builder.establish() ?: throw IllegalStateException("VpnService.Builder.establish() returned null")
             tunInterface = pfd
 
-            val fd = pfd.detachFd()
+            detachedFd = pfd.detachFd()
             tunInterface = null
 
-            Aethermobile.startVPN(fd.toLong(), MTU.toLong(), cfg.toCoreJson())
+            Aethermobile.startVPN(detachedFd.toLong(), MTU.toLong(), cfg.toCoreJson())
+            detachedFd = -1 // Ownership now held by Go core
+            isConnecting = false
             registerRoamingCallback()
-            updateNotification("AetherVPN Connected (Multi-Path + uTLS)")
+            updateNotification("AetherVPN Connected (${cfg.transport.uppercase()} · ${cfg.carriers} carriers)")
             refreshQuickTile()
         } catch (e: Exception) {
             Log.e("AetherVPN", "Failed to start VPN", e)
+            isConnecting = false
             lastError = e.message ?: e.toString()
+            if (detachedFd >= 0) {
+                try {
+                    ParcelFileDescriptor.adoptFd(detachedFd).close()
+                } catch (_: Exception) {
+                }
+            }
             stopTunnel()
             stopSelf()
         }

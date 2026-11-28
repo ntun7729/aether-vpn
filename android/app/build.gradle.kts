@@ -12,8 +12,8 @@ android {
         applicationId = "com.aether.vpn"
         minSdk = 26
         targetSdk = 35
-        versionCode = 15
-        versionName = "4.1.0"
+        versionCode = 16
+        versionName = "4.1.1"
     }
 
     buildTypes {

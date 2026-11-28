@@ -81,27 +81,39 @@ type vpnInstance struct {
 }
 
 var (
-	instMu sync.Mutex
-	active *vpnInstance
+	instMu      sync.Mutex
+	active      *vpnInstance
+	starting    bool
+	startCancel context.CancelFunc
 )
 
-// StartVPN starts the Aether v2.3 multi-path VPN tunnel over an Android VpnService TUN fd.
-// Includes: zero-delay gVisor TCP (Nagle off), 60s local cache of AdGuard DNS replies (0.1ms hits),
-// instant local AAAA empty-NOERROR, full QUIC (65s TTL, MTU 1500), and 64KB pooled copy buffers.
+// StartVPN starts the Aether multi-path VPN tunnel over an Android VpnService TUN fd.
+// Never holds instMu across network dialing so IsRunning() / GetStatsJSON() NEVER block the UI thread!
 func StartVPN(tunFd int, mtu int, configJSON string) error {
-	instMu.Lock()
-	defer instMu.Unlock()
-
-	if active != nil {
-		return errors.New("aether vpn is already running")
-	}
 	if mtu <= 0 {
 		mtu = 1500
 	}
-
 	var cfg MobileConfig
 	if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
 		return fmt.Errorf("invalid config JSON: %w", err)
+	}
+
+	instMu.Lock()
+	if active != nil || starting {
+		instMu.Unlock()
+		return errors.New("aether vpn is already running or connecting")
+	}
+	starting = true
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	startCancel = dialCancel
+	instMu.Unlock()
+
+	cleanupStart := func() {
+		dialCancel()
+		instMu.Lock()
+		starting = false
+		startCancel = nil
+		instMu.Unlock()
 	}
 
 	inst := &vpnInstance{
@@ -166,15 +178,25 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 		}
 	})
 	if err != nil {
+		cleanupStart()
 		return err
 	}
 
-	startCtx, startCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	if err := mgr.Start(startCtx); err != nil {
-		startCancel()
+	// Network dial runs WITHOUT holding instMu so StopVPN() can cancel instantly and UI polling never blocks!
+	if err := mgr.Start(dialCtx); err != nil {
+		cleanupStart()
 		return fmt.Errorf("connect failed: %w", err)
 	}
-	startCancel()
+	dialCancel()
+
+	// Check if StopVPN() was called while we were connecting
+	instMu.Lock()
+	if !starting {
+		instMu.Unlock()
+		_ = mgr.Close()
+		return errors.New("connection cancelled")
+	}
+	instMu.Unlock()
 
 	// Build low-latency, high-BDP gVisor TCP/IP stack (CUBIC + SACK + NoDelay + 4MB/8MB windows)
 	linkEP := channel.New(4096, uint32(mtu), "")
@@ -195,6 +217,7 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sndBuf)
 
 	if err := s.CreateNIC(nicID, linkEP); err != nil {
+		cleanupStart()
 		_ = mgr.Close()
 		return fmt.Errorf("create NIC failed: %v", err)
 	}
@@ -324,6 +347,14 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 	})
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
 
+	instMu.Lock()
+	if !starting {
+		instMu.Unlock()
+		linkEP.Close()
+		s.Close()
+		_ = mgr.Close()
+		return errors.New("connection cancelled")
+	}
 	tunFile := os.NewFile(uintptr(tunFd), "aether-tun")
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -332,6 +363,11 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 	inst.ipStack = s
 	inst.linkEP = linkEP
 	inst.cancel = cancel
+
+	active = inst
+	starting = false
+	startCancel = nil
+	instMu.Unlock()
 
 	// Pump packets: Android TUN -> gVisor
 	go func() {
@@ -379,17 +415,22 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 		}
 	}()
 
-	active = inst
 	return nil
 }
 
-// StopVPN tears down the active tunnel and closes the TUN interface.
+// StopVPN tears down the active tunnel (or immediately cancels an in-progress connect) and closes TUN.
 func StopVPN() error {
 	instMu.Lock()
 	inst := active
 	active = nil
+	starting = false
+	cancelDial := startCancel
+	startCancel = nil
 	instMu.Unlock()
 
+	if cancelDial != nil {
+		cancelDial()
+	}
 	if inst == nil {
 		return nil
 	}

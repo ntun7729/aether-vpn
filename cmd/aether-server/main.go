@@ -146,9 +146,10 @@ type Server struct {
 	liveDownBps  float64
 	liveUpBps    float64
 
-	// Active SplitHTTP (XHTTP) downlink carriers keyed by stream id
+	// Active SplitHTTP (XHTTP / H2) and gRPC downlink carriers keyed by stream id
 	xhttpMu  sync.Mutex
 	xhttpMap map[string]*carrier.XHTTPServerCarrier
+	grpcMap  map[string]*carrier.GRPCServerCarrier
 
 	// Telemetry counters
 	archivedTx      atomic.Uint64
@@ -224,6 +225,7 @@ func NewServer(psk, adminKey, tunnelPath string, allowPrivate, adblockSNI, block
 			CheckOrigin:       func(r *http.Request) bool { return true },
 		},
 		xhttpMap: make(map[string]*carrier.XHTTPServerCarrier),
+		grpcMap:  make(map[string]*carrier.GRPCServerCarrier),
 		sessions: make(map[[16]byte]*serverSession),
 	}
 	go s.gcLoop()
@@ -511,7 +513,52 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveCarrier(carrier.WrapConn(conn, carrier.Endpoint{Name: r.RemoteAddr}))
 		return
 
+	case isH2Path && r.Method == http.MethodGet:
+		id := r.URL.Query().Get("id")
+		if len(id) < 8 || len(id) > 64 {
+			http.Error(w, "bad stream id", http.StatusBadRequest)
+			return
+		}
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+
+		hc := carrier.NewXHTTPServerCarrier(w, flusher, carrier.Endpoint{Name: r.RemoteAddr})
+		s.xhttpMu.Lock()
+		s.xhttpMap["h2:"+id] = hc
+		s.xhttpMu.Unlock()
+		defer func() {
+			s.xhttpMu.Lock()
+			delete(s.xhttpMap, "h2:"+id)
+			s.xhttpMu.Unlock()
+			_ = hc.Close()
+		}()
+		s.serveCarrier(hc)
+		return
+
 	case isH2Path && r.Method == http.MethodPost:
+		if id := r.URL.Query().Get("id"); id != "" {
+			s.xhttpMu.Lock()
+			hc, ok := s.xhttpMap["h2:"+id]
+			s.xhttpMu.Unlock()
+			if !ok {
+				http.Error(w, "unknown stream id", http.StatusGone)
+				return
+			}
+			if err := hc.FeedPostBody(r.Body); err != nil {
+				http.Error(w, "stream closed", http.StatusGone)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -571,7 +618,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 
-	case r.URL.Path == carrier.GRPCPath && r.Method == http.MethodPost:
+	case r.URL.Path == carrier.GRPCPath && r.Method == http.MethodGet:
+		id := r.URL.Query().Get("id")
+		if len(id) < 8 || len(id) > 64 {
+			http.Error(w, "bad stream id", http.StatusBadRequest)
+			return
+		}
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -582,7 +634,34 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Accel-Buffering", "no")
 		w.WriteHeader(http.StatusOK)
 		flusher.Flush()
-		s.serveCarrier(carrier.WrapGRPCServer(r, w, flusher, carrier.Endpoint{Name: r.RemoteAddr}))
+
+		gc := carrier.NewGRPCServerCarrier(w, flusher, carrier.Endpoint{Name: r.RemoteAddr})
+		s.xhttpMu.Lock()
+		s.grpcMap[id] = gc
+		s.xhttpMu.Unlock()
+		defer func() {
+			s.xhttpMu.Lock()
+			delete(s.grpcMap, id)
+			s.xhttpMu.Unlock()
+			_ = gc.Close()
+		}()
+		s.serveCarrier(gc)
+		return
+
+	case r.URL.Path == carrier.GRPCPath && r.Method == http.MethodPost:
+		id := r.URL.Query().Get("id")
+		s.xhttpMu.Lock()
+		gc, ok := s.grpcMap[id]
+		s.xhttpMu.Unlock()
+		if !ok {
+			http.Error(w, "unknown grpc stream id", http.StatusGone)
+			return
+		}
+		if err := gc.FeedPostBody(r.Body); err != nil {
+			http.Error(w, "grpc stream closed", http.StatusGone)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 
