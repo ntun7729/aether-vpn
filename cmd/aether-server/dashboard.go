@@ -12,7 +12,7 @@ import (
 	"github.com/aether-vpn/aether/core/adblock"
 )
 
-const serverVersion = "3.1.1"
+const serverVersion = "3.2.0"
 
 // handleAdminRoute authenticates /{ADMIN_KEY}/... in constant time.
 // Returns true if the request was handled as an authenticated admin route; false falls through to decoy HTML.
@@ -153,6 +153,7 @@ func (s *Server) handleAPIStats(w http.ResponseWriter, r *http.Request) {
 		"dns_cache_size":    s.udpDNSCache.Size(),
 		"dns_cache_hit_pct": hitPct,
 		"ws_url":            wsURL,
+		"fallback_default":  "wss://sync.novv.tech/ws/sync",
 		"psk":               string(s.psk),
 		"config": map[string]any{
 			"tunnel_path":  s.path,
@@ -262,224 +263,2636 @@ const dashboardHTML = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AetherVPN Console</title>
+<meta name="color-scheme" content="dark">
+<title>AetherVPN · Control Plane</title>
 <style>
-  :root{--bg:#0b0f19;--card:#131a2a;--border:#1f2a44;--text:#e6edf7;--muted:#8b9bb4;--accent:#3b82f6;--green:#22c55e;--red:#ef4444;--amber:#f59e0b}
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--text);padding:20px;max-width:1100px;margin:0 auto;line-height:1.5}
-  header{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid var(--border)}
-  .brand{display:flex;align-items:center;gap:10px}
-  .dot{width:10px;height:10px;border-radius:50%;background:var(--green);box-shadow:0 0 10px var(--green)}
-  h1{font-size:20px;font-weight:700;letter-spacing:-0.3px}
-  .pill{font-size:12px;padding:4px 10px;border-radius:999px;background:#1b2640;color:var(--muted);border:1px solid var(--border)}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px;margin-bottom:18px}
-  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px}
-  .label{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:0.6px;margin-bottom:6px}
-  .val{font-size:24px;font-weight:700}
-  .sub{font-size:12px;color:var(--muted);margin-top:4px}
-  .section{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px;margin-bottom:16px}
-  .section h2{font-size:15px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center}
-  .row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
-  button{background:#1d2942;color:var(--text);border:1px solid var(--border);padding:8px 14px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;transition:.15s}
-  button:hover{border-color:var(--accent);background:#243354}
-  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
-  button.primary:hover{background:#2563eb}
-  button.active{background:rgba(34,197,94,.16);border-color:var(--green);color:#86efac}
-  button.danger{background:rgba(239,68,68,.15);border-color:var(--red);color:#fca5a5;padding:5px 10px;font-size:12px}
-  input{background:#0d1322;border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:8px;font-size:13px;flex:1;min-width:180px}
-  pre{background:#0a0f1c;border:1px solid var(--border);padding:12px;border-radius:8px;font-size:12px;overflow-x:auto;color:#93c5fd;margin-top:10px;word-break:break-all;white-space:pre-wrap}
-  table{width:100%;border-collapse:collapse;font-size:13px}
-  th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--border)}
-  th{color:var(--muted);font-size:11px;text-transform:uppercase}
-  .toast{position:fixed;bottom:20px;right:20px;background:#1e293b;border:1px solid var(--accent);padding:10px 16px;border-radius:10px;font-size:13px;opacity:0;transition:.2s;pointer-events:none}
-  .toast.show{opacity:1}
+  :root {
+    color-scheme: dark;
+    accent-color: #10b981;
+    scrollbar-color: #71717a #09090b;
+    scrollbar-width: auto;
+
+    --bg: #09090b;
+    --surface: #111114;
+    --surface-hover: #16161a;
+    --well: #0c0c0f;
+    --border: rgba(255, 255, 255, 0.08);
+    --border-strong: rgba(255, 255, 255, 0.14);
+    --specular: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+
+    --text: #fafafa;
+    --text-2: #a1a1aa;
+    --text-3: #85858f;
+
+    --emerald: #10b981;
+    --emerald-hi: #34d399;
+    --emerald-tint: rgba(16, 185, 129, 0.12);
+    --emerald-border: rgba(16, 185, 129, 0.34);
+    --emerald-ink: #04150e;
+
+    --silver: #e4e4e7;
+    --amber: #f59e0b;
+    --amber-tint: rgba(245, 158, 11, 0.12);
+    --amber-border: rgba(245, 158, 11, 0.32);
+    --rose: #f43f5e;
+    --rose-hi: #fda4af;
+    --rose-tint: rgba(244, 63, 94, 0.12);
+    --rose-border: rgba(244, 63, 94, 0.34);
+
+    --radius-lg: 12px;
+    --radius-md: 8px;
+    --radius-sm: 6px;
+    --font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  *, *::before, *::after {
+    box-sizing: border-box;
+  }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background: rgba(16, 185, 129, 0.32);
+    color: #fafafa;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--emerald);
+    outline-offset: 2px;
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .mono, .tabular {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .num {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ── Top Sticky Header ─────────────────────────────────────────────────── */
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 40;
+    background: rgba(9, 9, 11, 0.84);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .topbar-inner {
+    max-width: 1280px;
+    margin: 0 auto;
+    min-height: 64px;
+    padding: 10px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+  }
+
+  .brand-cluster {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    flex-wrap: wrap;
+  }
+
+  .brand-mark {
+    width: 28px;
+    height: 28px;
+    flex-shrink: 0;
+    display: grid;
+    place-items: center;
+    border-radius: 7px;
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    box-shadow: var(--specular);
+  }
+
+  .brand-name {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    color: var(--text);
+  }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 9px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 1.4;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--border);
+    color: var(--text-2);
+    white-space: nowrap;
+  }
+
+  .pill-mono {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    background: var(--emerald-tint);
+    border: 1px solid var(--emerald-border);
+    color: var(--emerald-hi);
+  }
+
+  .status-pill[data-state="degraded"] {
+    background: var(--amber-tint);
+    border-color: var(--amber-border);
+    color: #fcd34d;
+  }
+
+  .status-pill[data-state="offline"] {
+    background: var(--rose-tint);
+    border-color: var(--rose-border);
+    color: var(--rose-hi);
+  }
+
+  .status-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--emerald);
+    position: relative;
+    flex-shrink: 0;
+  }
+
+  .status-pill[data-state="degraded"] .status-dot {
+    background: var(--amber);
+  }
+
+  .status-pill[data-state="offline"] .status-dot {
+    background: var(--rose);
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .status-pill[data-state="ok"] .status-dot::after {
+      content: "";
+      position: absolute;
+      inset: -3px;
+      border-radius: 50%;
+      border: 1.5px solid var(--emerald);
+      opacity: 0;
+      animation: statusPulse 2.2s cubic-bezier(0.2, 0.7, 0.3, 1) infinite;
+    }
+
+    @keyframes statusPulse {
+      0% { transform: scale(0.8); opacity: 0.85; }
+      75%, 100% { transform: scale(2.1); opacity: 0; }
+    }
+  }
+
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+  }
+
+  .runtime-cluster {
+    display: inline-flex;
+    align-items: center;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--specular);
+    overflow: hidden;
+  }
+
+  .runtime-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 10px;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 11.5px;
+    color: var(--text);
+  }
+
+  .runtime-chip + .runtime-chip {
+    border-left: 1px solid var(--border);
+  }
+
+  .runtime-chip .k {
+    color: var(--text-3);
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  /* ── Buttons ───────────────────────────────────────────────────────────── */
+  button {
+    font-family: inherit;
+    cursor: pointer;
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    height: 32px;
+    padding: 0 12px;
+    border-radius: var(--radius-md);
+    font-size: 12.5px;
+    font-weight: 500;
+    border: 1px solid var(--border-strong);
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: var(--specular);
+    transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease, transform 80ms ease;
+    white-space: nowrap;
+  }
+
+  .btn:hover:not(:disabled) {
+    background: #1b1b20;
+    border-color: rgba(255, 255, 255, 0.22);
+  }
+
+  .btn:active:not(:disabled) {
+    transform: translateY(0.5px);
+  }
+
+  .btn:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+
+  .btn-primary {
+    background: var(--emerald);
+    border-color: var(--emerald);
+    color: var(--emerald-ink);
+    font-weight: 600;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.24);
+  }
+
+  .btn-primary:hover:not(:disabled) {
+    background: var(--emerald-hi);
+    border-color: var(--emerald-hi);
+    color: var(--emerald-ink);
+  }
+
+  .btn-ghost {
+    background: rgba(255, 255, 255, 0.03);
+    border-color: var(--border);
+    color: var(--text-2);
+  }
+
+  .btn-ghost:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.07);
+    border-color: var(--border-strong);
+    color: var(--text);
+  }
+
+  .btn-danger {
+    height: 28px;
+    padding: 0 10px;
+    font-size: 12px;
+    background: var(--rose-tint);
+    border-color: var(--rose-border);
+    color: var(--rose-hi);
+  }
+
+  .btn-danger:hover:not(:disabled) {
+    background: rgba(244, 63, 94, 0.22);
+    border-color: rgba(244, 63, 94, 0.55);
+    color: #fff1f2;
+  }
+
+  .btn svg {
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .btn.is-spinning svg {
+      animation: spin360 650ms linear infinite;
+    }
+    @keyframes spin360 {
+      to { transform: rotate(360deg); }
+    }
+  }
+
+  /* ── Main Container & Layout Grids ─────────────────────────────────────── */
+  .shell {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 20px 24px 48px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .hero-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.75fr) minmax(0, 1fr);
+    gap: 16px;
+    align-items: stretch;
+  }
+
+  .ops-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+    align-items: stretch;
+  }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--specular);
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .panel-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+
+  .panel-title-group {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+
+  .panel-title {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: var(--text);
+  }
+
+  .panel-sub {
+    font-size: 11.5px;
+    color: var(--text-3);
+  }
+
+  .panel-body {
+    padding: 16px 18px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    flex: 1;
+    min-width: 0;
+  }
+
+  /* ── Hero Chart Panel ──────────────────────────────────────────────────── */
+  .chart-legend {
+    display: inline-flex;
+    align-items: center;
+    gap: 14px;
+    font-size: 11.5px;
+    color: var(--text-2);
+  }
+
+  .legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .legend-swatch {
+    width: 12px;
+    height: 2px;
+    border-radius: 2px;
+  }
+
+  .legend-swatch.down {
+    background: var(--emerald);
+  }
+
+  .legend-swatch.up {
+    background: repeating-linear-gradient(90deg, var(--silver) 0 4px, transparent 4px 7px);
+  }
+
+  .chart-metrics {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+    padding: 14px 18px 0;
+  }
+
+  .chart-stat {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .chart-stat-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-3);
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .swatch-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .swatch-dot.down { background: var(--emerald); }
+  .swatch-dot.up { background: var(--silver); }
+  .swatch-dot.peak { background: var(--text-3); }
+
+  .chart-stat-value {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 22px;
+    font-weight: 600;
+    letter-spacing: -0.03em;
+    line-height: 1.2;
+    color: var(--text);
+  }
+
+  .chart-stat-value .unit {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-2);
+    margin-left: 3px;
+  }
+
+  .chart-stat-sub {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 11px;
+    color: var(--text-3);
+  }
+
+  .chart-stage {
+    position: relative;
+    padding: 10px 18px 16px;
+    flex: 1;
+    min-height: 210px;
+    display: flex;
+  }
+
+  .chart-canvas {
+    width: 100%;
+    height: 210px;
+    display: block;
+    cursor: crosshair;
+  }
+
+  .chart-tooltip {
+    position: absolute;
+    pointer-events: none;
+    z-index: 10;
+    background: rgba(9, 9, 11, 0.94);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-md);
+    padding: 7px 10px;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 11px;
+    color: var(--text);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    white-space: nowrap;
+  }
+
+  .chart-tooltip-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .chart-tooltip-time {
+    color: var(--text-3);
+    margin-bottom: 3px;
+    font-size: 10.5px;
+  }
+
+  /* ── 2x2 Hairline KPI Matrix ───────────────────────────────────────────── */
+  .kpi-matrix {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-rows: repeat(2, minmax(0, 1fr));
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+    box-shadow: var(--specular);
+  }
+
+  .kpi-cell {
+    background: var(--surface);
+    padding: 18px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    gap: 10px;
+    min-width: 0;
+  }
+
+  .kpi-label {
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-2);
+  }
+
+  .kpi-value {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 28px;
+    font-weight: 600;
+    letter-spacing: -0.03em;
+    line-height: 1.1;
+    color: var(--text);
+  }
+
+  .kpi-value.emerald {
+    color: var(--emerald-hi);
+  }
+
+  .kpi-sub {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 11.5px;
+    color: var(--text-3);
+    line-height: 1.4;
+  }
+
+  .progress-track {
+    width: 100%;
+    height: 4px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.08);
+    overflow: hidden;
+    margin-top: 2px;
+  }
+
+  .progress-fill {
+    height: 100%;
+    width: 0%;
+    border-radius: 999px;
+    background: var(--emerald);
+    transition: width 320ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .progress-fill { transition: none; }
+  }
+
+  /* ── Forms, Radio Cards & Native Switches ──────────────────────────────── */
+  fieldset {
+    border: 0;
+    margin: 0;
+    padding: 0;
+    min-width: 0;
+  }
+
+  .field-label {
+    display: block;
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-2);
+    margin-bottom: 8px;
+  }
+
+  .radio-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .radio-card {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 10px 12px;
+    border-radius: var(--radius-md);
+    background: var(--well);
+    border: 1px solid var(--border);
+    cursor: pointer;
+    transition: border-color 140ms ease, background-color 140ms ease;
+  }
+
+  .radio-card:hover {
+    border-color: var(--border-strong);
+    background: #141418;
+  }
+
+  .radio-card:has(:focus-visible) {
+    outline: 2px solid var(--emerald);
+    outline-offset: 2px;
+  }
+
+  .radio-card:has(:checked) {
+    background: var(--emerald-tint);
+    border-color: var(--emerald-border);
+  }
+
+  .radio-card-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+  }
+
+  .radio-card-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+  }
+
+  .radio-card-ip {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 11.5px;
+    color: var(--text-2);
+  }
+
+  .radio-card-meta {
+    font-size: 11px;
+    color: var(--text-3);
+  }
+
+  .radio-card:has(:checked) .radio-card-ip {
+    color: var(--emerald-hi);
+  }
+
+  .radio-card input[type="radio"] {
+    appearance: none;
+    -webkit-appearance: none;
+    width: 14px;
+    height: 14px;
+    margin: 0;
+    border-radius: 50%;
+    border: 1.5px solid rgba(255, 255, 255, 0.28);
+    background: transparent;
+    display: grid;
+    place-items: center;
+    flex-shrink: 0;
+    cursor: pointer;
+    transition: border-color 140ms ease;
+  }
+
+  .radio-card input[type="radio"]::after {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--emerald);
+    transform: scale(0);
+    transition: transform 140ms ease;
+  }
+
+  .radio-card input[type="radio"]:checked {
+    border-color: var(--emerald);
+  }
+
+  .radio-card input[type="radio"]:checked::after {
+    transform: scale(1);
+  }
+
+  .inline-form {
+    display: flex;
+    gap: 8px;
+    align-items: stretch;
+  }
+
+  .text-input {
+    width: 100%;
+    min-width: 0;
+    height: 34px;
+    padding: 0 11px;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border);
+    background: var(--well);
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    transition: border-color 140ms ease, background-color 140ms ease;
+  }
+
+  .text-input::placeholder {
+    color: var(--text-3);
+    font-family: var(--font-sans);
+  }
+
+  .text-input:hover {
+    border-color: var(--border-strong);
+  }
+
+  .text-input:focus {
+    outline: none;
+    border-color: var(--emerald);
+    background: #0e0e12;
+  }
+
+  .text-input:not([type="range"]):user-invalid {
+    border-color: var(--rose);
+  }
+
+  .text-input:not([type="range"]):not(:placeholder-shown):user-valid {
+    border-color: var(--emerald-border);
+  }
+
+  /* Native accessible pill toggle switches */
+  .switch-list {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--well);
+    overflow: hidden;
+  }
+
+  .switch-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    padding: 11px 13px;
+    cursor: pointer;
+    transition: background-color 140ms ease;
+  }
+
+  .switch-row + .switch-row {
+    border-top: 1px solid var(--border);
+  }
+
+  .switch-row:hover {
+    background: rgba(255, 255, 255, 0.025);
+  }
+
+  .switch-row:has(:checked) {
+    background: rgba(16, 185, 129, 0.05);
+  }
+
+  .switch-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+  }
+
+  .switch-title {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text);
+  }
+
+  .switch-desc {
+    font-size: 11.5px;
+    color: var(--text-3);
+  }
+
+  .toggle-switch {
+    appearance: none;
+    -webkit-appearance: none;
+    position: relative;
+    width: 38px;
+    height: 22px;
+    margin: 0;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.14);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    flex-shrink: 0;
+    cursor: pointer;
+    transition: background-color 160ms ease, border-color 160ms ease;
+  }
+
+  .toggle-switch::before {
+    content: "";
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #fafafa;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
+    transition: transform 160ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .toggle-switch:checked {
+    background: var(--emerald);
+    border-color: var(--emerald);
+  }
+
+  .toggle-switch:checked::before {
+    transform: translateX(16px);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .toggle-switch, .toggle-switch::before { transition: none; }
+  }
+
+  .policy-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-top: auto;
+    padding-top: 4px;
+    flex-wrap: wrap;
+  }
+
+  .policy-meta {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 11.5px;
+    color: var(--text-3);
+  }
+
+  /* ── Client Provisioning ───────────────────────────────────────────────── */
+  .prov-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 10px;
+    align-items: end;
+  }
+
+  .seg-group {
+    display: inline-flex;
+    padding: 3px;
+    border-radius: var(--radius-md);
+    background: var(--well);
+    border: 1px solid var(--border);
+    gap: 2px;
+  }
+
+  .seg-pill {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 34px;
+    height: 26px;
+    padding: 0 10px;
+    border-radius: 5px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-2);
+    cursor: pointer;
+    transition: background-color 140ms ease, color 140ms ease;
+  }
+
+  .seg-pill:hover {
+    color: var(--text);
+  }
+
+  .seg-pill input[type="radio"] {
+    position: absolute;
+    opacity: 0;
+    inset: 0;
+    margin: 0;
+    cursor: pointer;
+  }
+
+  .seg-pill:has(:focus-visible) {
+    outline: 2px solid var(--emerald);
+    outline-offset: 1px;
+  }
+
+  .seg-pill:has(:checked) {
+    background: var(--emerald-tint);
+    color: var(--emerald-hi);
+    box-shadow: inset 0 0 0 1px var(--emerald-border);
+  }
+
+  .prov-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  .prov-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .code-well {
+    margin: 0;
+    padding: 13px 14px;
+    border-radius: var(--radius-md);
+    background: var(--well);
+    border: 1px solid var(--border);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.55;
+    color: var(--emerald-hi);
+    overflow-x: auto;
+    word-break: break-all;
+    white-space: pre-wrap;
+    min-height: 82px;
+    flex: 1;
+  }
+
+  .code-well[data-mode="cli"] {
+    color: var(--silver);
+  }
+
+  /* ── Active Sessions Responsive Table ──────────────────────────────────── */
+  .table-wrapper {
+    overflow: auto;
+    max-inline-size: 100%;
+    max-block-size: min(500px, 75vh);
+    container-type: inline-size;
+    border-bottom-left-radius: var(--radius-lg);
+    border-bottom-right-radius: var(--radius-lg);
+  }
+
+  .sessions-table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    font-size: 13px;
+    --label-1: "Session";
+    --label-2: "Carriers";
+    --label-3: "TCP";
+    --label-4: "UDP / QUIC";
+    --label-5: "Down (TX)";
+    --label-6: "Up (RX)";
+    --label-7: "RTT";
+    --label-8: "Age";
+    --label-9: "Action";
+  }
+
+  .sessions-table thead {
+    position: sticky;
+    inset-block-start: 0;
+    z-index: 2;
+    background: #141418;
+  }
+
+  .sessions-table thead th {
+    text-align: left;
+    padding: 10px 14px;
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-3);
+    background: #141418;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+
+  .sessions-table thead th:first-child {
+    position: sticky;
+    inset-inline-start: 0;
+    z-index: 3;
+  }
+
+  .sessions-table tbody th,
+  .sessions-table tbody td {
+    padding: 11px 14px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: middle;
+    white-space: nowrap;
+  }
+
+  .sessions-table tbody tr:last-child th,
+  .sessions-table tbody tr:last-child td {
+    border-bottom: 0;
+  }
+
+  .sessions-table tbody th {
+    position: sticky;
+    inset-inline-start: 0;
+    z-index: 1;
+    background: var(--surface);
+    text-align: left;
+    font-weight: 500;
+  }
+
+  .sessions-table tbody tr:hover th,
+  .sessions-table tbody tr:hover td {
+    background: var(--surface-hover);
+  }
+
+  .sess-id {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text);
+    background: var(--well);
+    border: 1px solid var(--border);
+    padding: 3px 7px;
+    border-radius: 5px;
+    display: inline-block;
+  }
+
+  .carrier-dots {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+
+  .c-dots {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+  }
+
+  .c-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.12);
+  }
+
+  .c-dot.on {
+    background: var(--emerald);
+  }
+
+  .c-count {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 12px;
+    color: var(--text-2);
+    margin-left: 3px;
+  }
+
+  .rtt-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 11.5px;
+    font-weight: 500;
+    border: 1px solid var(--border);
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text-2);
+  }
+
+  .rtt-pill.good {
+    background: var(--emerald-tint);
+    border-color: var(--emerald-border);
+    color: var(--emerald-hi);
+  }
+
+  .rtt-pill.warn {
+    background: var(--amber-tint);
+    border-color: var(--amber-border);
+    color: #fcd34d;
+  }
+
+  .rtt-pill.bad {
+    background: var(--rose-tint);
+    border-color: var(--rose-border);
+    color: var(--rose-hi);
+  }
+
+  .empty-cell {
+    padding: 32px 18px;
+    text-align: center;
+    color: var(--text-3);
+    font-size: 13px;
+  }
+
+  @container (width < 640px) {
+    .sessions-table,
+    .sessions-table thead,
+    .sessions-table tbody,
+    .sessions-table tr,
+    .sessions-table th,
+    .sessions-table td {
+      display: block;
+    }
+
+    .sessions-table thead {
+      display: none;
+    }
+
+    .sessions-table tbody {
+      padding: 12px;
+    }
+
+    .sessions-table tbody tr {
+      margin-block-end: 12px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      background: var(--well);
+      overflow: hidden;
+    }
+
+    .sessions-table tbody tr:last-child {
+      margin-block-end: 0;
+    }
+
+    .sessions-table tbody tr.empty-row {
+      border: 0;
+      background: transparent;
+    }
+
+    .sessions-table tbody th {
+      position: sticky;
+      inset-block-start: 0;
+      z-index: 2;
+      background: #16161a;
+      border-bottom: 1px solid var(--border);
+      padding: 10px 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .sessions-table tbody th::before {
+      content: var(--label-1);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-3);
+      font-weight: 500;
+    }
+
+    .sessions-table tbody td {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 8px 12px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+      white-space: normal;
+    }
+
+    .sessions-table tbody td:last-child {
+      border-bottom: 0;
+    }
+
+    .sessions-table tbody td::before {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-3);
+      flex-shrink: 0;
+    }
+
+    .sessions-table tbody td:nth-child(2)::before { content: var(--label-2); }
+    .sessions-table tbody td:nth-child(3)::before { content: var(--label-3); }
+    .sessions-table tbody td:nth-child(4)::before { content: var(--label-4); }
+    .sessions-table tbody td:nth-child(5)::before { content: var(--label-5); }
+    .sessions-table tbody td:nth-child(6)::before { content: var(--label-6); }
+    .sessions-table tbody td:nth-child(7)::before { content: var(--label-7); }
+    .sessions-table tbody td:nth-child(8)::before { content: var(--label-8); }
+    .sessions-table tbody td:nth-child(9)::before { content: var(--label-9); }
+
+    .sessions-table tbody tr.empty-row td {
+      display: block;
+      text-align: center;
+    }
+
+    .sessions-table tbody tr.empty-row td::before {
+      content: none;
+    }
+  }
+
+  /* ── Popover Toast Notifications ───────────────────────────────────────── */
+  .toast-stack {
+    position: fixed;
+    inset-block-end: 0;
+    inset-inline-end: 0;
+    pointer-events: none;
+    z-index: 60;
+  }
+
+  @supports not selector(:popover-open) {
+    [popover]:not(.\:popover-open) {
+      display: none;
+    }
+  }
+
+  [popover].toast-card {
+    position: fixed;
+    inset: auto 20px 20px auto;
+    margin: 0;
+    padding: 10px 12px 10px 14px;
+    max-inline-size: min(380px, calc(100vw - 24px));
+    border-radius: var(--radius-md);
+    background: #16161b;
+    border: 1px solid var(--border-strong);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55), var(--specular);
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+    pointer-events: auto;
+    align-items: center;
+    gap: 10px;
+    opacity: 0;
+    transition: opacity 0.22s ease-out, transform 0.22s ease-out, display 0.22s ease-out, overlay 0.22s ease-out;
+    transition-behavior: allow-discrete;
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    [popover].toast-card {
+      transform: translateY(10px) scale(0.98);
+    }
+  }
+
+  [popover].toast-card:is(:popover-open, .\:popover-open):where(:not([data-closing])) {
+    display: flex;
+    opacity: 1;
+  }
+
+  @starting-style {
+    [popover].toast-card:is(:popover-open, .\:popover-open):where(:not([data-closing])) {
+      opacity: 0;
+    }
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    [popover].toast-card:is(:popover-open, .\:popover-open):where(:not([data-closing])) {
+      transform: translateY(0) scale(1);
+    }
+
+    @starting-style {
+      [popover].toast-card:is(:popover-open, .\:popover-open):where(:not([data-closing])) {
+        transform: translateY(10px) scale(0.98);
+      }
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    [popover].toast-card {
+      transition: opacity 0.08s ease-out, display 0.08s ease-out, overlay 0.08s ease-out;
+      transition-behavior: allow-discrete;
+    }
+  }
+
+  .toast-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--emerald);
+    flex-shrink: 0;
+  }
+
+  .toast-card[data-tone="warn"] .toast-dot {
+    background: var(--amber);
+  }
+
+  .toast-card[data-tone="error"] .toast-dot {
+    background: var(--rose);
+  }
+
+  .toast-msg {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .toast-close {
+    display: inline-grid;
+    place-items: center;
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    border-radius: var(--radius-sm);
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--text-2);
+    flex-shrink: 0;
+    transition: background-color 120ms ease, color 120ms ease;
+  }
+
+  .toast-close:hover {
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--text);
+  }
+
+  /* ── Responsive Breakpoints ────────────────────────────────────────────── */
+  @media (max-width: 900px) {
+    .hero-grid,
+    .ops-grid {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .topbar-inner {
+      padding: 10px 16px;
+      flex-wrap: wrap;
+    }
+
+    .shell {
+      padding: 16px 16px 40px;
+    }
+  }
+
+  @media (max-width: 600px) {
+    .radio-grid {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .prov-row {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .chart-metrics {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .kpi-matrix {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: auto;
+    }
+
+    .runtime-cluster {
+      display: none;
+    }
+
+    [popover].toast-card {
+      inset: auto 12px 12px 12px;
+      max-inline-size: none;
+    }
+  }
 </style>
 </head>
 <body>
-<header>
-  <div class="brand">
-    <div class="dot" id="statusDot"></div>
-    <h1>AetherVPN Server Console</h1>
-    <span class="pill" id="verPill">v2.3.0</span>
-  </div>
-  <div class="row">
-    <span class="pill" id="uptimePill">Uptime: --</span>
-    <span class="pill" id="sysPill">RAM: -- | Goroutines: --</span>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand-cluster">
+      <div class="brand-mark" aria-hidden="true">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2L3 7v10l9 5 9-5V7l-9-5z" stroke="#fafafa" stroke-opacity="0.88"/>
+          <path d="M12 7v10" stroke="#10b981"/>
+          <circle cx="12" cy="12" r="2.2" fill="#10b981" stroke="none"/>
+        </svg>
+      </div>
+      <h1 class="brand-name">AetherVPN</h1>
+      <span class="pill pill-mono" id="verPill">v3.2.0</span>
+      <span class="status-pill" id="statusPill" data-state="ok">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="statusText">OPERATIONAL</span>
+      </span>
+    </div>
+
+    <div class="header-right">
+      <div class="runtime-cluster" aria-label="Server runtime summary">
+        <span class="runtime-chip"><span class="k">UP</span><span id="uptimePill">--</span></span>
+        <span class="runtime-chip"><span class="k">RAM</span><span id="ramPill">--</span></span>
+        <span class="runtime-chip"><span class="k">GO</span><span id="goPill">--</span></span>
+      </div>
+      <button type="button" class="btn btn-ghost" id="btnRefresh" aria-label="Refresh telemetry">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M21 12a9 9 0 1 1-2.64-6.36"/>
+          <polyline points="21 3 21 9 15 9"/>
+        </svg>
+        <span>Refresh</span>
+      </button>
+    </div>
   </div>
 </header>
 
-<div class="grid">
-  <div class="card">
-    <div class="label">Active Connections</div>
-    <div class="val" id="kSessions">0</div>
-    <div class="sub" id="kCarriers">0 carriers · 0 TCP · 0 UDP</div>
-  </div>
-  <div class="card">
-    <div class="label">Live Speed</div>
-    <div class="val" id="kSpeed">0.0 Mbps</div>
-    <div class="sub" id="kSpeedSub">Down: 0 KB/s · Up: 0 KB/s</div>
-  </div>
-  <div class="card">
-    <div class="label">Total Bandwidth</div>
-    <div class="val" id="kTotal">0 MB</div>
-    <div class="sub" id="kTotalSub">TX: 0 MB · RX: 0 MB</div>
-  </div>
-  <div class="card">
-    <div class="label">DNS & AdGuard Cache</div>
-    <div class="val" id="kDns">0</div>
-    <div class="sub" id="kDnsSub">Hit rate: 0% · AAAA filtered: 0</div>
+<main class="shell">
+  <!-- Hero Telemetry Split -->
+  <section class="hero-grid" aria-label="Live telemetry overview">
+    <div class="panel">
+      <div class="panel-head">
+        <div class="panel-title-group">
+          <h2 class="panel-title">Live Throughput</h2>
+          <span class="panel-sub mono">90s rolling · 1.5s poll</span>
+        </div>
+        <div class="chart-legend" aria-hidden="true">
+          <span class="legend-item"><span class="legend-swatch down"></span>Download</span>
+          <span class="legend-item"><span class="legend-swatch up"></span>Upload</span>
+        </div>
+      </div>
+
+      <div class="chart-metrics">
+        <div class="chart-stat">
+          <span class="chart-stat-label"><span class="swatch-dot down" aria-hidden="true"></span>Download (TX)</span>
+          <div class="chart-stat-value"><span id="liveDownMbps">0.00</span><span class="unit">Mbps</span></div>
+          <span class="chart-stat-sub" id="liveDownRate">0.0 KB/s</span>
+        </div>
+        <div class="chart-stat">
+          <span class="chart-stat-label"><span class="swatch-dot up" aria-hidden="true"></span>Upload (RX)</span>
+          <div class="chart-stat-value"><span id="liveUpMbps">0.00</span><span class="unit">Mbps</span></div>
+          <span class="chart-stat-sub" id="liveUpRate">0.0 KB/s</span>
+        </div>
+        <div class="chart-stat">
+          <span class="chart-stat-label"><span class="swatch-dot peak" aria-hidden="true"></span>90s Peak</span>
+          <div class="chart-stat-value"><span id="livePeakMbps">0.00</span><span class="unit">Mbps</span></div>
+          <span class="chart-stat-sub" id="liveTotalMbps">Combined: 0.00 Mbps</span>
+        </div>
+      </div>
+
+      <div class="chart-stage" id="chartStage">
+        <canvas id="throughputChart" class="chart-canvas" role="img" aria-label="Live download and upload throughput in Mbps over the last 90 seconds"></canvas>
+        <div id="chartTooltip" class="chart-tooltip" hidden></div>
+      </div>
+    </div>
+
+    <div class="kpi-matrix" aria-label="Key performance indicators">
+      <div class="kpi-cell">
+        <div class="kpi-label">Active Sessions</div>
+        <div class="kpi-value" id="kSessions">0</div>
+        <div class="kpi-sub" id="kCarriers">0 carriers · 0 TCP · 0 UDP</div>
+      </div>
+
+      <div class="kpi-cell">
+        <div class="kpi-label">Total Transferred</div>
+        <div class="kpi-value" id="kTotal">0 B</div>
+        <div class="kpi-sub" id="kTotalSub">Down 0 B · Up 0 B</div>
+      </div>
+
+      <div class="kpi-cell">
+        <div class="kpi-label">DNS Cache Hit Rate</div>
+        <div>
+          <div class="kpi-value emerald" id="kDnsHit">0%</div>
+          <div class="progress-track" aria-hidden="true">
+            <div class="progress-fill" id="kDnsBar"></div>
+          </div>
+        </div>
+        <div class="kpi-sub" id="kDnsSub">0 queries · 0 cached · 0 AAAA</div>
+      </div>
+
+      <div class="kpi-cell">
+        <div class="kpi-label">Server Runtime</div>
+        <div class="kpi-value" id="kRuntime">0s</div>
+        <div class="kpi-sub" id="kRuntimeSub">0.0 / 0.0 MB RAM · 0 goroutines</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Operations Split -->
+  <section class="ops-grid" aria-label="Policy and client provisioning">
+    <!-- Left: DNS & Shield Policy -->
+    <div class="panel">
+      <div class="panel-head">
+        <div class="panel-title-group">
+          <h2 class="panel-title">DNS &amp; Shield Policy</h2>
+        </div>
+        <span class="pill pill-mono" id="curDnsPill">--</span>
+      </div>
+
+      <div class="panel-body">
+        <fieldset>
+          <legend class="field-label">Upstream Resolver</legend>
+          <div class="radio-grid">
+            <label class="radio-card">
+              <span class="radio-card-top">
+                <span class="radio-card-name">AdGuard</span>
+                <input type="radio" name="dns_preset" value="adguard">
+              </span>
+              <span class="radio-card-ip">94.140.14.14</span>
+              <span class="radio-card-meta">DNS AdBlock</span>
+            </label>
+
+            <label class="radio-card">
+              <span class="radio-card-top">
+                <span class="radio-card-name">Cloudflare</span>
+                <input type="radio" name="dns_preset" value="cloudflare">
+              </span>
+              <span class="radio-card-ip">1.1.1.1</span>
+              <span class="radio-card-meta">Low Latency</span>
+            </label>
+
+            <label class="radio-card">
+              <span class="radio-card-top">
+                <span class="radio-card-name">Google</span>
+                <input type="radio" name="dns_preset" value="google">
+              </span>
+              <span class="radio-card-ip">8.8.8.8</span>
+              <span class="radio-card-meta">Public DNS</span>
+            </label>
+          </div>
+        </fieldset>
+
+        <form id="customDnsForm" class="inline-form" novalidate>
+          <label class="sr-only" for="customDnsInput">Custom upstream DNS servers</label>
+          <input
+            type="text"
+            id="customDnsInput"
+            class="text-input"
+            placeholder="Custom DNS (e.g. 9.9.9.9:53, 1.1.1.2:53)"
+            pattern="^[0-9a-zA-Z.:,\s-]+$"
+            autocomplete="off"
+            spellcheck="false"
+          >
+          <button type="submit" class="btn" id="btnApplyCustomDns">Apply</button>
+        </form>
+
+        <div class="switch-list" role="group" aria-label="Traffic shield policies">
+          <label class="switch-row" for="chkBlockDot">
+            <span class="switch-copy">
+              <span class="switch-title">Block DoT (Port 853)</span>
+              <span class="switch-desc">Force client DNS through server resolver policy</span>
+            </span>
+            <input type="checkbox" role="switch" id="chkBlockDot" class="toggle-switch">
+          </label>
+
+          <label class="switch-row" for="chkAdblockSni">
+            <span class="switch-copy">
+              <span class="switch-title">SNI AdBlock</span>
+              <span class="switch-desc">Drop TLS ClientHello handshakes to known ad hosts</span>
+            </span>
+            <input type="checkbox" role="switch" id="chkAdblockSni" class="toggle-switch">
+          </label>
+        </div>
+
+        <div class="policy-footer">
+          <span class="policy-meta" id="cacheCountMeta">0 cached records</span>
+          <button type="button" class="btn btn-ghost" id="btnFlushDns">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="3 6 5 6 21 6"/>
+              <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+              <path d="M10 11v6"/>
+              <path d="M14 11v6"/>
+            </svg>
+            <span>Flush DNS Cache</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right: 1-Tap Client Provisioning -->
+    <div class="panel">
+      <div class="panel-head">
+        <div class="panel-title-group">
+          <h2 class="panel-title">1-Tap Client Provisioning</h2>
+        </div>
+        <span class="pill pill-mono" id="tunnelPathPill">/ws/sync</span>
+      </div>
+
+      <div class="panel-body">
+        <div>
+          <label class="field-label" for="fallbackInput">Fallback Tunnel URL</label>
+          <input
+            type="url"
+            id="fallbackInput"
+            class="text-input"
+            value="wss://sync.novv.tech/ws/sync"
+            placeholder="wss://sync.novv.tech/ws/sync"
+            autocomplete="off"
+            spellcheck="false"
+          >
+        </div>
+
+        <div class="prov-row">
+          <div>
+            <label class="field-label" for="cleanIpInput">Cloudflare Clean IP (Optional)</label>
+            <input
+              type="text"
+              id="cleanIpInput"
+              class="text-input"
+              placeholder="e.g. 162.159.192.1"
+              pattern="^[0-9a-fA-F.:]*$"
+              autocomplete="off"
+              spellcheck="false"
+            >
+          </div>
+
+          <fieldset>
+            <legend class="field-label">Carriers</legend>
+            <div class="seg-group" role="radiogroup" aria-label="Carrier count">
+              <label class="seg-pill mono"><input type="radio" name="carriers" value="2">2</label>
+              <label class="seg-pill mono"><input type="radio" name="carriers" value="3">3</label>
+              <label class="seg-pill mono"><input type="radio" name="carriers" value="4" checked>4</label>
+              <label class="seg-pill mono"><input type="radio" name="carriers" value="6">6</label>
+            </div>
+          </fieldset>
+        </div>
+
+        <div class="prov-toolbar">
+          <div class="seg-group" role="radiogroup" aria-label="Provisioning format">
+            <label class="seg-pill"><input type="radio" name="prov_mode" value="android" checked>Android aether://</label>
+            <label class="seg-pill"><input type="radio" name="prov_mode" value="cli">Laptop CLI</label>
+          </div>
+
+          <div class="prov-actions">
+            <button type="button" class="btn btn-ghost" id="btnToggleSecret" aria-pressed="false">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                <circle cx="12" cy="12" r="3"/>
+              </svg>
+              <span id="secretBtnLabel">Show Secret</span>
+            </button>
+            <button type="button" class="btn btn-primary" id="btnCopyProv">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+              </svg>
+              <span id="copyBtnLabel">Copy</span>
+            </button>
+          </div>
+        </div>
+
+        <pre class="code-well" id="provCodeWell" data-mode="android"><code id="provOutput">Waiting for server telemetry...</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- Active Sessions Table -->
+  <section class="panel" aria-label="Active sessions">
+    <div class="panel-head">
+      <div class="panel-title-group">
+        <h2 class="panel-title">Active Sessions</h2>
+        <span class="panel-sub">Multiplexed carrier tunnels</span>
+      </div>
+      <span class="pill pill-mono" id="sessCountPill">0 active</span>
+    </div>
+
+    <div tabindex="0" role="region" aria-labelledby="sessions-caption" class="table-wrapper">
+      <table class="sessions-table">
+        <caption id="sessions-caption" class="sr-only">Active VPN Sessions</caption>
+        <thead>
+          <tr>
+            <th scope="col">Session</th>
+            <th scope="col">Carriers</th>
+            <th scope="col">TCP</th>
+            <th scope="col">UDP / QUIC</th>
+            <th scope="col">Down (TX)</th>
+            <th scope="col">Up (RX)</th>
+            <th scope="col">RTT</th>
+            <th scope="col">Age</th>
+            <th scope="col">Action</th>
+          </tr>
+        </thead>
+        <tbody id="sessBody">
+          <tr class="empty-row"><td colspan="9" class="empty-cell">No active sessions</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<!-- Popover Toast Notification Region -->
+<div role="region" aria-label="Notifications" class="toast-stack">
+  <div id="toastPopover" popover="manual" class="toast-card" data-tone="ok">
+    <span class="toast-dot" aria-hidden="true"></span>
+    <span class="toast-msg" id="toastMsg"></span>
+    <button
+      type="button"
+      class="toast-close"
+      id="toastCloseBtn"
+      popovertarget="toastPopover"
+      popovertargetaction="hide"
+      aria-label="Close notification"
+    >
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <line x1="18" y1="6" x2="6" y2="18"/>
+        <line x1="6" y1="6" x2="18" y2="18"/>
+      </svg>
+    </button>
   </div>
 </div>
 
-<div class="section">
-  <h2>Runtime DNS & Filter Controls <span class="pill" id="curDnsPill">--</span></h2>
-  <div class="row">
-    <button id="btnAdguard" onclick="setDNS('adguard')">AdGuard DNS (AdBlock)</button>
-    <button id="btnCloudflare" onclick="setDNS('cloudflare')">Cloudflare (1.1.1.1)</button>
-    <button id="btnGoogle" onclick="setDNS('google')">Google (8.8.8.8)</button>
-    <button id="btnDot" onclick="toggleFlag('block_dot')">Block DoT 853: ON</button>
-    <button id="btnSni" onclick="toggleFlag('adblock_sni')">SNI AdBlock: OFF</button>
-    <button onclick="flushDNS()">Flush DNS Cache</button>
-  </div>
-</div>
-
-<div class="section">
-  <h2>1-Tap Client Provisioning (Android & Laptop)</h2>
-  <div class="row" style="margin-bottom:10px">
-    <input id="fallbackInput" placeholder="Optional Fallback URL (e.g. wss://your-render.onrender.com/ws/sync)" oninput="renderLinks()">
-    <input id="cleanIpInput" placeholder="Optional Cloudflare Clean IP" oninput="renderLinks()" style="max-width:220px">
-    <button class="primary" onclick="copyText('shareUriBox','Copied aether:// link!')">Copy aether:// Link</button>
-    <button onclick="copyText('cliBox','Copied CLI command!')">Copy Laptop CLI</button>
-  </div>
-  <pre id="shareUriBox">Loading...</pre>
-  <pre id="cliBox">Loading...</pre>
-</div>
-
-<div class="section">
-  <h2>Active Sessions</h2>
-  <div style="overflow-x:auto">
-    <table>
-      <thead><tr><th>Session</th><th>Carriers</th><th>TCP</th><th>UDP/QUIC</th><th>Down (TX)</th><th>Up (RX)</th><th>RTT</th><th>Age</th><th>Action</th></tr></thead>
-      <tbody id="sessBody"><tr><td colspan="9" style="color:var(--muted)">No active sessions</td></tr></tbody>
-    </table>
-  </div>
-</div>
-
-<div class="toast" id="toast"></div>
+<p class="sr-only">Screen reader announcements</p>
+<div id="srAnnounce" class="sr-only" aria-live="assertive"></div>
 
 <script>
-const base = location.pathname.replace(/\/$/, '');
-let lastData = null, prevTx = 0, prevRx = 0, prevTime = 0;
+(function () {
+  'use strict';
 
-function fmtBytes(b) {
-  if (b >= 1e9) return (b/1e9).toFixed(2) + ' GB';
-  if (b >= 1e6) return (b/1e6).toFixed(2) + ' MB';
-  if (b >= 1e3) return (b/1e3).toFixed(1) + ' KB';
-  return b + ' B';
-}
-function fmtUptime(s) {
-  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
-  return (h?h+'h ':'') + (m?m+'m ':'') + sec + 's';
-}
-function toast(msg) {
-  const t = document.getElementById('toast');
-  t.textContent = msg; t.classList.add('show');
-  setTimeout(() => t.classList.remove('show'), 2200);
-}
-function copyText(id, msg) {
-  navigator.clipboard.writeText(document.getElementById(id).textContent).then(() => toast(msg));
-}
-function b64url(str) {
-  return btoa(unescape(encodeURIComponent(str))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
-}
-function renderLinks() {
-  if (!lastData) return;
-  const fb = document.getElementById('fallbackInput').value.trim();
-  const cip = document.getElementById('cleanIpInput').value.trim();
-  const obj = { psk: lastData.psk, primary_url: lastData.ws_url, carriers: 3, transport: 'auto' };
-  if (fb) obj.fallback_url = fb;
-  if (cip) obj.cf_clean_ip = cip;
-  document.getElementById('shareUriBox').textContent = 'aether://' + b64url(JSON.stringify(obj));
-  let cli = './aether-client -server ' + lastData.ws_url + ' -psk "' + lastData.psk + '" -carriers 3';
-  if (fb) cli += ' -fallback ' + fb;
-  document.getElementById('cliBox').textContent = cli;
-}
+  // Self-contained popover fallback guarded identically to @oddbird/popover-polyfill
+  // (keeps the embedded control plane 100% zero-CDN and offline-capable).
+  var hasNativePopover = Object.hasOwn(HTMLElement.prototype, "popover");
+  if (!Object.hasOwn(HTMLElement.prototype, "popover")) {
+    document.addEventListener('click', function (ev) {
+      var btn = ev.target && ev.target.closest ? ev.target.closest('[popovertarget]') : null;
+      if (!btn) return;
+      var target = document.getElementById(btn.getAttribute('popovertarget'));
+      if (!target) return;
+      var action = btn.getAttribute('popovertargetaction') || 'toggle';
+      if (action === 'hide') {
+        target.classList.remove(':popover-open');
+      } else if (action === 'show') {
+        target.classList.add(':popover-open');
+      } else {
+        target.classList.toggle(':popover-open');
+      }
+    });
+  }
 
-async function setDNS(preset) {
-  const r = await fetch(base + '/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({dns_preset: preset})});
-  if (r.ok) { toast('Switched DNS to ' + preset.toUpperCase()); poll(); }
-}
-async function toggleFlag(name) {
-  if (!lastData) return;
-  const next = !lastData.config[name];
-  const r = await fetch(base + '/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({[name]: next})});
-  if (r.ok) { toast(name + ' = ' + (next ? 'ON' : 'OFF')); poll(); }
-}
-async function flushDNS() {
-  const r = await fetch(base + '/api/dns/flush', {method:'POST'});
-  if (r.ok) { toast('DNS cache flushed'); poll(); }
-}
-async function kick(id) {
-  const r = await fetch(base + '/api/kick', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({session_id: id})});
-  if (r.ok) { toast('Kicked session ' + id); poll(); }
-}
+  var base = location.pathname.replace(/\/$/, '');
+  var POLL_MS = 1500;
+  var MAX_SAMPLES = 60;
 
-async function poll() {
-  try {
-    const r = await fetch(base + '/api/stats');
-    if (!r.ok) return;
-    const d = await r.json();
-    const first = !lastData;
-    lastData = d;
-    if (first) renderLinks();
+  var lastData = null;
+  var prevTx = 0;
+  var prevRx = 0;
+  var prevTime = 0;
+  var inFlight = false;
+  var failCount = 0;
+  var secretVisible = false;
+  var fallbackTouched = false;
+  var rawAndroidUri = '';
+  var rawCliCmd = '';
 
-    document.getElementById('verPill').textContent = 'v' + d.version;
-    document.getElementById('uptimePill').textContent = 'Uptime: ' + fmtUptime(d.uptime_sec);
-    document.getElementById('sysPill').textContent = 'RAM: ' + d.mem_alloc_mb.toFixed(1) + ' MB | Goroutines: ' + d.goroutines;
-    document.getElementById('kSessions').textContent = d.active_sessions;
-    document.getElementById('kCarriers').textContent = d.active_carriers + ' carriers · ' + d.active_streams + ' TCP · ' + d.active_udp_flows + ' UDP';
-    document.getElementById('kTotal').textContent = fmtBytes(d.total_tx_bytes + d.total_rx_bytes);
-    document.getElementById('kTotalSub').textContent = 'Down: ' + fmtBytes(d.total_tx_bytes) + ' · Up: ' + fmtBytes(d.total_rx_bytes);
-    document.getElementById('kDns').textContent = d.dns_queries;
-    document.getElementById('kDnsSub').textContent = 'Hit: ' + d.dns_cache_hit_pct.toFixed(0) + '% (' + d.dns_cache_size + ' cached) · AAAA: ' + d.dns_aaaa_filtered;
+  var downSeries = new Array(MAX_SAMPLES).fill(0);
+  var upSeries = new Array(MAX_SAMPLES).fill(0);
+  var hoverIndex = -1;
 
-    const now = Date.now();
-    if (prevTime > 0) {
-      const dt = Math.max(0.5, (now - prevTime) / 1000);
-      const txBps = Math.max(0, (d.total_tx_bytes - prevTx) / dt);
-      const rxBps = Math.max(0, (d.total_rx_bytes - prevRx) / dt);
-      const totalMbps = ((txBps + rxBps) * 8 / 1e6).toFixed(2);
-      document.getElementById('kSpeed').textContent = totalMbps + ' Mbps';
-      document.getElementById('kSpeedSub').textContent = 'Down: ' + (txBps/1024).toFixed(1) + ' KB/s · Up: ' + (rxBps/1024).toFixed(1) + ' KB/s';
+  // ── Formatting helpers ──────────────────────────────────────────────────
+  function fmtBytes(b) {
+    if (!Number.isFinite(b) || b <= 0) return '0 B';
+    if (b >= 1e9) return (b / 1e9).toFixed(2) + ' GB';
+    if (b >= 1e6) return (b / 1e6).toFixed(2) + ' MB';
+    if (b >= 1e3) return (b / 1e3).toFixed(1) + ' KB';
+    return Math.round(b) + ' B';
+  }
+
+  function fmtRate(bps) {
+    if (!Number.isFinite(bps) || bps <= 0) return '0.0 KB/s';
+    if (bps >= 1e6) return (bps / 1e6).toFixed(2) + ' MB/s';
+    return (bps / 1024).toFixed(1) + ' KB/s';
+  }
+
+  function fmtUptime(s) {
+    s = Math.max(0, Math.floor(s || 0));
+    var d = Math.floor(s / 86400);
+    var h = Math.floor((s % 86400) / 3600);
+    var m = Math.floor((s % 3600) / 60);
+    var sec = s % 60;
+    if (d > 0) return d + 'd ' + h + 'h ' + m + 'm';
+    if (h > 0) return h + 'h ' + m + 'm ' + sec + 's';
+    if (m > 0) return m + 'm ' + sec + 's';
+    return sec + 's';
+  }
+
+  function escHtml(str) {
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function b64url(str) {
+    return btoa(unescape(encodeURIComponent(str)))
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+  }
+
+  // ── Popover Toast + Top-Layer Exit Fallback + ariaNotify() ──────────────
+  var toastEl = document.getElementById('toastPopover');
+  var toastMsgEl = document.getElementById('toastMsg');
+  var toastCloseBtn = document.getElementById('toastCloseBtn');
+  var srAnnounceEl = document.getElementById('srAnnounce');
+  var toastTimer = null;
+  var priorFocusEl = null;
+  var supportsDisplayTransition;
+
+  function canTransitionDisplay() {
+    if (supportsDisplayTransition !== undefined) return supportsDisplayTransition;
+    if (!window.CSS || !window.CSS.supports || !window.CSS.supports('transition-behavior', 'allow-discrete') || !document.body) {
+      return false;
     }
-    prevTx = d.total_tx_bytes; prevRx = d.total_rx_bytes; prevTime = now;
+    var probe = document.createElement('div');
+    probe.style.cssText = 'transition: display 1s allow-discrete !important; display: block;';
+    document.body.appendChild(probe);
+    getComputedStyle(probe).display;
+    probe.style.display = 'none';
+    supportsDisplayTransition = getComputedStyle(probe).display === 'block';
+    probe.remove();
+    return supportsDisplayTransition;
+  }
 
-    const dnsStr = (d.config.upstream_dns || []).join(', ');
-    document.getElementById('curDnsPill').textContent = dnsStr || 'Direct';
-    document.getElementById('btnAdguard').className = dnsStr.includes('94.140.') ? 'active' : '';
-    document.getElementById('btnCloudflare').className = dnsStr.includes('1.1.1.1') ? 'active' : '';
-    document.getElementById('btnGoogle').className = dnsStr.includes('8.8.8.8') ? 'active' : '';
-    const bDot = document.getElementById('btnDot');
-    bDot.textContent = 'Block DoT 853: ' + (d.config.block_dot ? 'ON' : 'OFF');
-    bDot.className = d.config.block_dot ? 'active' : '';
-    const bSni = document.getElementById('btnSni');
-    bSni.textContent = 'SNI AdBlock: ' + (d.config.adblock_sni ? 'ON' : 'OFF');
-    bSni.className = d.config.adblock_sni ? 'active' : '';
+  function supportsTopLayerExit() {
+    return Boolean(window.CSS && window.CSS.supports && window.CSS.supports('overlay', 'auto') && canTransitionDisplay());
+  }
 
-    const tb = document.getElementById('sessBody');
-    if (!d.sessions || d.sessions.length === 0) {
-      tb.innerHTML = '<tr><td colspan="9" style="color:var(--muted)">No active sessions</td></tr>';
+  function isToastOpen() {
+    if (hasNativePopover) {
+      try { return toastEl.matches(':popover-open'); } catch (e) {}
+    }
+    return toastEl.classList.contains(':popover-open');
+  }
+
+  function hideToastNow(restoreFocus) {
+    var hadFocus = toastEl.contains(document.activeElement);
+    clearTimeout(toastTimer);
+    toastTimer = null;
+
+    function finishHide() {
+      if (hasNativePopover && typeof toastEl.hidePopover === 'function') {
+        try {
+          if (toastEl.matches(':popover-open')) toastEl.hidePopover();
+        } catch (e) {}
+      } else {
+        toastEl.classList.remove(':popover-open');
+      }
+      if ((restoreFocus || hadFocus) && priorFocusEl && typeof priorFocusEl.focus === 'function' && document.contains(priorFocusEl)) {
+        priorFocusEl.focus();
+      }
+    }
+
+    if (!isToastOpen()) return;
+    if (hasNativePopover && !supportsTopLayerExit()) {
+      toastEl.setAttribute('data-closing', '');
+      var anims = typeof toastEl.getAnimations === 'function' ? toastEl.getAnimations({ subtree: true }) : [];
+      if (anims.length > 0) {
+        Promise.race([
+          Promise.allSettled(anims.map(function (a) { return a.finished; })),
+          new Promise(function (r) { setTimeout(r, 400); })
+        ]).then(function () {
+          if (!toastEl.hasAttribute('data-closing')) return;
+          toastEl.removeAttribute('data-closing');
+          finishHide();
+        });
+        return;
+      }
+      toastEl.removeAttribute('data-closing');
+    }
+    finishHide();
+  }
+
+  function scheduleToastDismiss() {
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () {
+      if (toastEl.contains(document.activeElement)) return;
+      hideToastNow(false);
+    }, 3200);
+  }
+
+  function announceSR(msg) {
+    if (typeof document.ariaNotify === 'function') {
+      try {
+        document.ariaNotify(msg);
+        return;
+      } catch (e) {}
+    }
+    srAnnounceEl.textContent = '';
+    setTimeout(function () {
+      srAnnounceEl.textContent = msg;
+    }, 20);
+  }
+
+  function toast(msg, tone) {
+    priorFocusEl = document.activeElement;
+    toastEl.removeAttribute('data-closing');
+    toastEl.setAttribute('data-tone', tone || 'ok');
+    toastMsgEl.textContent = msg;
+
+    if (hasNativePopover && typeof toastEl.showPopover === 'function') {
+      try {
+        if (!toastEl.matches(':popover-open')) toastEl.showPopover();
+      } catch (e) {}
     } else {
-      tb.innerHTML = d.sessions.map(s =>
-        '<tr><td><code>' + s.id + '</code></td><td>' + s.carriers + '</td><td>' + s.streams + '</td><td>' + s.udp_flows + '</td><td>' +
-        fmtBytes(s.tx_bytes) + '</td><td>' + fmtBytes(s.rx_bytes) + '</td><td>' + s.rtt_ms + 'ms</td><td>' + fmtUptime(s.age_sec) +
-        '</td><td><button class="danger" onclick="kick(\'' + s.id + '\')">Kick</button></td></tr>'
-      ).join('');
+      toastEl.classList.add(':popover-open');
     }
-  } catch(e) {}
-}
-poll();
-setInterval(poll, 2000);
+
+    announceSR(msg);
+    scheduleToastDismiss();
+  }
+
+  toastEl.addEventListener('focusin', function () {
+    clearTimeout(toastTimer);
+  });
+
+  toastEl.addEventListener('focusout', function () {
+    setTimeout(function () {
+      if (isToastOpen() && !toastEl.contains(document.activeElement)) {
+        scheduleToastDismiss();
+      }
+    }, 0);
+  });
+
+  toastCloseBtn.addEventListener('click', function (ev) {
+    if (hasNativePopover && !supportsTopLayerExit()) {
+      ev.preventDefault();
+      hideToastNow(true);
+    } else {
+      clearTimeout(toastTimer);
+      setTimeout(function () {
+        if (priorFocusEl && typeof priorFocusEl.focus === 'function' && document.contains(priorFocusEl)) {
+          priorFocusEl.focus();
+        }
+      }, 0);
+    }
+  });
+
+  // ── High-DPI Canvas Throughput Chart ────────────────────────────────────
+  var canvas = document.getElementById('throughputChart');
+  var chartStage = document.getElementById('chartStage');
+  var chartTooltip = document.getElementById('chartTooltip');
+  var ctx = canvas.getContext('2d');
+  var chartW = 0;
+  var chartH = 0;
+  var pad = { top: 14, right: 12, bottom: 26, left: 48 };
+
+  function niceCeiling(maxVal) {
+    if (maxVal <= 0.8) return 1;
+    var steps = [2, 5, 10, 20, 50, 100, 200, 500, 1000, 2500, 5000];
+    for (var i = 0; i < steps.length; i++) {
+      if (maxVal * 1.15 <= steps[i]) return steps[i];
+    }
+    return Math.ceil(maxVal * 1.2 / 1000) * 1000;
+  }
+
+  function resizeChart() {
+    var rect = canvas.getBoundingClientRect();
+    var dpr = Math.min(window.devicePixelRatio || 1, 3);
+    chartW = Math.max(240, Math.floor(rect.width));
+    chartH = Math.max(180, Math.floor(rect.height));
+    canvas.width = Math.floor(chartW * dpr);
+    canvas.height = Math.floor(chartH * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    drawChart();
+  }
+
+  function buildPoints(series, maxY, plotW, plotH) {
+    var pts = [];
+    var n = series.length;
+    for (var i = 0; i < n; i++) {
+      var x = pad.left + (i / (n - 1)) * plotW;
+      var ratio = Math.min(1, Math.max(0, series[i] / maxY));
+      var y = pad.top + plotH - ratio * plotH;
+      pts.push({ x: x, y: y });
+    }
+    return pts;
+  }
+
+  function traceSmoothPath(pts) {
+    if (pts.length === 0) return;
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (var i = 0; i < pts.length - 1; i++) {
+      var p0 = pts[Math.max(0, i - 1)];
+      var p1 = pts[i];
+      var p2 = pts[i + 1];
+      var p3 = pts[Math.min(pts.length - 1, i + 2)];
+      var cp1x = p1.x + (p2.x - p0.x) / 6;
+      var cp1y = p1.y + (p2.y - p0.y) / 6;
+      var cp2x = p2.x - (p3.x - p1.x) / 6;
+      var cp2y = p2.y - (p3.y - p1.y) / 6;
+      var minY = Math.min(p1.y, p2.y);
+      var maxY = Math.max(p1.y, p2.y);
+      cp1y = Math.min(maxY, Math.max(minY, cp1y));
+      cp2y = Math.min(maxY, Math.max(minY, cp2y));
+      ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, p2.x, p2.y);
+    }
+  }
+
+  function drawChart() {
+    if (!ctx || chartW <= 0 || chartH <= 0) return;
+    ctx.clearRect(0, 0, chartW, chartH);
+
+    var plotW = chartW - pad.left - pad.right;
+    var plotH = chartH - pad.top - pad.bottom;
+    if (plotW <= 10 || plotH <= 10) return;
+
+    var maxSample = 0;
+    for (var i = 0; i < MAX_SAMPLES; i++) {
+      if (downSeries[i] > maxSample) maxSample = downSeries[i];
+      if (upSeries[i] > maxSample) maxSample = upSeries[i];
+    }
+    var yCeil = niceCeiling(maxSample);
+
+    // Horizontal gridlines & Y-axis labels
+    var gridRows = 4;
+    ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+
+    for (var r = 0; r <= gridRows; r++) {
+      var frac = r / gridRows;
+      var y = Math.round(pad.top + frac * plotH) + 0.5;
+      var val = yCeil * (1 - frac);
+
+      ctx.strokeStyle = r === gridRows ? 'rgba(255, 255, 255, 0.12)' : 'rgba(255, 255, 255, 0.055)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(pad.left, y);
+      ctx.lineTo(pad.left + plotW, y);
+      ctx.stroke();
+
+      ctx.fillStyle = '#85858f';
+      var lbl = yCeil >= 10 ? Math.round(val).toString() : val.toFixed(1);
+      ctx.fillText(lbl + ' M', pad.left - 8, y);
+    }
+
+    // X-axis time markers
+    var xMarks = [
+      { idx: 0, label: '-90s', align: 'left' },
+      { idx: 20, label: '-60s', align: 'center' },
+      { idx: 40, label: '-30s', align: 'center' },
+      { idx: MAX_SAMPLES - 1, label: 'now', align: 'right' }
+    ];
+    ctx.textBaseline = 'top';
+    ctx.fillStyle = '#71717a';
+    for (var m = 0; m < xMarks.length; m++) {
+      var xm = xMarks[m];
+      var xx = pad.left + (xm.idx / (MAX_SAMPLES - 1)) * plotW;
+      ctx.textAlign = xm.align;
+      ctx.fillText(xm.label, xx, pad.top + plotH + 8);
+    }
+
+    var downPts = buildPoints(downSeries, yCeil, plotW, plotH);
+    var upPts = buildPoints(upSeries, yCeil, plotW, plotH);
+
+    // Download gradient fill
+    ctx.save();
+    traceSmoothPath(downPts);
+    ctx.lineTo(downPts[downPts.length - 1].x, pad.top + plotH);
+    ctx.lineTo(downPts[0].x, pad.top + plotH);
+    ctx.closePath();
+    var grad = ctx.createLinearGradient(0, pad.top, 0, pad.top + plotH);
+    grad.addColorStop(0, 'rgba(16, 185, 129, 0.24)');
+    grad.addColorStop(0.75, 'rgba(16, 185, 129, 0.04)');
+    grad.addColorStop(1, 'rgba(16, 185, 129, 0.0)');
+    ctx.fillStyle = grad;
+    ctx.fill();
+    ctx.restore();
+
+    // Upload dashed silver curve
+    ctx.save();
+    traceSmoothPath(upPts);
+    ctx.strokeStyle = 'rgba(228, 228, 231, 0.85)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 3]);
+    ctx.stroke();
+    ctx.restore();
+
+    // Download solid Signal Emerald curve
+    ctx.save();
+    traceSmoothPath(downPts);
+    ctx.strokeStyle = '#10b981';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([]);
+    ctx.stroke();
+    ctx.restore();
+
+    // Live endpoint markers
+    var lastDown = downPts[downPts.length - 1];
+    var lastUp = upPts[upPts.length - 1];
+
+    ctx.beginPath();
+    ctx.arc(lastUp.x, lastUp.y, 2.5, 0, Math.PI * 2);
+    ctx.fillStyle = '#e4e4e7';
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.arc(lastDown.x, lastDown.y, 6, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(16, 185, 129, 0.24)';
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.arc(lastDown.x, lastDown.y, 3, 0, Math.PI * 2);
+    ctx.fillStyle = '#34d399';
+    ctx.fill();
+
+    // Hover crosshair & point highlight
+    if (hoverIndex >= 0 && hoverIndex < MAX_SAMPLES) {
+      var hd = downPts[hoverIndex];
+      var hu = upPts[hoverIndex];
+
+      ctx.save();
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.22)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([2, 2]);
+      ctx.beginPath();
+      ctx.moveTo(hd.x + 0.5, pad.top);
+      ctx.lineTo(hd.x + 0.5, pad.top + plotH);
+      ctx.stroke();
+      ctx.restore();
+
+      ctx.beginPath();
+      ctx.arc(hu.x, hu.y, 3.5, 0, Math.PI * 2);
+      ctx.fillStyle = '#e4e4e7';
+      ctx.fill();
+
+      ctx.beginPath();
+      ctx.arc(hd.x, hd.y, 4, 0, Math.PI * 2);
+      ctx.fillStyle = '#34d399';
+      ctx.strokeStyle = '#09090b';
+      ctx.lineWidth = 1.5;
+      ctx.fill();
+      ctx.stroke();
+    }
+  }
+
+  canvas.addEventListener('pointermove', function (ev) {
+    var rect = canvas.getBoundingClientRect();
+    var x = ev.clientX - rect.left;
+    var plotW = chartW - pad.left - pad.right;
+    if (x < pad.left || x > pad.left + plotW) {
+      hoverIndex = -1;
+      chartTooltip.hidden = true;
+      drawChart();
+      return;
+    }
+    var ratio = (x - pad.left) / plotW;
+    var idx = Math.max(0, Math.min(MAX_SAMPLES - 1, Math.round(ratio * (MAX_SAMPLES - 1))));
+    hoverIndex = idx;
+    drawChart();
+
+    var secAgo = Math.round((MAX_SAMPLES - 1 - idx) * (POLL_MS / 1000));
+    var timeText = secAgo === 0 ? 'now' : ('-' + secAgo + 's');
+    chartTooltip.innerHTML =
+      '<div class="chart-tooltip-time">' + timeText + '</div>' +
+      '<div class="chart-tooltip-row"><span style="color:#34d399">Down</span><span>' + downSeries[idx].toFixed(2) + ' Mbps</span></div>' +
+      '<div class="chart-tooltip-row"><span style="color:#e4e4e7">Up</span><span>' + upSeries[idx].toFixed(2) + ' Mbps</span></div>';
+    chartTooltip.hidden = false;
+
+    var stageRect = chartStage.getBoundingClientRect();
+    var tipW = chartTooltip.offsetWidth || 132;
+    var px = ev.clientX - stageRect.left + 12;
+    if (px + tipW > stageRect.width - 8) px = ev.clientX - stageRect.left - tipW - 12;
+    var py = Math.max(8, ev.clientY - stageRect.top - 48);
+    chartTooltip.style.left = Math.max(8, px) + 'px';
+    chartTooltip.style.top = py + 'px';
+  });
+
+  canvas.addEventListener('pointerleave', function () {
+    hoverIndex = -1;
+    chartTooltip.hidden = true;
+    drawChart();
+  });
+
+  if (typeof ResizeObserver === 'function') {
+    new ResizeObserver(resizeChart).observe(canvas);
+  } else {
+    window.addEventListener('resize', resizeChart);
+  }
+
+  // ── Provisioning Logic ──────────────────────────────────────────────────
+  function getSelectedCarriers() {
+    var checked = document.querySelector('input[name="carriers"]:checked');
+    var n = checked ? parseInt(checked.value, 10) : 4;
+    return Number.isFinite(n) && n > 0 ? n : 4;
+  }
+
+  function getProvisionMode() {
+    var checked = document.querySelector('input[name="prov_mode"]:checked');
+    return checked ? checked.value : 'android';
+  }
+
+  function renderLinks() {
+    if (!lastData) return;
+    var fb = document.getElementById('fallbackInput').value.trim();
+    var cip = document.getElementById('cleanIpInput').value.trim();
+    var carriers = getSelectedCarriers();
+    var mode = getProvisionMode();
+
+    var obj = {
+      psk: lastData.psk,
+      primary_url: lastData.ws_url,
+      carriers: carriers,
+      transport: 'auto'
+    };
+    if (fb) obj.fallback_url = fb;
+    if (cip) obj.cf_clean_ip = cip;
+
+    rawAndroidUri = 'aether://' + b64url(JSON.stringify(obj));
+
+    var cli = './aether-client -server ' + lastData.ws_url + ' -psk "' + lastData.psk + '" -carriers ' + carriers;
+    if (fb) cli += ' -fallback ' + fb;
+    rawCliCmd = cli;
+
+    var outEl = document.getElementById('provOutput');
+    var wellEl = document.getElementById('provCodeWell');
+    wellEl.setAttribute('data-mode', mode);
+
+    if (mode === 'android') {
+      if (secretVisible) {
+        outEl.textContent = rawAndroidUri;
+      } else {
+        outEl.textContent = 'aether://••••••••••••••••••••••••••••••••  (secret hidden · Copy uses real link)';
+      }
+    } else {
+      if (secretVisible) {
+        outEl.textContent = rawCliCmd;
+      } else {
+        var maskedCli = './aether-client -server ' + lastData.ws_url + ' -psk "••••••••••••••••" -carriers ' + carriers;
+        if (fb) maskedCli += ' -fallback ' + fb;
+        outEl.textContent = maskedCli;
+      }
+    }
+  }
+
+  // ── API Actions ─────────────────────────────────────────────────────────
+  async function setDNS(preset, customVal) {
+    var payload = { dns_preset: preset };
+    if (preset === 'custom') payload.custom_dns = customVal;
+    try {
+      var r = await fetch(base + '/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!r.ok) {
+        toast('Failed to update DNS policy', 'error');
+        return;
+      }
+      toast(preset === 'custom' ? ('Applied custom DNS: ' + customVal) : ('Switched upstream DNS to ' + preset.toUpperCase()), 'ok');
+      poll(false);
+    } catch (e) {
+      toast('Network error updating DNS', 'error');
+    }
+  }
+
+  async function setFlag(name, nextVal) {
+    var payload = {};
+    payload[name] = nextVal;
+    try {
+      var r = await fetch(base + '/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!r.ok) {
+        toast('Failed to update shield policy', 'error');
+        poll(false);
+        return;
+      }
+      var label = name === 'block_dot' ? 'Block DoT (853)' : 'SNI AdBlock';
+      toast(label + ' ' + (nextVal ? 'enabled' : 'disabled'), 'ok');
+      poll(false);
+    } catch (e) {
+      toast('Network error updating shield policy', 'error');
+      poll(false);
+    }
+  }
+
+  async function flushDNS() {
+    var btn = document.getElementById('btnFlushDns');
+    btn.disabled = true;
+    try {
+      var r = await fetch(base + '/api/dns/flush', { method: 'POST' });
+      if (r.ok) {
+        toast('DNS cache flushed', 'ok');
+        poll(false);
+      } else {
+        toast('Failed to flush DNS cache', 'error');
+      }
+    } catch (e) {
+      toast('Network error flushing DNS cache', 'error');
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function kickSession(id, btnEl) {
+    if (btnEl) btnEl.disabled = true;
+    try {
+      var r = await fetch(base + '/api/kick', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: id })
+      });
+      if (r.ok) {
+        toast('Terminated session ' + id, 'warn');
+        poll(false);
+      } else {
+        toast('Session ' + id + ' not found', 'error');
+        if (btnEl) btnEl.disabled = false;
+      }
+    } catch (e) {
+      toast('Network error kicking session', 'error');
+      if (btnEl) btnEl.disabled = false;
+    }
+  }
+
+  // ── Sessions Rendering ──────────────────────────────────────────────────
+  function renderCarrierDots(count) {
+    var slots = 4;
+    var active = Math.min(slots, Math.max(0, count));
+    var html = '<span class="carrier-dots"><span class="c-dots" aria-hidden="true">';
+    for (var i = 0; i < slots; i++) {
+      html += '<span class="c-dot' + (i < active ? ' on' : '') + '"></span>';
+    }
+    html += '</span><span class="c-count">' + count + '</span></span>';
+    return html;
+  }
+
+  function renderRttPill(rtt) {
+    if (!Number.isFinite(rtt) || rtt <= 0) {
+      return '<span class="rtt-pill">--</span>';
+    }
+    var cls = rtt < 80 ? 'good' : (rtt <= 180 ? 'warn' : 'bad');
+    return '<span class="rtt-pill ' + cls + '">' + rtt + ' ms</span>';
+  }
+
+  function renderSessions(sessions) {
+    var tb = document.getElementById('sessBody');
+    var count = sessions ? sessions.length : 0;
+    document.getElementById('sessCountPill').textContent = count + (count === 1 ? ' session' : ' sessions');
+
+    if (!sessions || sessions.length === 0) {
+      tb.innerHTML = '<tr class="empty-row"><td colspan="9" class="empty-cell">No active sessions</td></tr>';
+      return;
+    }
+
+    tb.innerHTML = sessions.map(function (s) {
+      var sid = escHtml(s.id);
+      return '<tr>' +
+        '<th scope="row"><span class="sess-id">' + sid + '</span></th>' +
+        '<td>' + renderCarrierDots(s.carriers) + '</td>' +
+        '<td class="mono">' + s.streams + '</td>' +
+        '<td class="mono">' + s.udp_flows + '</td>' +
+        '<td class="mono">' + fmtBytes(s.tx_bytes) + '</td>' +
+        '<td class="mono">' + fmtBytes(s.rx_bytes) + '</td>' +
+        '<td>' + renderRttPill(s.rtt_ms) + '</td>' +
+        '<td class="mono">' + fmtUptime(s.age_sec) + '</td>' +
+        '<td><button type="button" class="btn btn-danger" data-kick="' + sid + '">Kick</button></td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  // ── Status Indicator ────────────────────────────────────────────────────
+  function setConnState(state, text) {
+    var pill = document.getElementById('statusPill');
+    var txt = document.getElementById('statusText');
+    pill.setAttribute('data-state', state);
+    txt.textContent = text;
+  }
+
+  // ── Telemetry Poll Loop ─────────────────────────────────────────────────
+  async function poll(isManual) {
+    if (inFlight) return;
+    inFlight = true;
+    var refreshBtn = document.getElementById('btnRefresh');
+    if (isManual) refreshBtn.classList.add('is-spinning');
+
+    try {
+      var r = await fetch(base + '/api/stats', { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      var d = await r.json();
+      failCount = 0;
+      setConnState('ok', 'OPERATIONAL');
+
+      var first = !lastData;
+      lastData = d;
+
+      if (first) {
+        if (d.fallback_default && !fallbackTouched) {
+          document.getElementById('fallbackInput').value = d.fallback_default;
+        }
+        renderLinks();
+      }
+
+      document.getElementById('verPill').textContent = 'v' + d.version;
+      var upStr = fmtUptime(d.uptime_sec);
+      document.getElementById('uptimePill').textContent = upStr;
+      document.getElementById('ramPill').textContent = d.mem_alloc_mb.toFixed(1) + ' MB';
+      document.getElementById('goPill').textContent = String(d.goroutines);
+
+      // KPI Matrix
+      document.getElementById('kSessions').textContent = String(d.active_sessions);
+      document.getElementById('kCarriers').textContent =
+        d.active_carriers + ' carriers · ' + d.active_streams + ' TCP · ' + d.active_udp_flows + ' UDP';
+
+      document.getElementById('kTotal').textContent = fmtBytes(d.total_tx_bytes + d.total_rx_bytes);
+      document.getElementById('kTotalSub').textContent =
+        'Down ' + fmtBytes(d.total_tx_bytes) + ' · Up ' + fmtBytes(d.total_rx_bytes);
+
+      var hitPct = Math.max(0, Math.min(100, d.dns_cache_hit_pct || 0));
+      document.getElementById('kDnsHit').textContent = hitPct.toFixed(1) + '%';
+      document.getElementById('kDnsBar').style.width = hitPct.toFixed(1) + '%';
+      document.getElementById('kDnsSub').textContent =
+        d.dns_queries + ' queries · ' + d.dns_cache_size + ' cached · ' + d.dns_aaaa_filtered + ' AAAA';
+
+      document.getElementById('kRuntime').textContent = upStr;
+      document.getElementById('kRuntimeSub').textContent =
+        d.mem_alloc_mb.toFixed(1) + ' / ' + d.mem_sys_mb.toFixed(1) + ' MB RAM · ' + d.goroutines + ' goroutines';
+
+      document.getElementById('cacheCountMeta').textContent = d.dns_cache_size + ' cached records';
+      if (d.config && d.config.tunnel_path) {
+        document.getElementById('tunnelPathPill').textContent = d.config.tunnel_path;
+      }
+
+      // Live throughput delta & chart update
+      var now = Date.now();
+      if (prevTime > 0) {
+        var dt = Math.max(0.4, (now - prevTime) / 1000);
+        var txBps = Math.max(0, (d.total_tx_bytes - prevTx) / dt);
+        var rxBps = Math.max(0, (d.total_rx_bytes - prevRx) / dt);
+        var downMbps = (txBps * 8) / 1e6;
+        var upMbps = (rxBps * 8) / 1e6;
+
+        downSeries.push(downMbps);
+        if (downSeries.length > MAX_SAMPLES) downSeries.shift();
+        upSeries.push(upMbps);
+        if (upSeries.length > MAX_SAMPLES) upSeries.shift();
+
+        var peak = 0;
+        for (var i = 0; i < MAX_SAMPLES; i++) {
+          var combined = downSeries[i] + upSeries[i];
+          if (combined > peak) peak = combined;
+        }
+
+        document.getElementById('liveDownMbps').textContent = downMbps.toFixed(2);
+        document.getElementById('liveDownRate').textContent = fmtRate(txBps);
+        document.getElementById('liveUpMbps').textContent = upMbps.toFixed(2);
+        document.getElementById('liveUpRate').textContent = fmtRate(rxBps);
+        document.getElementById('livePeakMbps').textContent = peak.toFixed(2);
+        document.getElementById('liveTotalMbps').textContent = 'Combined: ' + (downMbps + upMbps).toFixed(2) + ' Mbps';
+        drawChart();
+      }
+      prevTx = d.total_tx_bytes;
+      prevRx = d.total_rx_bytes;
+      prevTime = now;
+
+      // Sync DNS & Shield controls
+      var dnsList = (d.config && d.config.upstream_dns) ? d.config.upstream_dns : [];
+      var dnsStr = dnsList.join(', ');
+      document.getElementById('curDnsPill').textContent = dnsStr || 'Direct';
+
+      var presetVal = '';
+      if (dnsStr.indexOf('94.140.') !== -1) presetVal = 'adguard';
+      else if (dnsStr.indexOf('1.1.1.1') !== -1) presetVal = 'cloudflare';
+      else if (dnsStr.indexOf('8.8.8.8') !== -1) presetVal = 'google';
+
+      var radios = document.querySelectorAll('input[name="dns_preset"]');
+      for (var rIdx = 0; rIdx < radios.length; rIdx++) {
+        radios[rIdx].checked = (radios[rIdx].value === presetVal);
+      }
+
+      document.getElementById('chkBlockDot').checked = Boolean(d.config && d.config.block_dot);
+      document.getElementById('chkAdblockSni').checked = Boolean(d.config && d.config.adblock_sni);
+
+      renderSessions(d.sessions);
+      if (isManual) toast('Telemetry refreshed', 'ok');
+    } catch (e) {
+      failCount++;
+      if (failCount >= 3) {
+        setConnState('offline', 'OFFLINE');
+      } else {
+        setConnState('degraded', 'RECONNECTING');
+      }
+      if (isManual) toast('Failed to fetch server stats', 'error');
+    } finally {
+      inFlight = false;
+      if (isManual) {
+        setTimeout(function () { refreshBtn.classList.remove('is-spinning'); }, 220);
+      }
+    }
+  }
+
+  // ── Event Wiring ────────────────────────────────────────────────────────
+  document.getElementById('btnRefresh').addEventListener('click', function () {
+    poll(true);
+  });
+
+  var dnsRadios = document.querySelectorAll('input[name="dns_preset"]');
+  for (var i = 0; i < dnsRadios.length; i++) {
+    dnsRadios[i].addEventListener('change', function (ev) {
+      if (ev.target.checked) setDNS(ev.target.value);
+    });
+  }
+
+  document.getElementById('customDnsForm').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var inp = document.getElementById('customDnsInput');
+    var val = inp.value.trim();
+    if (!val || !inp.checkValidity()) {
+      inp.focus();
+      toast('Enter a valid DNS host:port (e.g. 9.9.9.9:53)', 'warn');
+      return;
+    }
+    setDNS('custom', val);
+  });
+
+  document.getElementById('chkBlockDot').addEventListener('change', function (ev) {
+    setFlag('block_dot', ev.target.checked);
+  });
+
+  document.getElementById('chkAdblockSni').addEventListener('change', function (ev) {
+    setFlag('adblock_sni', ev.target.checked);
+  });
+
+  document.getElementById('btnFlushDns').addEventListener('click', flushDNS);
+
+  document.getElementById('fallbackInput').addEventListener('input', function () {
+    fallbackTouched = true;
+    renderLinks();
+  });
+
+  document.getElementById('cleanIpInput').addEventListener('input', renderLinks);
+
+  var carrierRadios = document.querySelectorAll('input[name="carriers"]');
+  for (var c = 0; c < carrierRadios.length; c++) {
+    carrierRadios[c].addEventListener('change', renderLinks);
+  }
+
+  var modeRadios = document.querySelectorAll('input[name="prov_mode"]');
+  for (var m = 0; m < modeRadios.length; m++) {
+    modeRadios[m].addEventListener('change', renderLinks);
+  }
+
+  document.getElementById('btnToggleSecret').addEventListener('click', function () {
+    secretVisible = !secretVisible;
+    this.setAttribute('aria-pressed', secretVisible ? 'true' : 'false');
+    document.getElementById('secretBtnLabel').textContent = secretVisible ? 'Hide Secret' : 'Show Secret';
+    renderLinks();
+  });
+
+  document.getElementById('btnCopyProv').addEventListener('click', function () {
+    var mode = getProvisionMode();
+    var text = mode === 'android' ? rawAndroidUri : rawCliCmd;
+    if (!text) {
+      toast('Payload not ready yet', 'warn');
+      return;
+    }
+    var msg = mode === 'android' ? 'Copied Android aether:// link' : 'Copied Laptop CLI command';
+    var copyLabel = document.getElementById('copyBtnLabel');
+
+    function onCopied() {
+      copyLabel.textContent = 'Copied';
+      toast(msg, 'ok');
+      setTimeout(function () { copyLabel.textContent = 'Copy'; }, 1600);
+    }
+
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      navigator.clipboard.writeText(text).then(onCopied).catch(function () {
+        toast('Clipboard permission denied', 'error');
+      });
+    } else {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand('copy');
+        onCopied();
+      } catch (e) {
+        toast('Unable to copy to clipboard', 'error');
+      }
+      ta.remove();
+    }
+  });
+
+  document.getElementById('sessBody').addEventListener('click', function (ev) {
+    var btn = ev.target && ev.target.closest ? ev.target.closest('button[data-kick]') : null;
+    if (!btn) return;
+    kickSession(btn.getAttribute('data-kick'), btn);
+  });
+
+  // ── Init ────────────────────────────────────────────────────────────────
+  resizeChart();
+  poll(false);
+  setInterval(function () { poll(false); }, POLL_MS);
+})();
 </script>
 </body>
 </html>`
