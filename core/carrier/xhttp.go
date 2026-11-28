@@ -97,7 +97,7 @@ func DialXHTTP(ctx context.Context, ep Endpoint, timeout time.Duration) (*XHTTPC
 		MaxIdleConnsPerHost: 8,
 		IdleConnTimeout:     60 * time.Second,
 		DisableCompression:  true,
-		ForceAttemptHTTP2:   true,
+		ForceAttemptHTTP2:   false,
 		DialContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
 			target := addr
 			if ep.ResolveIP != "" {
@@ -121,7 +121,7 @@ func DialXHTTP(ctx context.Context, ep Endpoint, timeout time.Duration) (*XHTTPC
 			if tc, ok := rawConn.(*net.TCPConn); ok {
 				_ = tc.SetNoDelay(true)
 			}
-			return dialUTLS(dctx, rawConn, host, ep.Fingerprint, []string{"h2", "http/1.1"})
+			return dialUTLS(dctx, rawConn, host, ep.Fingerprint, []string{"http/1.1"})
 		},
 		TLSClientConfig: &tls.Config{ServerName: host},
 	}

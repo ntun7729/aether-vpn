@@ -17,3 +17,4 @@ android/app/libs/*.aar
 # Local configs with secrets
 aether.local.json
 .env
+.wrangler/
