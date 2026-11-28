@@ -51,7 +51,11 @@ type Stats struct {
 	Replays        uint64 `json:"replays"`
 	Failovers      uint64 `json:"failovers"`
 	Endpoint       string `json:"endpoint"`
+	Cipher         string `json:"cipher"`
 }
+
+// ConfigSyncHandler is invoked when a peer pushes a live encrypted JSON config update.
+type ConfigSyncHandler func(payload []byte)
 
 // StreamOpenHandler is invoked on the server when a client opens a new TCP stream.
 type StreamOpenHandler func(ctx context.Context, s *Stream, addr proto.Address) error
@@ -151,6 +155,8 @@ type Session struct {
 
 	onStreamOpen StreamOpenHandler
 	onUDP        UDPHandler
+	onConfigSync atomic.Value // ConfigSyncHandler
+	maxPad       atomic.Int32
 
 	// Carrier pool
 	carrierMu   sync.RWMutex
@@ -199,7 +205,42 @@ func New(id [16]byte, cipher *acrypto.SessionCipher, isServer bool, onOpen Strea
 		cancel:       cancel,
 	}
 	s.endpoint.Store("")
+	s.maxPad.Store(DefaultMaxPad)
 	return s
+}
+
+// SetConfigSyncHandler registers a callback invoked on incoming FrameConfigSync frames.
+func (s *Session) SetConfigSyncHandler(fn ConfigSyncHandler) {
+	if fn != nil {
+		s.onConfigSync.Store(fn)
+	}
+}
+
+// SetMaxPad updates anti-DPI padding bytes at runtime (0 = off, 24 = balanced, 96 = stealth).
+func (s *Session) SetMaxPad(n int) {
+	if n < 0 {
+		n = 0
+	}
+	if n > proto.MaxPaddingSize {
+		n = proto.MaxPaddingSize
+	}
+	s.maxPad.Store(int32(n))
+}
+
+func (s *Session) getMaxPad() int {
+	return int(s.maxPad.Load())
+}
+
+// SendConfigSync sends an encrypted JSON config payload to the peer on the high-priority lane.
+func (s *Session) SendConfigSync(payload []byte) error {
+	c := s.pickHealthyCarrier()
+	if c == nil {
+		return ErrNoCarriers
+	}
+	return s.sendOnCarrier(c, &proto.Frame{
+		Type:    proto.FrameConfigSync,
+		Payload: payload,
+	}, 0, true)
 }
 
 // AttachCarrier binds a WebSocket or HTTP/2 carrier to this session and starts its read loop.
@@ -209,6 +250,12 @@ func (s *Session) AttachCarrier(c carrier.Conn, onDetach func(carrier.Conn, erro
 		return
 	}
 	ep := c.GetEndpoint()
+	// Count txBytes AFTER actual socket write inside carrier (prevents fake RAM-queue Mbps spikes!)
+	c.SetOnWritten(func(n int) {
+		if n > 0 {
+			s.txBytes.Add(uint64(n))
+		}
+	})
 	s.carrierMu.Lock()
 	s.carriers = append(s.carriers, c)
 	if ep.Name != "" {
@@ -352,7 +399,6 @@ func (s *Session) sendOnCarrier(c carrier.Conn, f *proto.Frame, pad int, highPri
 		s.removeCarrier(c)
 		return err
 	}
-	s.txBytes.Add(uint64(len(wire)))
 	return nil
 }
 
@@ -457,6 +503,12 @@ func (s *Session) handleFrame(src carrier.Conn, f *proto.Frame) {
 		if st := s.getStream(f.StreamID); st != nil {
 			st.deliverReset()
 		}
+
+	case proto.FrameConfigSync:
+		if fn, ok := s.onConfigSync.Load().(ConfigSyncHandler); ok && fn != nil {
+			cp := append([]byte(nil), f.Payload...)
+			go fn(cp)
+		}
 	}
 }
 
@@ -531,7 +583,7 @@ func (s *Session) OpenStream(ctx context.Context, host string, port uint16) (*St
 		StreamID: id,
 		Seq:      0,
 		Payload:  proto.EncodeAddress(host, port),
-	}, s.MaxPad, false)
+	}, s.getMaxPad(), false)
 	if err != nil {
 		s.removeStream(id)
 		return nil, err
@@ -574,6 +626,10 @@ func (s *Session) Stats() Stats {
 	activeStreams := len(s.streams)
 	s.streamMu.RUnlock()
 	ep, _ := s.endpoint.Load().(string)
+	cipherName := ""
+	if s.Cipher != nil {
+		cipherName = acrypto.CipherName(s.Cipher.CipherID)
+	}
 	return Stats{
 		SessionID:      fmt.Sprintf("%x", s.ID[:6]),
 		ActiveCarriers: s.ActiveCarriers(),
@@ -584,6 +640,7 @@ func (s *Session) Stats() Stats {
 		Replays:        s.replays.Load(),
 		Failovers:      s.failovers.Load(),
 		Endpoint:       ep,
+		Cipher:         cipherName,
 	}
 }
 
@@ -893,7 +950,7 @@ func (st *Stream) Write(p []byte) (int, error) {
 			c = st.sess.pickHealthyCarrier()
 		}
 
-		pad := st.sess.MaxPad
+		pad := st.sess.getMaxPad()
 		if len(chunk) >= 1024 {
 			pad = 0
 		}

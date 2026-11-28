@@ -16,7 +16,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
 )
 
@@ -25,13 +24,14 @@ const MaxH2PacketSize = 256 * 1024
 // H2Carrier implements CarrierConn over a single full-duplex HTTP/2 POST stream.
 // Useful when strict ISPs/firewalls throttle WebSocket upgrades while allowing HTTP/2.
 type H2Carrier struct {
-	id       uint64
-	endpoint Endpoint
-	pw       *io.PipeWriter
-	respBody io.ReadCloser
-	br       *bufio.Reader
-	writeMu  sync.Mutex
-	closed   atomic.Bool
+	id        uint64
+	endpoint  Endpoint
+	pw        *io.PipeWriter
+	respBody  io.ReadCloser
+	br        *bufio.Reader
+	writeMu   sync.Mutex
+	onWritten atomic.Value // func(int)
+	closed    atomic.Bool
 }
 
 // WrapH2Server wraps an incoming HTTP/2 request/response pair on the server side.
@@ -39,7 +39,7 @@ func WrapH2Server(r *http.Request, w http.ResponseWriter, flusher http.Flusher, 
 	return &H2ServerCarrier{
 		id:       nextCarrierID.Add(1),
 		endpoint: ep,
-		br:       bufio.NewReaderSize(r.Body, 64*1024),
+		br:       bufio.NewReaderSize(r.Body, 256*1024),
 		body:     r.Body,
 		w:        w,
 		flusher:  flusher,
@@ -48,14 +48,15 @@ func WrapH2Server(r *http.Request, w http.ResponseWriter, flusher http.Flusher, 
 
 // H2ServerCarrier is the server-side counterpart to H2Carrier.
 type H2ServerCarrier struct {
-	id       uint64
-	endpoint Endpoint
-	br       *bufio.Reader
-	body     io.ReadCloser
-	w        http.ResponseWriter
-	flusher  http.Flusher
-	writeMu  sync.Mutex
-	closed   atomic.Bool
+	id        uint64
+	endpoint  Endpoint
+	br        *bufio.Reader
+	body      io.ReadCloser
+	w         http.ResponseWriter
+	flusher   http.Flusher
+	writeMu   sync.Mutex
+	onWritten atomic.Value // func(int)
+	closed    atomic.Bool
 }
 
 func (c *H2ServerCarrier) CarrierID() uint64   { return c.id }
@@ -63,6 +64,11 @@ func (c *H2ServerCarrier) GetEndpoint() Endpoint { return c.endpoint }
 func (c *H2ServerCarrier) IsClosed() bool      { return c.closed.Load() }
 func (c *H2ServerCarrier) Degraded() bool      { return false }
 func (c *H2ServerCarrier) QueueLen() int       { return 0 }
+func (c *H2ServerCarrier) SetOnWritten(fn func(int)) {
+	if fn != nil {
+		c.onWritten.Store(fn)
+	}
+}
 func (c *H2ServerCarrier) WritePacketPriority(data []byte, _ bool) error { return c.WritePacket(data) }
 
 func (c *H2ServerCarrier) WritePacket(data []byte) error {
@@ -80,6 +86,9 @@ func (c *H2ServerCarrier) WritePacket(data []byte) error {
 		return err
 	}
 	c.flusher.Flush()
+	if fn, ok := c.onWritten.Load().(func(int)); ok && fn != nil {
+		fn(len(data))
+	}
 	return nil
 }
 
@@ -148,15 +157,7 @@ func DialH2(ctx context.Context, ep Endpoint, timeout time.Duration) (*H2Carrier
 			if u.Scheme == "http" {
 				return rawConn, nil
 			}
-			uConn := utls.UClient(rawConn, &utls.Config{
-				ServerName: host,
-				NextProtos: []string{"h2"},
-			}, utls.HelloChrome_Auto)
-			if err := uConn.HandshakeContext(dctx); err != nil {
-				_ = rawConn.Close()
-				return nil, err
-			}
-			return uConn, nil
+			return dialUTLS(dctx, rawConn, host, ep.Fingerprint, []string{"h2"})
 		},
 	}
 
@@ -209,6 +210,11 @@ func (c *H2Carrier) GetEndpoint() Endpoint { return c.endpoint }
 func (c *H2Carrier) IsClosed() bool        { return c.closed.Load() }
 func (c *H2Carrier) Degraded() bool        { return false }
 func (c *H2Carrier) QueueLen() int         { return 0 }
+func (c *H2Carrier) SetOnWritten(fn func(int)) {
+	if fn != nil {
+		c.onWritten.Store(fn)
+	}
+}
 func (c *H2Carrier) WritePacketPriority(data []byte, _ bool) error { return c.WritePacket(data) }
 
 func (c *H2Carrier) WritePacket(data []byte) error {
@@ -222,8 +228,13 @@ func (c *H2Carrier) WritePacket(data []byte) error {
 	if _, err := c.pw.Write(lenBuf[:]); err != nil {
 		return err
 	}
-	_, err := c.pw.Write(data)
-	return err
+	if _, err := c.pw.Write(data); err != nil {
+		return err
+	}
+	if fn, ok := c.onWritten.Load().(func(int)); ok && fn != nil {
+		fn(len(data))
+	}
+	return nil
 }
 
 func (c *H2Carrier) ReadPacket() ([]byte, error) {

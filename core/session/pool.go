@@ -19,11 +19,30 @@ import (
 
 // ClientConfig configures the multi-endpoint Aether client manager.
 type ClientConfig struct {
-	PSK         string             `json:"psk"`
-	Endpoints   []carrier.Endpoint `json:"endpoints"` // Ordered by priority: Railway (0), Render (1), CF Worker (2)
-	Carriers    int                `json:"carriers"`  // Parallel carriers per session (default 3)
-	DialTimeout time.Duration      `json:"-"`
-	MaxPad      int                `json:"max_pad"`
+	PSK          string             `json:"psk"`
+	Endpoints    []carrier.Endpoint `json:"endpoints"` // Ordered by priority: Railway (0), CF Worker / Render (1)
+	Carriers     int                `json:"carriers"`  // Parallel carriers per session (default 4)
+	Cipher       string             `json:"cipher"`    // xchacha20-poly1305 | aes-256-gcm | aes-128-gcm | chacha20-poly1305 | none
+	PaddingMode  string             `json:"padding_mode"` // balanced (default) | stealth | off
+	DialTimeout  time.Duration      `json:"-"`
+	MaxPad       int                `json:"max_pad"`
+	OnConfigSync ConfigSyncHandler  `json:"-"`
+}
+
+func paddingBytesForMode(mode string, fallback int) int {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "off", "none":
+		return 0
+	case "stealth", "high":
+		return 96
+	case "balanced", "default":
+		return DefaultMaxPad
+	default:
+		if fallback > 0 {
+			return fallback
+		}
+		return DefaultMaxPad
+	}
 }
 
 // ClientManager maintains a resilient Aether Session across multiple carriers and endpoints,
@@ -141,6 +160,26 @@ func (m *ClientManager) SendUDP(flowID uint32, host string, port uint16, payload
 	return s.SendUDP(flowID, host, port, payload)
 }
 
+// SendConfigSync pushes a live encrypted JSON config update to the server over the active session.
+func (m *ClientManager) SendConfigSync(payload []byte) error {
+	s, err := m.Session()
+	if err != nil {
+		return err
+	}
+	return s.SendConfigSync(payload)
+}
+
+// SetPaddingMode updates anti-DPI padding live on the active session without reconnecting.
+func (m *ClientManager) SetPaddingMode(mode string) {
+	pad := paddingBytesForMode(mode, DefaultMaxPad)
+	m.mu.RLock()
+	s := m.sess
+	m.mu.RUnlock()
+	if s != nil {
+		s.SetMaxPad(pad)
+	}
+}
+
 // Stats returns live telemetry for the active session.
 func (m *ClientManager) Stats() Stats {
 	m.mu.RLock()
@@ -206,10 +245,12 @@ func (m *ClientManager) dialNewSession(ctx context.Context, ep carrier.Endpoint)
 		_ = c.Close()
 		return nil, err
 	}
+	cipherID := acrypto.ParseCipher(m.cfg.Cipher)
 	sessID := NewSessionID()
 	hello := carrier.EncodeClientHello(carrier.ClientHello{
 		Version:   proto.Version,
 		Mode:      carrier.ModeNewSession,
+		CipherID:  cipherID,
 		SessionID: sessID,
 		PubKey:    kp.Public,
 		Timestamp: time.Now().Unix(),
@@ -233,15 +274,16 @@ func (m *ClientManager) dialNewSession(ctx context.Context, ep carrier.Endpoint)
 		return nil, err
 	}
 
-	cipher, err := acrypto.DeriveSessionCipher(m.psk, kp.Private, sh.PubKey, sessID, false)
+	cipher, err := acrypto.DeriveSessionCipherWithID(m.psk, kp.Private, sh.PubKey, sessID, false, cipherID)
 	if err != nil {
 		_ = c.Close()
 		return nil, err
 	}
 
 	s := New(sessID, cipher, false, nil, m.onUDP)
-	if m.cfg.MaxPad > 0 {
-		s.MaxPad = m.cfg.MaxPad
+	s.SetMaxPad(paddingBytesForMode(m.cfg.PaddingMode, m.cfg.MaxPad))
+	if m.cfg.OnConfigSync != nil {
+		s.SetConfigSyncHandler(m.cfg.OnConfigSync)
 	}
 	s.AttachCarrier(c, m.onCarrierDetach(s, ep))
 	return s, nil

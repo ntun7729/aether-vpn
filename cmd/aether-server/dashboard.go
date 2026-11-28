@@ -8,11 +8,9 @@ import (
 	"runtime"
 	"strings"
 	"time"
-
-	"github.com/aether-vpn/aether/core/adblock"
 )
 
-const serverVersion = "3.2.0"
+const serverVersion = "4.0.0"
 
 // handleAdminRoute authenticates /{ADMIN_KEY}/... in constant time.
 // Returns true if the request was handled as an authenticated admin route; false falls through to decoy HTML.
@@ -50,7 +48,11 @@ func (s *Server) handleAdminRoute(w http.ResponseWriter, r *http.Request) bool {
 		s.handleAPIStats(w, r)
 		return true
 
-	case subPath == "/api/config" && r.Method == http.MethodPost:
+	case subPath == "/api/sync" && r.Method == http.MethodGet:
+		writeJSON(w, http.StatusOK, s.getSyncConfig())
+		return true
+
+	case (subPath == "/api/config" || subPath == "/api/sync") && r.Method == http.MethodPost:
 		s.handleAPIConfig(w, r)
 		return true
 
@@ -75,6 +77,7 @@ func (s *Server) handleAPIStats(w http.ResponseWriter, r *http.Request) {
 
 	type sessInfo struct {
 		ID       string `json:"id"`
+		Cipher   string `json:"cipher"`
 		Carriers int    `json:"carriers"`
 		Streams  int    `json:"streams"`
 		UDPFlows int    `json:"udp_flows"`
@@ -101,6 +104,7 @@ func (s *Server) handleAPIStats(w http.ResponseWriter, r *http.Request) {
 		liveRx += st.RxBytes
 		sessions = append(sessions, sessInfo{
 			ID:       fmt.Sprintf("%x", id[:6]),
+			Cipher:   st.Cipher,
 			Carriers: st.ActiveCarriers,
 			Streams:  st.ActiveStreams,
 			UDPFlows: uCount,
@@ -115,11 +119,12 @@ func (s *Server) handleAPIStats(w http.ResponseWriter, r *http.Request) {
 	totalTx := s.archivedTx.Load() + liveTx
 	totalRx := s.archivedRx.Load() + liveRx
 
-	s.cfgMu.RLock()
-	upDNS := append([]string(nil), s.upstreamDNS...)
-	blockDoT := s.blockDoT
-	adblockSNI := s.adblockSNI
-	s.cfgMu.RUnlock()
+	s.rateMu.RLock()
+	downBps := s.liveDownBps
+	upBps := s.liveUpBps
+	s.rateMu.RUnlock()
+
+	sc := s.getSyncConfig()
 
 	dnsQ := s.dnsQueries.Load()
 	dnsHits := s.dnsCacheHits.Load()
@@ -137,6 +142,7 @@ func (s *Server) handleAPIStats(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":           serverVersion,
+		"server_time_ms":    now.UnixMilli(),
 		"uptime_sec":        int64(now.Sub(s.startedAt).Seconds()),
 		"goroutines":        runtime.NumGoroutine(),
 		"mem_alloc_mb":      float64(ms.Alloc) / (1024 * 1024),
@@ -147,19 +153,33 @@ func (s *Server) handleAPIStats(w http.ResponseWriter, r *http.Request) {
 		"active_udp_flows":  totalUDP,
 		"total_tx_bytes":    totalTx,
 		"total_rx_bytes":    totalRx,
+		"live_down_bps":     downBps,
+		"live_up_bps":       upBps,
+		"live_down_mbps":    (downBps * 8.0) / 1e6,
+		"live_up_mbps":      (upBps * 8.0) / 1e6,
 		"dns_queries":       dnsQ,
 		"dns_cache_hits":    dnsHits,
 		"dns_aaaa_filtered": dnsAAAA,
 		"dns_cache_size":    s.udpDNSCache.Size(),
 		"dns_cache_hit_pct": hitPct,
 		"ws_url":            wsURL,
-		"fallback_default":  "wss://sync.novv.tech/ws/sync",
+		"fallback_default":  sc.FallbackURL,
 		"psk":               string(s.psk),
+		"sync_config":       sc,
 		"config": map[string]any{
 			"tunnel_path":  s.path,
-			"upstream_dns": upDNS,
-			"block_dot":    blockDoT,
-			"adblock_sni":  adblockSNI,
+			"upstream_dns": sc.UpstreamDNS,
+			"block_dot":    sc.BlockDoT,
+			"adblock_sni":  sc.AdblockSNI,
+			"cipher":       sc.Cipher,
+			"transport":    sc.Transport,
+			"fingerprint":  sc.Fingerprint,
+			"padding_mode": sc.PaddingMode,
+			"carriers":     sc.Carriers,
+			"dns_preset":   sc.DNSPreset,
+			"custom_dns":   sc.CustomDNS,
+			"fallback_url": sc.FallbackURL,
+			"updated_at":   sc.UpdatedAt,
 		},
 		"sessions": sessions,
 	})
@@ -167,49 +187,30 @@ func (s *Server) handleAPIStats(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		DNSPreset  string `json:"dns_preset"` // adguard | cloudflare | google | custom
-		CustomDNS  string `json:"custom_dns"`
-		BlockDoT   *bool  `json:"block_dot"`
-		AdblockSNI *bool  `json:"adblock_sni"`
+		DNSPreset   string  `json:"dns_preset"`
+		CustomDNS   string  `json:"custom_dns"`
+		BlockDoT    *bool   `json:"block_dot"`
+		AdblockSNI  *bool   `json:"adblock_sni"`
+		Cipher      string  `json:"cipher"`
+		Transport   string  `json:"transport"`
+		Fingerprint string  `json:"fingerprint"`
+		PaddingMode string  `json:"padding_mode"`
+		Carriers    *int    `json:"carriers"`
+		FallbackURL *string `json:"fallback_url"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
 		return
 	}
 
-	s.cfgMu.Lock()
-	if body.DNSPreset != "" {
-		switch strings.ToLower(body.DNSPreset) {
-		case "adguard":
-			s.upstreamDNS = []string{"94.140.14.14:53", "94.140.15.15:53"}
-		case "cloudflare":
-			s.upstreamDNS = []string{"1.1.1.1:53", "1.0.0.1:53"}
-		case "google":
-			s.upstreamDNS = []string{"8.8.8.8:53", "8.8.4.4:53"}
-		case "custom":
-			if parsed := parseUpstreams(body.CustomDNS); len(parsed) > 0 {
-				s.upstreamDNS = parsed
-			}
-		}
-		s.udpDNSCache.Flush()
-	}
-	if body.BlockDoT != nil {
-		s.blockDoT = *body.BlockDoT
-	}
-	if body.AdblockSNI != nil {
-		s.adblockSNI = *body.AdblockSNI
-		s.blocker = adblock.New(*body.AdblockSNI)
-	}
-	up := append([]string(nil), s.upstreamDNS...)
-	bdot := s.blockDoT
-	asni := s.adblockSNI
-	s.cfgMu.Unlock()
+	updated := s.applySyncPatch(body, [16]byte{}, false)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":           true,
-		"upstream_dns": up,
-		"block_dot":    bdot,
-		"adblock_sni":  asni,
+		"sync_config":  updated,
+		"upstream_dns": updated.UpstreamDNS,
+		"block_dot":    updated.BlockDoT,
+		"adblock_sni":  updated.AdblockSNI,
 	})
 }
 
@@ -639,6 +640,86 @@ const dashboardHTML = `<!doctype html>
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 16px;
     align-items: stretch;
+  }
+
+  .panel-span-2 {
+    grid-column: 1 / -1;
+  }
+
+  .sync-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    background: var(--emerald-tint);
+    border: 1px solid var(--emerald-border);
+    color: var(--emerald-hi);
+    white-space: nowrap;
+  }
+
+  .sync-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--emerald);
+    flex-shrink: 0;
+  }
+
+  .sync-grid {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 14px 16px;
+    align-items: start;
+  }
+
+  .sync-col-3 {
+    grid-column: span 3;
+  }
+
+  .sync-col-2 {
+    grid-column: span 2;
+  }
+
+  .seg-group.seg-wrap {
+    display: flex;
+    flex-wrap: wrap;
+    width: 100%;
+  }
+
+  .seg-group.seg-wrap .seg-pill {
+    flex: 1 0 auto;
+    white-space: nowrap;
+  }
+
+  .prov-profile-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 8px 11px;
+    border-radius: var(--radius-md);
+    background: var(--well);
+    border: 1px solid var(--border);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-2);
+  }
+
+  .prov-profile-bar .k {
+    color: var(--text-3);
+    text-transform: uppercase;
+    font-size: 10.5px;
+    letter-spacing: 0.05em;
+  }
+
+  .prov-profile-bar .v {
+    color: var(--emerald-hi);
   }
 
   .panel {
@@ -1270,14 +1351,15 @@ const dashboardHTML = `<!doctype html>
     border-spacing: 0;
     font-size: 13px;
     --label-1: "Session";
-    --label-2: "Carriers";
-    --label-3: "TCP";
-    --label-4: "UDP / QUIC";
-    --label-5: "Down (TX)";
-    --label-6: "Up (RX)";
-    --label-7: "RTT";
-    --label-8: "Age";
-    --label-9: "Action";
+    --label-2: "Cipher";
+    --label-3: "Carriers";
+    --label-4: "TCP";
+    --label-5: "UDP / QUIC";
+    --label-6: "Down (TX)";
+    --label-7: "Up (RX)";
+    --label-8: "RTT";
+    --label-9: "Age";
+    --label-10: "Action";
   }
 
   .sessions-table thead {
@@ -1342,6 +1424,25 @@ const dashboardHTML = `<!doctype html>
     padding: 3px 7px;
     border-radius: 5px;
     display: inline-block;
+  }
+
+  .cipher-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 7px;
+    border-radius: 5px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 500;
+    background: var(--emerald-tint);
+    border: 1px solid var(--emerald-border);
+    color: var(--emerald-hi);
+  }
+
+  .cipher-pill.plain {
+    background: var(--amber-tint);
+    border-color: var(--amber-border);
+    color: #fcd34d;
   }
 
   .carrier-dots {
@@ -1500,6 +1601,7 @@ const dashboardHTML = `<!doctype html>
     .sessions-table tbody td:nth-child(7)::before { content: var(--label-7); }
     .sessions-table tbody td:nth-child(8)::before { content: var(--label-8); }
     .sessions-table tbody td:nth-child(9)::before { content: var(--label-9); }
+    .sessions-table tbody td:nth-child(10)::before { content: var(--label-10); }
 
     .sessions-table tbody tr.empty-row td {
       display: block;
@@ -1627,8 +1729,14 @@ const dashboardHTML = `<!doctype html>
   /* ── Responsive Breakpoints ────────────────────────────────────────────── */
   @media (max-width: 900px) {
     .hero-grid,
-    .ops-grid {
+    .ops-grid,
+    .sync-grid {
       grid-template-columns: minmax(0, 1fr);
+    }
+
+    .sync-col-3,
+    .sync-col-2 {
+      grid-column: auto;
     }
 
     .topbar-inner {
@@ -1683,7 +1791,7 @@ const dashboardHTML = `<!doctype html>
         </svg>
       </div>
       <h1 class="brand-name">AetherVPN</h1>
-      <span class="pill pill-mono" id="verPill">v3.2.0</span>
+      <span class="pill pill-mono" id="verPill">v4.0.0</span>
       <span class="status-pill" id="statusPill" data-state="ok">
         <span class="status-dot" aria-hidden="true"></span>
         <span id="statusText">OPERATIONAL</span>
@@ -1714,7 +1822,7 @@ const dashboardHTML = `<!doctype html>
       <div class="panel-head">
         <div class="panel-title-group">
           <h2 class="panel-title">Live Throughput</h2>
-          <span class="panel-sub mono">90s rolling · 1.5s poll</span>
+          <span class="panel-sub mono">90s rolling · 3s server window</span>
         </div>
         <div class="chart-legend" aria-hidden="true">
           <span class="legend-item"><span class="legend-swatch down"></span>Download</span>
@@ -1779,7 +1887,74 @@ const dashboardHTML = `<!doctype html>
   </section>
 
   <!-- Operations Split -->
-  <section class="ops-grid" aria-label="Policy and client provisioning">
+  <section class="ops-grid" aria-label="Policy, synced profile, and client provisioning">
+    <!-- Full-Width: Synced Tunnel Profile (Live Server ↔ Client Control) -->
+    <div class="panel panel-span-2">
+      <div class="panel-head">
+        <div class="panel-title-group">
+          <h2 class="panel-title">Synced Tunnel Profile</h2>
+          <span class="panel-sub">Live Server ↔ Client Control</span>
+        </div>
+        <span class="sync-badge"><span class="sync-dot" aria-hidden="true"></span>Auto-Sync Active</span>
+      </div>
+
+      <div class="panel-body">
+        <div class="sync-grid">
+          <fieldset class="sync-col-3">
+            <legend class="field-label">Encryption Cipher</legend>
+            <div class="seg-group seg-wrap" role="radiogroup" aria-label="Encryption cipher">
+              <label class="seg-pill"><input type="radio" name="cipher" value="xchacha20-poly1305" data-label="XChaCha20" checked>XChaCha20</label>
+              <label class="seg-pill"><input type="radio" name="cipher" value="aes-256-gcm" data-label="AES-256-GCM">AES-256-GCM</label>
+              <label class="seg-pill"><input type="radio" name="cipher" value="aes-128-gcm" data-label="AES-128-GCM">AES-128-GCM</label>
+              <label class="seg-pill"><input type="radio" name="cipher" value="chacha20-poly1305" data-label="ChaCha20">ChaCha20</label>
+              <label class="seg-pill"><input type="radio" name="cipher" value="none" data-label="TLS-Only">TLS-Only</label>
+            </div>
+          </fieldset>
+
+          <fieldset class="sync-col-3">
+            <legend class="field-label">Transport Mode</legend>
+            <div class="seg-group seg-wrap" role="radiogroup" aria-label="Transport mode">
+              <label class="seg-pill"><input type="radio" name="transport" value="auto" data-label="Auto" checked>Auto</label>
+              <label class="seg-pill"><input type="radio" name="transport" value="ws" data-label="WebSocket">WebSocket</label>
+              <label class="seg-pill"><input type="radio" name="transport" value="xhttp" data-label="XHTTP">XHTTP</label>
+              <label class="seg-pill"><input type="radio" name="transport" value="grpc" data-label="gRPC">gRPC</label>
+              <label class="seg-pill"><input type="radio" name="transport" value="h2" data-label="HTTP/2">HTTP/2</label>
+            </div>
+          </fieldset>
+
+          <fieldset class="sync-col-2">
+            <legend class="field-label">uTLS Fingerprint</legend>
+            <div class="seg-group seg-wrap" role="radiogroup" aria-label="uTLS fingerprint">
+              <label class="seg-pill"><input type="radio" name="fingerprint" value="chrome" data-label="Chrome" checked>Chrome</label>
+              <label class="seg-pill"><input type="radio" name="fingerprint" value="firefox" data-label="Firefox">Firefox</label>
+              <label class="seg-pill"><input type="radio" name="fingerprint" value="safari" data-label="Safari">Safari</label>
+              <label class="seg-pill"><input type="radio" name="fingerprint" value="ios" data-label="iOS">iOS</label>
+              <label class="seg-pill"><input type="radio" name="fingerprint" value="randomized" data-label="Random">Random</label>
+            </div>
+          </fieldset>
+
+          <fieldset class="sync-col-2">
+            <legend class="field-label">Anti-DPI Padding</legend>
+            <div class="seg-group seg-wrap" role="radiogroup" aria-label="Anti-DPI padding">
+              <label class="seg-pill"><input type="radio" name="padding_mode" value="balanced" data-label="Balanced" checked>Balanced</label>
+              <label class="seg-pill"><input type="radio" name="padding_mode" value="stealth" data-label="Stealth">Stealth</label>
+              <label class="seg-pill"><input type="radio" name="padding_mode" value="off" data-label="Off">Off</label>
+            </div>
+          </fieldset>
+
+          <fieldset class="sync-col-2">
+            <legend class="field-label">Parallel Carriers</legend>
+            <div class="seg-group seg-wrap" role="radiogroup" aria-label="Parallel carriers">
+              <label class="seg-pill mono"><input type="radio" name="carriers" value="2" data-label="2">2</label>
+              <label class="seg-pill mono"><input type="radio" name="carriers" value="3" data-label="3">3</label>
+              <label class="seg-pill mono"><input type="radio" name="carriers" value="4" data-label="4" checked>4</label>
+              <label class="seg-pill mono"><input type="radio" name="carriers" value="6" data-label="6">6</label>
+            </div>
+          </fieldset>
+        </div>
+      </div>
+    </div>
+
     <!-- Left: DNS & Shield Policy -->
     <div class="panel">
       <div class="panel-head">
@@ -1892,29 +2067,22 @@ const dashboardHTML = `<!doctype html>
           >
         </div>
 
-        <div class="prov-row">
-          <div>
-            <label class="field-label" for="cleanIpInput">Cloudflare Clean IP (Optional)</label>
-            <input
-              type="text"
-              id="cleanIpInput"
-              class="text-input"
-              placeholder="e.g. 162.159.192.1"
-              pattern="^[0-9a-fA-F.:]*$"
-              autocomplete="off"
-              spellcheck="false"
-            >
-          </div>
+        <div>
+          <label class="field-label" for="cleanIpInput">Cloudflare Clean IP (Optional)</label>
+          <input
+            type="text"
+            id="cleanIpInput"
+            class="text-input"
+            placeholder="e.g. 162.159.192.1"
+            pattern="^[0-9a-fA-F.:]*$"
+            autocomplete="off"
+            spellcheck="false"
+          >
+        </div>
 
-          <fieldset>
-            <legend class="field-label">Carriers</legend>
-            <div class="seg-group" role="radiogroup" aria-label="Carrier count">
-              <label class="seg-pill mono"><input type="radio" name="carriers" value="2">2</label>
-              <label class="seg-pill mono"><input type="radio" name="carriers" value="3">3</label>
-              <label class="seg-pill mono"><input type="radio" name="carriers" value="4" checked>4</label>
-              <label class="seg-pill mono"><input type="radio" name="carriers" value="6">6</label>
-            </div>
-          </fieldset>
+        <div class="prov-profile-bar" aria-live="polite">
+          <span class="k">Synced Profile</span>
+          <span class="v" id="provProfileSummary">xchacha20-poly1305 · auto · chrome · balanced · 4c</span>
         </div>
 
         <div class="prov-toolbar">
@@ -1962,6 +2130,7 @@ const dashboardHTML = `<!doctype html>
         <thead>
           <tr>
             <th scope="col">Session</th>
+            <th scope="col">Cipher</th>
             <th scope="col">Carriers</th>
             <th scope="col">TCP</th>
             <th scope="col">UDP / QUIC</th>
@@ -1973,7 +2142,7 @@ const dashboardHTML = `<!doctype html>
           </tr>
         </thead>
         <tbody id="sessBody">
-          <tr class="empty-row"><td colspan="9" class="empty-cell">No active sessions</td></tr>
+          <tr class="empty-row"><td colspan="10" class="empty-cell">No active sessions</td></tr>
         </tbody>
       </table>
     </div>
@@ -2033,9 +2202,8 @@ const dashboardHTML = `<!doctype html>
   var MAX_SAMPLES = 60;
 
   var lastData = null;
-  var prevTx = 0;
-  var prevRx = 0;
-  var prevTime = 0;
+  var lastSyncSig = '';
+  var lastLocalMutationAt = 0;
   var inFlight = false;
   var failCount = 0;
   var secretVisible = false;
@@ -2473,39 +2641,78 @@ const dashboardHTML = `<!doctype html>
     window.addEventListener('resize', resizeChart);
   }
 
-  // ── Provisioning Logic ──────────────────────────────────────────────────
+  // ── Provisioning & Synced Profile Logic ─────────────────────────────────
+  function getCheckedVal(name, fallback) {
+    var checked = document.querySelector('input[name="' + name + '"]:checked');
+    return checked ? checked.value : fallback;
+  }
+
+  function setRadioGroup(name, value) {
+    if (value === undefined || value === null || value === '') return;
+    var target = String(value);
+    var radios = document.querySelectorAll('input[name="' + name + '"]');
+    for (var i = 0; i < radios.length; i++) {
+      radios[i].checked = (radios[i].value === target);
+    }
+  }
+
   function getSelectedCarriers() {
-    var checked = document.querySelector('input[name="carriers"]:checked');
-    var n = checked ? parseInt(checked.value, 10) : 4;
+    var n = parseInt(getCheckedVal('carriers', '4'), 10);
     return Number.isFinite(n) && n > 0 ? n : 4;
   }
 
   function getProvisionMode() {
-    var checked = document.querySelector('input[name="prov_mode"]:checked');
-    return checked ? checked.value : 'android';
+    return getCheckedVal('prov_mode', 'android');
+  }
+
+  function syncProfileControls(sc) {
+    if (!sc) return;
+    if (sc.cipher) setRadioGroup('cipher', sc.cipher);
+    if (sc.transport) setRadioGroup('transport', sc.transport);
+    if (sc.fingerprint) setRadioGroup('fingerprint', sc.fingerprint);
+    if (sc.padding_mode) setRadioGroup('padding_mode', sc.padding_mode);
+    if (sc.carriers) setRadioGroup('carriers', sc.carriers);
   }
 
   function renderLinks() {
     if (!lastData) return;
+    var sc = lastData.sync_config || lastData.config || {};
     var fb = document.getElementById('fallbackInput').value.trim();
     var cip = document.getElementById('cleanIpInput').value.trim();
-    var carriers = getSelectedCarriers();
+    var cipher = sc.cipher || getCheckedVal('cipher', 'xchacha20-poly1305');
+    var transport = sc.transport || getCheckedVal('transport', 'auto');
+    var fingerprint = sc.fingerprint || getCheckedVal('fingerprint', 'chrome');
+    var paddingMode = sc.padding_mode || getCheckedVal('padding_mode', 'balanced');
+    var carriers = (Number.isFinite(sc.carriers) && sc.carriers > 0) ? sc.carriers : getSelectedCarriers();
     var mode = getProvisionMode();
+
+    var summaryEl = document.getElementById('provProfileSummary');
+    if (summaryEl) {
+      summaryEl.textContent = cipher + ' · ' + transport + ' · ' + fingerprint + ' · ' + paddingMode + ' · ' + carriers + 'c';
+    }
 
     var obj = {
       psk: lastData.psk,
       primary_url: lastData.ws_url,
       carriers: carriers,
-      transport: 'auto'
+      cipher: cipher,
+      transport: transport,
+      fingerprint: fingerprint,
+      padding_mode: paddingMode
     };
     if (fb) obj.fallback_url = fb;
     if (cip) obj.cf_clean_ip = cip;
 
     rawAndroidUri = 'aether://' + b64url(JSON.stringify(obj));
 
-    var cli = './aether-client -server ' + lastData.ws_url + ' -psk "' + lastData.psk + '" -carriers ' + carriers;
-    if (fb) cli += ' -fallback ' + fb;
-    rawCliCmd = cli;
+    var cliFlags = ' -carriers ' + carriers +
+      ' -cipher ' + cipher +
+      ' -transport ' + transport +
+      ' -fingerprint ' + fingerprint +
+      ' -padding ' + paddingMode;
+    if (fb) cliFlags += ' -fallback ' + fb;
+
+    rawCliCmd = './aether-client -server ' + lastData.ws_url + ' -psk "' + lastData.psk + '"' + cliFlags;
 
     var outEl = document.getElementById('provOutput');
     var wellEl = document.getElementById('provCodeWell');
@@ -2521,15 +2728,52 @@ const dashboardHTML = `<!doctype html>
       if (secretVisible) {
         outEl.textContent = rawCliCmd;
       } else {
-        var maskedCli = './aether-client -server ' + lastData.ws_url + ' -psk "••••••••••••••••" -carriers ' + carriers;
-        if (fb) maskedCli += ' -fallback ' + fb;
-        outEl.textContent = maskedCli;
+        outEl.textContent = './aether-client -server ' + lastData.ws_url + ' -psk "••••••••••••••••"' + cliFlags;
       }
     }
   }
 
   // ── API Actions ─────────────────────────────────────────────────────────
+  async function setSyncField(field, rawVal, settingLabel) {
+    lastLocalMutationAt = Date.now();
+    var val = field === 'carriers' ? parseInt(rawVal, 10) : rawVal;
+    var payload = {};
+    payload[field] = val;
+
+    if (lastData) {
+      if (!lastData.sync_config) lastData.sync_config = {};
+      lastData.sync_config[field] = val;
+      if (lastData.config) lastData.config[field] = val;
+      renderLinks();
+    }
+
+    try {
+      var r = await fetch(base + '/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!r.ok) {
+        toast('Failed to sync ' + settingLabel, 'error');
+        poll(false);
+        return;
+      }
+      var res = await r.json();
+      if (lastData && res && res.sync_config) {
+        lastData.sync_config = res.sync_config;
+        syncProfileControls(res.sync_config);
+        renderLinks();
+      }
+      toast('Synced ' + settingLabel + ' to server & connected clients', 'ok');
+      poll(false);
+    } catch (e) {
+      toast('Network error syncing ' + settingLabel, 'error');
+      poll(false);
+    }
+  }
+
   async function setDNS(preset, customVal) {
+    lastLocalMutationAt = Date.now();
     var payload = { dns_preset: preset };
     if (preset === 'custom') payload.custom_dns = customVal;
     try {
@@ -2550,6 +2794,7 @@ const dashboardHTML = `<!doctype html>
   }
 
   async function setFlag(name, nextVal) {
+    lastLocalMutationAt = Date.now();
     var payload = {};
     payload[name] = nextVal;
     try {
@@ -2612,8 +2857,15 @@ const dashboardHTML = `<!doctype html>
   }
 
   // ── Sessions Rendering ──────────────────────────────────────────────────
+  function renderCipherPill(cipher) {
+    var c = cipher || 'xchacha20-poly1305';
+    var cls = c === 'none' ? 'cipher-pill plain' : 'cipher-pill';
+    var label = c === 'none' ? 'tls-only' : c;
+    return '<span class="' + cls + '">' + escHtml(label) + '</span>';
+  }
+
   function renderCarrierDots(count) {
-    var slots = 4;
+    var slots = count > 4 ? 6 : 4;
     var active = Math.min(slots, Math.max(0, count));
     var html = '<span class="carrier-dots"><span class="c-dots" aria-hidden="true">';
     for (var i = 0; i < slots; i++) {
@@ -2637,7 +2889,7 @@ const dashboardHTML = `<!doctype html>
     document.getElementById('sessCountPill').textContent = count + (count === 1 ? ' session' : ' sessions');
 
     if (!sessions || sessions.length === 0) {
-      tb.innerHTML = '<tr class="empty-row"><td colspan="9" class="empty-cell">No active sessions</td></tr>';
+      tb.innerHTML = '<tr class="empty-row"><td colspan="10" class="empty-cell">No active sessions</td></tr>';
       return;
     }
 
@@ -2645,6 +2897,7 @@ const dashboardHTML = `<!doctype html>
       var sid = escHtml(s.id);
       return '<tr>' +
         '<th scope="row"><span class="sess-id">' + sid + '</span></th>' +
+        '<td>' + renderCipherPill(s.cipher) + '</td>' +
         '<td>' + renderCarrierDots(s.carriers) + '</td>' +
         '<td class="mono">' + s.streams + '</td>' +
         '<td class="mono">' + s.udp_flows + '</td>' +
@@ -2669,6 +2922,7 @@ const dashboardHTML = `<!doctype html>
   async function poll(isManual) {
     if (inFlight) return;
     inFlight = true;
+    var pollStartedAt = Date.now();
     var refreshBtn = document.getElementById('btnRefresh');
     if (isManual) refreshBtn.classList.add('is-spinning');
 
@@ -2680,13 +2934,17 @@ const dashboardHTML = `<!doctype html>
       setConnState('ok', 'OPERATIONAL');
 
       var first = !lastData;
+      var sc = d.sync_config || d.config || {};
+      var staleConfig = lastLocalMutationAt > pollStartedAt;
+      if (staleConfig && lastData && lastData.sync_config) {
+        d.sync_config = lastData.sync_config;
+        sc = d.sync_config;
+      }
       lastData = d;
 
-      if (first) {
-        if (d.fallback_default && !fallbackTouched) {
-          document.getElementById('fallbackInput').value = d.fallback_default;
-        }
-        renderLinks();
+      var fbInp = document.getElementById('fallbackInput');
+      if (d.fallback_default && !fallbackTouched && document.activeElement !== fbInp) {
+        fbInp.value = d.fallback_default;
       }
 
       document.getElementById('verPill').textContent = 'v' + d.version;
@@ -2719,55 +2977,74 @@ const dashboardHTML = `<!doctype html>
         document.getElementById('tunnelPathPill').textContent = d.config.tunnel_path;
       }
 
-      // Live throughput delta & chart update
-      var now = Date.now();
-      if (prevTime > 0) {
-        var dt = Math.max(0.4, (now - prevTime) / 1000);
-        var txBps = Math.max(0, (d.total_tx_bytes - prevTx) / dt);
-        var rxBps = Math.max(0, (d.total_rx_bytes - prevRx) / dt);
-        var downMbps = (txBps * 8) / 1e6;
-        var upMbps = (rxBps * 8) / 1e6;
+      // Live throughput directly from server's smooth 3-second monotonic sliding window
+      var txBps = Number.isFinite(d.live_down_bps) ? Math.max(0, d.live_down_bps) : 0;
+      var rxBps = Number.isFinite(d.live_up_bps) ? Math.max(0, d.live_up_bps) : 0;
+      var downMbps = Number.isFinite(d.live_down_mbps) ? Math.max(0, d.live_down_mbps) : ((txBps * 8) / 1e6);
+      var upMbps = Number.isFinite(d.live_up_mbps) ? Math.max(0, d.live_up_mbps) : ((rxBps * 8) / 1e6);
 
-        downSeries.push(downMbps);
-        if (downSeries.length > MAX_SAMPLES) downSeries.shift();
-        upSeries.push(upMbps);
-        if (upSeries.length > MAX_SAMPLES) upSeries.shift();
+      downSeries.push(downMbps);
+      if (downSeries.length > MAX_SAMPLES) downSeries.shift();
+      upSeries.push(upMbps);
+      if (upSeries.length > MAX_SAMPLES) upSeries.shift();
 
-        var peak = 0;
-        for (var i = 0; i < MAX_SAMPLES; i++) {
-          var combined = downSeries[i] + upSeries[i];
-          if (combined > peak) peak = combined;
+      var peak = 0;
+      for (var i = 0; i < MAX_SAMPLES; i++) {
+        var combined = downSeries[i] + upSeries[i];
+        if (combined > peak) peak = combined;
+      }
+
+      document.getElementById('liveDownMbps').textContent = downMbps.toFixed(2);
+      document.getElementById('liveDownRate').textContent = fmtRate(txBps);
+      document.getElementById('liveUpMbps').textContent = upMbps.toFixed(2);
+      document.getElementById('liveUpRate').textContent = fmtRate(rxBps);
+      document.getElementById('livePeakMbps').textContent = peak.toFixed(2);
+      document.getElementById('liveTotalMbps').textContent = 'Combined: ' + (downMbps + upMbps).toFixed(2) + ' Mbps';
+      drawChart();
+
+      // Sync DNS, Shield & Tunnel Profile controls from server state
+      if (!staleConfig) {
+        var dnsList = sc.upstream_dns || (d.config && d.config.upstream_dns) || [];
+        var dnsStr = dnsList.join(', ');
+        document.getElementById('curDnsPill').textContent = dnsStr || 'Direct';
+
+        var presetVal = sc.dns_preset || '';
+        if (!presetVal) {
+          if (dnsStr.indexOf('94.140.') !== -1) presetVal = 'adguard';
+          else if (dnsStr.indexOf('1.1.1.1') !== -1) presetVal = 'cloudflare';
+          else if (dnsStr.indexOf('8.8.8.8') !== -1) presetVal = 'google';
+        }
+        var radios = document.querySelectorAll('input[name="dns_preset"]');
+        for (var rIdx = 0; rIdx < radios.length; rIdx++) {
+          radios[rIdx].checked = (radios[rIdx].value === presetVal);
         }
 
-        document.getElementById('liveDownMbps').textContent = downMbps.toFixed(2);
-        document.getElementById('liveDownRate').textContent = fmtRate(txBps);
-        document.getElementById('liveUpMbps').textContent = upMbps.toFixed(2);
-        document.getElementById('liveUpRate').textContent = fmtRate(rxBps);
-        document.getElementById('livePeakMbps').textContent = peak.toFixed(2);
-        document.getElementById('liveTotalMbps').textContent = 'Combined: ' + (downMbps + upMbps).toFixed(2) + ' Mbps';
-        drawChart();
+        var customDnsInp = document.getElementById('customDnsInput');
+        if (sc.custom_dns && document.activeElement !== customDnsInp) {
+          customDnsInp.value = sc.custom_dns;
+        }
+
+        document.getElementById('chkBlockDot').checked = Boolean(sc.block_dot);
+        document.getElementById('chkAdblockSni').checked = Boolean(sc.adblock_sni);
+
+        syncProfileControls(sc);
+
+        var nextSyncSig = [
+          sc.cipher || '',
+          sc.transport || '',
+          sc.fingerprint || '',
+          sc.padding_mode || '',
+          sc.carriers || '',
+          d.fallback_default || ''
+        ].join('|');
+
+        if (first || nextSyncSig !== lastSyncSig) {
+          lastSyncSig = nextSyncSig;
+          renderLinks();
+        }
+      } else if (first) {
+        renderLinks();
       }
-      prevTx = d.total_tx_bytes;
-      prevRx = d.total_rx_bytes;
-      prevTime = now;
-
-      // Sync DNS & Shield controls
-      var dnsList = (d.config && d.config.upstream_dns) ? d.config.upstream_dns : [];
-      var dnsStr = dnsList.join(', ');
-      document.getElementById('curDnsPill').textContent = dnsStr || 'Direct';
-
-      var presetVal = '';
-      if (dnsStr.indexOf('94.140.') !== -1) presetVal = 'adguard';
-      else if (dnsStr.indexOf('1.1.1.1') !== -1) presetVal = 'cloudflare';
-      else if (dnsStr.indexOf('8.8.8.8') !== -1) presetVal = 'google';
-
-      var radios = document.querySelectorAll('input[name="dns_preset"]');
-      for (var rIdx = 0; rIdx < radios.length; rIdx++) {
-        radios[rIdx].checked = (radios[rIdx].value === presetVal);
-      }
-
-      document.getElementById('chkBlockDot').checked = Boolean(d.config && d.config.block_dot);
-      document.getElementById('chkAdblockSni').checked = Boolean(d.config && d.config.adblock_sni);
 
       renderSessions(d.sessions);
       if (isManual) toast('Telemetry refreshed', 'ok');
@@ -2828,9 +3105,24 @@ const dashboardHTML = `<!doctype html>
 
   document.getElementById('cleanIpInput').addEventListener('input', renderLinks);
 
-  var carrierRadios = document.querySelectorAll('input[name="carriers"]');
-  for (var c = 0; c < carrierRadios.length; c++) {
-    carrierRadios[c].addEventListener('change', renderLinks);
+  var syncGroups = [
+    { name: 'cipher', title: 'Cipher' },
+    { name: 'transport', title: 'Transport' },
+    { name: 'fingerprint', title: 'Fingerprint' },
+    { name: 'padding_mode', title: 'Padding' },
+    { name: 'carriers', title: 'Carriers' }
+  ];
+  for (var sg = 0; sg < syncGroups.length; sg++) {
+    (function (grp) {
+      var inputs = document.querySelectorAll('input[name="' + grp.name + '"]');
+      for (var k = 0; k < inputs.length; k++) {
+        inputs[k].addEventListener('change', function (ev) {
+          if (!ev.target.checked) return;
+          var lbl = ev.target.getAttribute('data-label') || ev.target.value;
+          setSyncField(grp.name, ev.target.value, grp.title + ' (' + lbl + ')');
+        });
+      }
+    })(syncGroups[sg]);
   }
 
   var modeRadios = document.querySelectorAll('input[name="prov_mode"]');

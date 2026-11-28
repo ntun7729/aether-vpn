@@ -27,10 +27,12 @@ import (
 )
 
 type Config struct {
-	Listen   string             `json:"listen"`   // e.g. 127.0.0.1:1080 (SOCKS5 + HTTP CONNECT auto-detect)
-	PSK      string             `json:"psk"`
-	Carriers int                `json:"carriers"` // Parallel WebSocket carriers (default 3)
-	Endpoints []carrier.Endpoint `json:"endpoints"`
+	Listen      string             `json:"listen"`       // e.g. 127.0.0.1:1080 (SOCKS5 + HTTP CONNECT auto-detect)
+	PSK         string             `json:"psk"`
+	Carriers    int                `json:"carriers"`     // Parallel carriers (default 4)
+	Cipher      string             `json:"cipher"`       // xchacha20-poly1305 | aes-256-gcm | aes-128-gcm | chacha20-poly1305 | none
+	PaddingMode string             `json:"padding_mode"` // balanced | stealth | off
+	Endpoints   []carrier.Endpoint `json:"endpoints"`
 }
 
 type udpAssociation struct {
@@ -317,7 +319,10 @@ func main() {
 	listen := flag.String("listen", "", "Local SOCKS5/HTTP proxy address (overrides config)")
 	serverURL := flag.String("server", "", "Primary server URL (e.g. wss://app.up.railway.app/ws/sync)")
 	fallbackURL := flag.String("fallback", "", "Optional fallback URL (e.g. Render or CF Worker)")
-	transport := flag.String("transport", "auto", "Carrier transport: auto, ws, or h2")
+	transport := flag.String("transport", "auto", "Carrier transport: auto, ws, xhttp, grpc, or h2")
+	cipherName := flag.String("cipher", "xchacha20-poly1305", "AEAD cipher: xchacha20-poly1305, aes-256-gcm, aes-128-gcm, chacha20-poly1305, or none")
+	fingerprint := flag.String("fingerprint", "chrome", "uTLS fingerprint: chrome, firefox, safari, ios, or randomized")
+	paddingMode := flag.String("padding", "balanced", "Anti-DPI padding: balanced, stealth, or off")
 	psk := flag.String("psk", "", "Pre-shared secret key")
 	carriers := flag.Int("carriers", 4, "Number of parallel carriers")
 	bindIface := flag.String("iface", "", "Optional Linux network interface (e.g. eth0) to bypass local TUN VPN")
@@ -338,15 +343,17 @@ func main() {
 		}
 	} else {
 		cfg = Config{
-			Listen:   *listen,
-			PSK:      *psk,
-			Carriers: *carriers,
+			Listen:      *listen,
+			PSK:         *psk,
+			Carriers:    *carriers,
+			Cipher:      *cipherName,
+			PaddingMode: *paddingMode,
 		}
 		if *serverURL != "" {
-			cfg.Endpoints = append(cfg.Endpoints, carrier.Endpoint{Name: "primary", URL: *serverURL, Transport: *transport, Priority: 0})
+			cfg.Endpoints = append(cfg.Endpoints, carrier.Endpoint{Name: "primary", URL: *serverURL, Transport: *transport, Fingerprint: *fingerprint, Priority: 0})
 		}
 		if *fallbackURL != "" {
-			cfg.Endpoints = append(cfg.Endpoints, carrier.Endpoint{Name: "fallback", URL: *fallbackURL, Transport: *transport, Priority: 1})
+			cfg.Endpoints = append(cfg.Endpoints, carrier.Endpoint{Name: "fallback", URL: *fallbackURL, Transport: *transport, Fingerprint: *fingerprint, Priority: 1})
 		}
 	}
 	if *bindIface != "" {
@@ -382,10 +389,26 @@ func main() {
 	}
 
 	var proxy *ProxyServer
+	var mgr *session.ClientManager
 	mgr, err := session.NewClientManager(session.ClientConfig{
-		PSK:       cfg.PSK,
-		Endpoints: cfg.Endpoints,
-		Carriers:  cfg.Carriers,
+		PSK:         cfg.PSK,
+		Endpoints:   cfg.Endpoints,
+		Carriers:    cfg.Carriers,
+		Cipher:      cfg.Cipher,
+		PaddingMode: cfg.PaddingMode,
+		OnConfigSync: func(payload []byte) {
+			var sc struct {
+				PaddingMode string `json:"padding_mode"`
+				DNSPreset   string `json:"dns_preset"`
+				Cipher      string `json:"cipher"`
+			}
+			if json.Unmarshal(payload, &sc) == nil {
+				if mgr != nil && sc.PaddingMode != "" {
+					mgr.SetPaddingMode(sc.PaddingMode)
+				}
+				log.Printf("[aether] synced server config (dns=%s cipher=%s padding=%s)", sc.DNSPreset, sc.Cipher, sc.PaddingMode)
+			}
+		},
 	}, func(flowID uint32, addr proto.Address, payload []byte) {
 		if proxy != nil {
 			proxy.OnRemoteUDP(flowID, addr, payload)

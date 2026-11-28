@@ -8,7 +8,9 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,9 +48,11 @@ var udpBufPool = sync.Pool{
 }
 
 type MobileConfig struct {
-	PSK       string             `json:"psk"`
-	Carriers  int                `json:"carriers"`
-	Endpoints []carrier.Endpoint `json:"endpoints"`
+	PSK         string             `json:"psk"`
+	Carriers    int                `json:"carriers"`
+	Cipher      string             `json:"cipher"`
+	PaddingMode string             `json:"padding_mode"`
+	Endpoints   []carrier.Endpoint `json:"endpoints"`
 }
 
 type udpFlowEntry struct {
@@ -58,15 +62,18 @@ type udpFlowEntry struct {
 }
 
 type vpnInstance struct {
-	mgr      *session.ClientManager
-	tunFile  *os.File
-	ipStack  *stack.Stack
-	linkEP   *channel.Endpoint
-	dnsCache *adns.UDPCache
-	cancel   context.CancelFunc
-	udpMu    sync.RWMutex
-	udpFlows map[uint32]*udpFlowEntry
-	nextFlow atomic.Uint32
+	mgr       *session.ClientManager
+	tunFile   *os.File
+	ipStack   *stack.Stack
+	linkEP    *channel.Endpoint
+	dnsCache  *adns.UDPCache
+	cancel    context.CancelFunc
+	udpMu     sync.RWMutex
+	udpFlows  map[uint32]*udpFlowEntry
+	nextFlow  atomic.Uint32
+	syncMu    sync.RWMutex
+	syncJSON  string
+	syncSeq   atomic.Int64
 }
 
 var (
@@ -99,9 +106,17 @@ func StartVPN(tunFd int, mtu int, configJSON string) error {
 	}
 
 	mgr, err := session.NewClientManager(session.ClientConfig{
-		PSK:       cfg.PSK,
-		Endpoints: cfg.Endpoints,
-		Carriers:  cfg.Carriers,
+		PSK:         cfg.PSK,
+		Endpoints:   cfg.Endpoints,
+		Carriers:    cfg.Carriers,
+		Cipher:      cfg.Cipher,
+		PaddingMode: cfg.PaddingMode,
+		OnConfigSync: func(payload []byte) {
+			inst.syncMu.Lock()
+			inst.syncJSON = string(payload)
+			inst.syncMu.Unlock()
+			inst.syncSeq.Add(1)
+		},
 	}, func(flowID uint32, addr proto.Address, payload []byte) {
 		inst.udpMu.RLock()
 		entry, ok := inst.udpFlows[flowID]
@@ -376,6 +391,77 @@ func GetStatsJSON() string {
 	}
 	b, _ := json.Marshal(inst.mgr.Stats())
 	return string(b)
+}
+
+// GetSyncedConfigSeq returns a monotonically increasing sequence number whenever the server pushes a config update.
+func GetSyncedConfigSeq() int64 {
+	instMu.Lock()
+	inst := active
+	instMu.Unlock()
+	if inst == nil {
+		return 0
+	}
+	return inst.syncSeq.Load()
+}
+
+// GetSyncedConfigJSON returns the latest JSON config pushed from the Railway server over the encrypted tunnel.
+func GetSyncedConfigJSON() string {
+	instMu.Lock()
+	inst := active
+	instMu.Unlock()
+	if inst == nil {
+		return ""
+	}
+	inst.syncMu.RLock()
+	defer inst.syncMu.RUnlock()
+	return inst.syncJSON
+}
+
+// PushConfigJSON sends client settings over the encrypted tunnel to Railway so the server updates immediately.
+func PushConfigJSON(configJSON string) error {
+	instMu.Lock()
+	inst := active
+	instMu.Unlock()
+	if inst == nil || inst.mgr == nil {
+		return errors.New("vpn is not running")
+	}
+	var p struct {
+		PaddingMode string `json:"padding_mode"`
+	}
+	if err := json.Unmarshal([]byte(configJSON), &p); err == nil && p.PaddingMode != "" {
+		inst.mgr.SetPaddingMode(p.PaddingMode)
+	}
+	return inst.mgr.SendConfigSync([]byte(configJSON))
+}
+
+// PingEndpoint probes an endpoint's /health URL and returns RTT in milliseconds (or -1 on error).
+func PingEndpoint(rawURL string) int64 {
+	u := strings.TrimSpace(rawURL)
+	if u == "" {
+		return -1
+	}
+	u = strings.Replace(u, "wss://", "https://", 1)
+	u = strings.Replace(u, "ws://", "http://", 1)
+	if idx := strings.Index(u, "://"); idx > 0 {
+		rest := u[idx+3:]
+		if slash := strings.IndexByte(rest, '/'); slash > 0 {
+			u = u[:idx+3+slash] + "/health"
+		} else {
+			u += "/health"
+		}
+	}
+	hc := &http.Client{Timeout: 5 * time.Second}
+	t0 := time.Now()
+	resp, err := hc.Get(u)
+	if err != nil {
+		return -1
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode >= 500 {
+		return -1
+	}
+	return time.Since(t0).Milliseconds()
 }
 
 var _ net.Conn

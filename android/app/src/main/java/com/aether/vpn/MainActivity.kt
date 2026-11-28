@@ -5,11 +5,17 @@ import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Canvas as AndroidCanvas
 import android.net.VpnService
 import android.os.Bundle
+import android.os.SystemClock
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
@@ -27,6 +33,7 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -46,6 +53,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -71,6 +80,8 @@ import androidx.compose.runtime.mutableDoubleStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -80,10 +91,12 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
@@ -96,9 +109,17 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.net.HttpURLConnection
 import java.net.URI
+import java.net.URL
+import java.net.URLEncoder
 import java.util.Locale
 import kotlin.math.PI
 import kotlin.math.cos
@@ -114,6 +135,7 @@ private val BorderHairline = Color(0xFF242429)
 private val TextPrimary = Color(0xFFFAFAFA)
 private val TextSecondary = Color(0xFFA1A1AA)
 private val TextDim = Color(0xFF71717A)
+private val CoolSilver = Color(0xFFE4E4E7)
 private val SignalEmerald = Color(0xFF10B981)
 private val SignalEmeraldBright = Color(0xFF34D399)
 private val SignalAmber = Color(0xFFF59E0B)
@@ -193,6 +215,15 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private enum class MenuRoute(val title: String) {
+    ROUTES("Server & Routes"),
+    PROTOCOL("Protocol & Transport"),
+    ENCRYPTION("Encryption & Stealth"),
+    DNS_SHIELD("DNS & Shield"),
+    BYPASS_APPS("Split Tunneling & Apps"),
+    ACCESS_KEY("Access Key & Engine")
+}
+
 private data class LiveTelemetry(
     val running: Boolean = false,
     val endpoint: String = "Disconnected",
@@ -202,8 +233,16 @@ private data class LiveTelemetry(
     val txBytes: Long = 0,
     val rxBytes: Long = 0,
     val failovers: Long = 0,
-    val liveMbps: Double = 0.0,
+    val downMbps: Double = 0.0,
+    val upMbps: Double = 0.0,
     val connectedSec: Long = 0
+)
+
+private data class InstalledAppItem(
+    val packageName: String,
+    val label: String,
+    val isSystem: Boolean,
+    val icon: ImageBitmap?
 )
 
 private fun fmtBytes(b: Long): String = when {
@@ -229,10 +268,138 @@ private fun extractHost(url: String): String {
     if (trimmed.isEmpty()) return "Not configured"
     return try {
         val parsed = URI(trimmed).host
-        if (!parsed.isNullOrBlank()) parsed else trimmed.removePrefix("wss://").removePrefix("https://").substringBefore("/")
+        if (!parsed.isNullOrBlank()) {
+            parsed
+        } else {
+            trimmed.removePrefix("wss://").removePrefix("ws://").removePrefix("https://").removePrefix("http://").substringBefore("/")
+        }
     } catch (_: Exception) {
-        trimmed.removePrefix("wss://").removePrefix("https://").substringBefore("/")
+        trimmed.removePrefix("wss://").removePrefix("ws://").removePrefix("https://").removePrefix("http://").substringBefore("/")
     }
+}
+
+private fun transportLabel(transport: String): String = when (transport.lowercase(Locale.US)) {
+    "ws" -> "WebSocket"
+    "xhttp" -> "XHTTP"
+    "grpc" -> "gRPC"
+    "h2" -> "HTTP/2"
+    else -> "AUTO"
+}
+
+private fun shortCipherName(cipher: String): String = when (cipher.lowercase(Locale.US)) {
+    "aes-256-gcm" -> "AES-256"
+    "aes-128-gcm" -> "AES-128"
+    "chacha20-poly1305" -> "ChaCha20"
+    "none" -> "TLS-Only"
+    else -> "XChaCha20"
+}
+
+private fun fullCipherName(cipher: String): String = when (cipher.lowercase(Locale.US)) {
+    "aes-256-gcm" -> "AES-256-GCM"
+    "aes-128-gcm" -> "AES-128-GCM"
+    "chacha20-poly1305" -> "ChaCha20-Poly1305"
+    "none" -> "TLS-Only (VLESS)"
+    else -> "XChaCha20-Poly1305"
+}
+
+private fun fingerprintLabel(fp: String): String = when (fp.lowercase(Locale.US)) {
+    "firefox" -> "Firefox"
+    "safari" -> "Safari"
+    "ios" -> "iOS"
+    "randomized", "random" -> "Random"
+    else -> "Chrome"
+}
+
+private fun paddingLabel(mode: String): String = when (mode.lowercase(Locale.US)) {
+    "stealth" -> "Stealth"
+    "off" -> "Off"
+    else -> "Balanced"
+}
+
+private fun dnsLabel(preset: String): String = when (preset.lowercase(Locale.US)) {
+    "cloudflare" -> "Cloudflare"
+    "google" -> "Google"
+    "custom" -> "Custom"
+    else -> "AdGuard"
+}
+
+private fun buildAdminApiUrl(endpointUrl: String, psk: String, apiPath: String): String? {
+    val cleanPsk = psk.trim()
+    val raw = endpointUrl.trim()
+    if (cleanPsk.isEmpty() || raw.isEmpty()) return null
+    val httpUrl = when {
+        raw.startsWith("wss://", ignoreCase = true) -> "https://" + raw.substring(6)
+        raw.startsWith("ws://", ignoreCase = true) -> "http://" + raw.substring(5)
+        raw.startsWith("https://", ignoreCase = true) || raw.startsWith("http://", ignoreCase = true) -> raw
+        else -> "https://$raw"
+    }
+    return try {
+        val uri = URI(httpUrl)
+        val scheme = uri.scheme ?: "https"
+        val authority = uri.rawAuthority ?: return null
+        val encodedPsk = URLEncoder.encode(cleanPsk, "UTF-8").replace("+", "%20")
+        "$scheme://$authority/$encodedPsk$apiPath"
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private fun postConfigOverHttps(cfg: AetherConfig): Boolean {
+    val candidates = listOf(cfg.primaryUrl, cfg.fallbackUrl).filter { it.isNotBlank() }
+    val payload = cfg.toSyncPatchJson().toByteArray(Charsets.UTF_8)
+    for (ep in candidates) {
+        val urlStr = buildAdminApiUrl(ep, cfg.psk, "/api/config") ?: continue
+        var conn: HttpURLConnection? = null
+        try {
+            conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 5000
+                readTimeout = 5000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                setRequestProperty("Accept", "application/json")
+            }
+            conn.outputStream.use { it.write(payload) }
+            val code = conn.responseCode
+            if (code in 200..299) {
+                return true
+            }
+        } catch (_: Throwable) {
+        } finally {
+            try {
+                conn?.disconnect()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+    return false
+}
+
+private fun fetchSyncOverHttps(cfg: AetherConfig): String? {
+    val candidates = listOf(cfg.primaryUrl, cfg.fallbackUrl).filter { it.isNotBlank() }
+    for (ep in candidates) {
+        val urlStr = buildAdminApiUrl(ep, cfg.psk, "/api/sync") ?: continue
+        var conn: HttpURLConnection? = null
+        try {
+            conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 5000
+                readTimeout = 5000
+                setRequestProperty("Accept", "application/json")
+            }
+            val code = conn.responseCode
+            if (code in 200..299) {
+                return conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            }
+        } catch (_: Throwable) {
+        } finally {
+            try {
+                conn?.disconnect()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+    return null
 }
 
 @Composable
@@ -243,37 +410,93 @@ private fun AetherApp(
     onDisconnect: () -> Unit
 ) {
     val context = LocalContext.current
-    var tab by remember { mutableIntStateOf(0) } // 0=Tunnel, 1=Routes, 2=Settings
+    val scope = rememberCoroutineScope()
 
-    var psk by remember { mutableStateOf(initial.psk) }
-    var primaryUrl by remember { mutableStateOf(initial.primaryUrl) }
-    var fallbackUrl by remember { mutableStateOf(initial.fallbackUrl) }
-    var cfCleanIp by remember { mutableStateOf(initial.cfCleanIp) }
-    var transport by remember { mutableStateOf(initial.transport.ifBlank { "auto" }) }
-    var carriers by remember { mutableIntStateOf(initial.carriers.coerceIn(1, 6)) }
-    var bypassLan by remember { mutableStateOf(initial.bypassLan) }
-    var bypassApps by remember { mutableStateOf(initial.bypassApps) }
+    var tab by remember { mutableIntStateOf(0) } // 0 = Tunnel, 1 = Menu
+    var menuSubPage by remember { mutableStateOf<MenuRoute?>(null) }
+
+    var cfg by remember { mutableStateOf(initial) }
+    val latestCfg by rememberUpdatedState(cfg)
 
     var telemetry by remember { mutableStateOf(LiveTelemetry()) }
-    var speedHistory by remember { mutableStateOf(List(30) { 0f }) }
+    var downHistory by remember { mutableStateOf(List(30) { 0f }) }
+    var upHistory by remember { mutableStateOf(List(30) { 0f }) }
     var peakMbps by remember { mutableDoubleStateOf(0.0) }
     var errorText by remember { mutableStateOf<String?>(null) }
+    var isReconnecting by remember { mutableStateOf(false) }
 
-    fun currentConfig() = AetherConfig(
-        psk = psk,
-        primaryUrl = primaryUrl,
-        fallbackUrl = fallbackUrl,
-        cfCleanIp = cfCleanIp,
-        transport = transport,
-        carriers = carriers,
-        bypassLan = bypassLan,
-        bypassApps = bypassApps
-    )
+    fun reconnectTunnel(nextCfg: AetherConfig) {
+        if (isReconnecting) return
+        isReconnecting = true
+        scope.launch {
+            try {
+                onSave(nextCfg)
+                onDisconnect()
+                delay(400)
+                onConnect(nextCfg)
+            } finally {
+                delay(300)
+                isReconnecting = false
+            }
+        }
+    }
 
-    // Poll Go core telemetry every 1s & maintain rolling 30-sample throughput sparkline
+    fun syncToRailway(newCfg: AetherConfig, reconnectIfNeeded: Boolean) {
+        val stamped = newCfg.copy(configUpdatedAt = System.currentTimeMillis())
+        cfg = stamped
+        onSave(stamped)
+
+        val wasRunning = telemetry.running
+        scope.launch {
+            val synced = if (stamped.psk.isNotBlank()) {
+                withContext(Dispatchers.IO) {
+                    val runningNow = try {
+                        Aethermobile.isRunning()
+                    } catch (_: Throwable) {
+                        false
+                    }
+                    var pushed = false
+                    if (runningNow) {
+                        pushed = try {
+                            Aethermobile.pushConfigJSON(stamped.toSyncPatchJson())
+                            true
+                        } catch (_: Throwable) {
+                            false
+                        }
+                    }
+                    if (pushed) true else postConfigOverHttps(stamped)
+                }
+            } else {
+                false
+            }
+
+            Toast.makeText(
+                context,
+                if (synced) "Saved & synced with Railway" else "Saved locally",
+                Toast.LENGTH_SHORT
+            ).show()
+
+            if (reconnectIfNeeded && wasRunning) {
+                reconnectTunnel(stamped)
+            }
+        }
+    }
+
+    // System back inside a Menu sub-screen returns cleanly to the Menu Hub
+    BackHandler(enabled = tab == 1 && menuSubPage != null) {
+        menuSubPage = null
+    }
+
+    // 1-second telemetry & live bidirectional Railway sync loop
     LaunchedEffect(Unit) {
-        var prevTotal = 0L
-        var startMs = 0L
+        var prevTx = 0L
+        var prevRx = 0L
+        var prevElapsedMs = 0L
+        var startElapsedMs = 0L
+        var smoothDown = 0.0
+        var smoothUp = 0.0
+        var lastSyncSeq = 0L
+
         while (true) {
             val isRun = try {
                 Aethermobile.isRunning()
@@ -281,18 +504,37 @@ private fun AetherApp(
                 false
             }
             errorText = AetherVpnService.lastError
+
             if (isRun) {
-                if (startMs == 0L) startMs = System.currentTimeMillis()
+                val nowMs = SystemClock.elapsedRealtime()
+                if (startElapsedMs == 0L) startElapsedMs = nowMs
+
                 try {
                     val j = JSONObject(Aethermobile.getStatsJSON())
                     val tx = j.optLong("tx_bytes")
                     val rx = j.optLong("rx_bytes")
-                    val tot = tx + rx
-                    val delta = if (prevTotal > 0 && tot >= prevTotal) tot - prevTotal else 0L
-                    prevTotal = tot
-                    val mbps = (delta * 8.0) / 1_000_000.0
-                    if (mbps > peakMbps) peakMbps = mbps
-                    speedHistory = speedHistory.drop(1) + mbps.toFloat()
+
+                    val dtSec = if (prevElapsedMs > 0L) (nowMs - prevElapsedMs) / 1000.0 else 0.0
+                    if (prevElapsedMs > 0L && dtSec in 0.4..2.5) {
+                        val rawDownMbps = ((rx - prevRx).coerceAtLeast(0L) * 8.0) / (dtSec * 1_000_000.0)
+                        val rawUpMbps = ((tx - prevTx).coerceAtLeast(0L) * 8.0) / (dtSec * 1_000_000.0)
+                        smoothDown = 0.65 * rawDownMbps + 0.35 * smoothDown
+                        smoothUp = 0.65 * rawUpMbps + 0.35 * smoothUp
+                    } else if (prevElapsedMs > 0L && dtSec > 2.5) {
+                        // Discard background-resume spike bursts when dtSec > 2.5s
+                        smoothDown *= 0.35
+                        smoothUp *= 0.35
+                    }
+                    prevTx = tx
+                    prevRx = rx
+                    prevElapsedMs = nowMs
+
+                    val samplePeak = max(smoothDown, smoothUp)
+                    if (samplePeak > peakMbps) peakMbps = samplePeak
+
+                    downHistory = downHistory.drop(1) + smoothDown.toFloat()
+                    upHistory = upHistory.drop(1) + smoothUp.toFloat()
+
                     telemetry = LiveTelemetry(
                         running = true,
                         endpoint = j.optString("endpoint", "connected"),
@@ -302,26 +544,63 @@ private fun AetherApp(
                         txBytes = tx,
                         rxBytes = rx,
                         failovers = j.optLong("failovers"),
-                        liveMbps = mbps,
-                        connectedSec = (System.currentTimeMillis() - startMs) / 1000L
+                        downMbps = smoothDown,
+                        upMbps = smoothUp,
+                        connectedSec = ((nowMs - startElapsedMs) / 1000L).coerceAtLeast(0L)
                     )
                 } catch (_: Throwable) {
                     telemetry = telemetry.copy(running = true)
                 }
+
+                // Auto-apply live config updates pushed from Railway over the encrypted tunnel
+                val seq = try {
+                    Aethermobile.getSyncedConfigSeq()
+                } catch (_: Throwable) {
+                    0L
+                }
+                if (seq > lastSyncSeq) {
+                    lastSyncSeq = seq
+                    val current = latestCfg
+                    if (current.autoSync) {
+                        val rawSync = try {
+                            Aethermobile.getSyncedConfigJSON()
+                        } catch (_: Throwable) {
+                            ""
+                        }
+                        if (rawSync.isNotBlank()) {
+                            val (merged, needsReconnect) = current.mergeFromServerSync(rawSync)
+                            if (merged != current) {
+                                cfg = merged
+                                onSave(merged)
+                                Toast.makeText(context, "Synced settings from Railway", Toast.LENGTH_SHORT).show()
+                                if (needsReconnect) {
+                                    reconnectTunnel(merged)
+                                }
+                            }
+                        }
+                    }
+                }
             } else {
-                startMs = 0L
-                prevTotal = 0L
+                prevTx = 0L
+                prevRx = 0L
+                prevElapsedMs = 0L
+                startElapsedMs = 0L
+                smoothDown = 0.0
+                smoothUp = 0.0
+                lastSyncSeq = 0L
                 if (peakMbps != 0.0) peakMbps = 0.0
-                if (speedHistory.any { it > 0f }) speedHistory = List(30) { 0f }
+                if (downHistory.any { it > 0f }) downHistory = List(30) { 0f }
+                if (upHistory.any { it > 0f }) upHistory = List(30) { 0f }
                 telemetry = LiveTelemetry(running = false)
             }
+
             delay(1000)
         }
     }
 
     val ambientGlowColor by animateColorAsState(
         targetValue = if (telemetry.running) {
-            SignalEmerald.copy(alpha = if (tab == 0) 0.14f else 0.08f)
+            SignalEmerald.copy(alpha = if (tab == 0) 0.14f else 0.07f)
         } else {
             TextDim.copy(alpha = if (tab == 0) 0.08f else 0.04f)
         },
@@ -339,23 +618,22 @@ private fun AetherApp(
                 .padding(innerPad)
                 .background(BgCarbon)
         ) {
-            // Ambient top radial glow behind the hero instrument
+            // Ambient radial glow behind the hero dial / header
             Canvas(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(380.dp)
+                    .height(360.dp)
                     .align(Alignment.TopCenter)
             ) {
                 drawRect(
                     brush = Brush.radialGradient(
                         colors = listOf(ambientGlowColor, Color.Transparent),
-                        center = Offset(size.width * 0.5f, size.height * 0.42f),
+                        center = Offset(size.width * 0.5f, size.height * 0.40f),
                         radius = size.width * 0.78f
                     )
                 )
             }
 
-            // Main vertical scaffold: pinned Top Bar + Animated tab body
             Column(
                 modifier = Modifier
                     .fillMaxSize()
@@ -363,113 +641,219 @@ private fun AetherApp(
             ) {
                 TopBrandBar(running = telemetry.running)
 
+                // Pinned Back Bar for Menu Sub-Screens
+                if (tab == 1 && menuSubPage != null) {
+                    SubPageTopBar(
+                        title = menuSubPage!!.title,
+                        onBack = { menuSubPage = null }
+                    )
+                }
+
                 AnimatedContent(
-                    targetState = tab,
+                    targetState = Pair(tab, menuSubPage),
                     transitionSpec = {
-                        fadeIn(animationSpec = tween(180)) togetherWith fadeOut(animationSpec = tween(140))
+                        fadeIn(animationSpec = tween(160)) togetherWith fadeOut(animationSpec = tween(120))
                     },
                     modifier = Modifier.weight(1f),
-                    label = "tabContent"
-                ) { activeTab ->
-                    Column(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .verticalScroll(rememberScrollState())
-                            .padding(horizontal = 20.dp)
-                    ) {
-                        Spacer(Modifier.height(6.dp))
-                        when (activeTab) {
-                            0 -> TunnelTab(
-                                telemetry = telemetry,
-                                speedHistory = speedHistory,
-                                peakMbps = peakMbps,
-                                targetCarriers = carriers,
-                                errorText = errorText,
-                                onToggle = {
-                                    val cfg = currentConfig()
-                                    if (telemetry.running) onDisconnect() else onConnect(cfg)
-                                }
-                            )
-                            1 -> RoutesTab(
-                                primaryUrl = primaryUrl,
-                                onPrimaryChange = { primaryUrl = it },
-                                fallbackUrl = fallbackUrl,
-                                onFallbackChange = { fallbackUrl = it },
-                                cfCleanIp = cfCleanIp,
-                                onCleanIpChange = { cfCleanIp = it },
-                                transport = transport,
-                                onTransportChange = { transport = it },
-                                carriers = carriers,
-                                onCarriersChange = { carriers = it.coerceIn(1, 6) },
-                                onSwapRoutes = {
-                                    val oldPrimary = primaryUrl
-                                    primaryUrl = fallbackUrl
-                                    fallbackUrl = oldPrimary
-                                    onSave(currentConfig())
-                                    Toast.makeText(context, "Swapped Primary & Fallback routes", Toast.LENGTH_SHORT).show()
-                                },
-                                onImport = {
-                                    val cm = context.getSystemService(ClipboardManager::class.java)
-                                    val clip = cm?.primaryClip?.getItemAt(0)?.text?.toString() ?: ""
-                                    val imported = AetherConfig.fromShareUri(clip, currentConfig())
-                                    if (imported != null) {
-                                        psk = imported.psk
-                                        primaryUrl = imported.primaryUrl
-                                        fallbackUrl = imported.fallbackUrl
-                                        cfCleanIp = imported.cfCleanIp
-                                        transport = imported.transport
-                                        carriers = imported.carriers.coerceIn(1, 6)
-                                        onSave(imported)
-                                        Toast.makeText(context, "Imported aether:// config", Toast.LENGTH_SHORT).show()
-                                    } else {
-                                        Toast.makeText(context, "Copy an aether:// link first", Toast.LENGTH_SHORT).show()
+                    label = "screenTransition"
+                ) { (activeTab, activeSub) ->
+                    when {
+                        activeTab == 0 -> {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .verticalScroll(rememberScrollState())
+                                    .padding(horizontal = 20.dp)
+                            ) {
+                                Spacer(Modifier.height(2.dp))
+                                TunnelTab(
+                                    cfg = cfg,
+                                    telemetry = telemetry,
+                                    downHistory = downHistory,
+                                    upHistory = upHistory,
+                                    peakMbps = peakMbps,
+                                    errorText = errorText,
+                                    onToggle = {
+                                        if (telemetry.running) onDisconnect() else onConnect(cfg)
                                     }
+                                )
+                                Spacer(Modifier.height(98.dp))
+                                Spacer(Modifier.navigationBarsPadding())
+                            }
+                        }
+
+                        activeSub == null -> {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .verticalScroll(rememberScrollState())
+                                    .padding(horizontal = 20.dp)
+                            ) {
+                                Spacer(Modifier.height(4.dp))
+                                MenuHubTab(
+                                    cfg = cfg,
+                                    onOpen = { menuSubPage = it }
+                                )
+                                Spacer(Modifier.height(98.dp))
+                                Spacer(Modifier.navigationBarsPadding())
+                            }
+                        }
+
+                        activeSub == MenuRoute.BYPASS_APPS -> {
+                            // Dedicated non-scrollable root so LazyColumn scrolls at 120 FPS
+                            BypassAppsSubScreen(
+                                cfg = cfg,
+                                running = telemetry.running,
+                                onUpdateBypass = { updated ->
+                                    cfg = updated
+                                    onSave(updated)
                                 },
-                                onCopy = {
-                                    val uri = currentConfig().toShareUri()
-                                    val cm = context.getSystemService(ClipboardManager::class.java)
-                                    cm?.setPrimaryClip(ClipData.newPlainText("AetherVPN", uri))
-                                    Toast.makeText(context, "Copied aether:// share link", Toast.LENGTH_SHORT).show()
+                                onReconnectNow = { updated ->
+                                    reconnectTunnel(updated)
                                 },
-                                onSave = {
-                                    onSave(currentConfig())
-                                    Toast.makeText(context, "Routes saved", Toast.LENGTH_SHORT).show()
-                                }
-                            )
-                            2 -> SettingsTab(
-                                psk = psk,
-                                onPskChange = { psk = it },
-                                onCopyPsk = {
-                                    if (psk.isBlank()) {
-                                        Toast.makeText(context, "Secret key is empty", Toast.LENGTH_SHORT).show()
-                                    } else {
-                                        val cm = context.getSystemService(ClipboardManager::class.java)
-                                        cm?.setPrimaryClip(ClipData.newPlainText("AETHER_PSK", psk.trim()))
-                                        Toast.makeText(context, "Copied AETHER_PSK", Toast.LENGTH_SHORT).show()
-                                    }
-                                },
-                                bypassLan = bypassLan,
-                                onBypassLanChange = { bypassLan = it },
-                                bypassApps = bypassApps,
-                                onBypassAppsChange = { bypassApps = it },
-                                onSave = {
-                                    onSave(currentConfig())
-                                    Toast.makeText(context, "Settings saved", Toast.LENGTH_SHORT).show()
-                                }
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(horizontal = 20.dp)
                             )
                         }
-                        // Ensure floating pill dock never obscures bottom cards or save buttons
-                        Spacer(Modifier.height(104.dp))
-                        Spacer(Modifier.navigationBarsPadding())
+
+                        else -> {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .verticalScroll(rememberScrollState())
+                                    .padding(horizontal = 20.dp)
+                            ) {
+                                Spacer(Modifier.height(6.dp))
+                                when (activeSub) {
+                                    MenuRoute.ROUTES -> RoutesSubScreen(
+                                        cfg = cfg,
+                                        onImport = {
+                                            val cm = context.getSystemService(ClipboardManager::class.java)
+                                            val clip = cm?.primaryClip?.getItemAt(0)?.text?.toString() ?: ""
+                                            val imported = AetherConfig.fromShareUri(clip, cfg)
+                                            if (imported != null) {
+                                                val needsReconnect = imported.primaryUrl != cfg.primaryUrl ||
+                                                    imported.fallbackUrl != cfg.fallbackUrl ||
+                                                    imported.cfCleanIp != cfg.cfCleanIp ||
+                                                    imported.cipher != cfg.cipher ||
+                                                    imported.transport != cfg.transport ||
+                                                    imported.fingerprint != cfg.fingerprint ||
+                                                    imported.carriers != cfg.carriers ||
+                                                    imported.psk != cfg.psk
+                                                cfg = imported
+                                                onSave(imported)
+                                                Toast.makeText(context, "Imported aether:// config", Toast.LENGTH_SHORT).show()
+                                                if (needsReconnect && telemetry.running) {
+                                                    reconnectTunnel(imported)
+                                                }
+                                            } else {
+                                                Toast.makeText(context, "Copy an aether:// link first", Toast.LENGTH_SHORT).show()
+                                            }
+                                        },
+                                        onCopy = {
+                                            val uri = cfg.toShareUri()
+                                            val cm = context.getSystemService(ClipboardManager::class.java)
+                                            cm?.setPrimaryClip(ClipData.newPlainText("AetherVPN", uri))
+                                            Toast.makeText(context, "Copied aether:// share link", Toast.LENGTH_SHORT).show()
+                                        },
+                                        onSwap = { swapped ->
+                                            syncToRailway(swapped, reconnectIfNeeded = true)
+                                        },
+                                        onSaveAndSync = { updated ->
+                                            val reconnect = updated.primaryUrl != cfg.primaryUrl ||
+                                                updated.fallbackUrl != cfg.fallbackUrl ||
+                                                updated.cfCleanIp != cfg.cfCleanIp
+                                            syncToRailway(updated, reconnectIfNeeded = reconnect)
+                                        }
+                                    )
+
+                                    MenuRoute.PROTOCOL -> ProtocolSubScreen(
+                                        cfg = cfg,
+                                        onApplyAndSync = { updated ->
+                                            val reconnect = updated.transport != cfg.transport ||
+                                                updated.carriers != cfg.carriers
+                                            syncToRailway(updated, reconnectIfNeeded = reconnect)
+                                        }
+                                    )
+
+                                    MenuRoute.ENCRYPTION -> EncryptionSubScreen(
+                                        cfg = cfg,
+                                        onApplyAndSync = { updated ->
+                                            val reconnect = updated.cipher != cfg.cipher ||
+                                                updated.fingerprint != cfg.fingerprint
+                                            syncToRailway(updated, reconnectIfNeeded = reconnect)
+                                        }
+                                    )
+
+                                    MenuRoute.DNS_SHIELD -> DnsShieldSubScreen(
+                                        cfg = cfg,
+                                        onSyncToRailway = { updated ->
+                                            syncToRailway(updated, reconnectIfNeeded = false)
+                                        },
+                                        onPullFromRailway = { onDone ->
+                                            scope.launch {
+                                                if (cfg.psk.isBlank()) {
+                                                    Toast.makeText(context, "Set AETHER_PSK first", Toast.LENGTH_SHORT).show()
+                                                    onDone()
+                                                    return@launch
+                                                }
+                                                val raw = withContext(Dispatchers.IO) {
+                                                    fetchSyncOverHttps(cfg)
+                                                }
+                                                if (raw != null && raw.isNotBlank()) {
+                                                    val (merged, needsReconnect) = cfg.mergeFromServerSync(raw)
+                                                    cfg = merged
+                                                    onSave(merged)
+                                                    Toast.makeText(context, "Pulled settings from Railway", Toast.LENGTH_SHORT).show()
+                                                    if (needsReconnect && telemetry.running) {
+                                                        reconnectTunnel(merged)
+                                                    }
+                                                } else {
+                                                    Toast.makeText(context, "Could not reach Railway (check URL & PSK)", Toast.LENGTH_SHORT).show()
+                                                }
+                                                onDone()
+                                            }
+                                        }
+                                    )
+
+                                    MenuRoute.ACCESS_KEY -> AccessKeySubScreen(
+                                        cfg = cfg,
+                                        onCopyPsk = { keyVal ->
+                                            if (keyVal.isBlank()) {
+                                                Toast.makeText(context, "Secret key is empty", Toast.LENGTH_SHORT).show()
+                                            } else {
+                                                val cm = context.getSystemService(ClipboardManager::class.java)
+                                                cm?.setPrimaryClip(ClipData.newPlainText("AETHER_PSK", keyVal.trim()))
+                                                Toast.makeText(context, "Copied AETHER_PSK", Toast.LENGTH_SHORT).show()
+                                            }
+                                        },
+                                        onSaveKey = { updated ->
+                                            val pskChanged = updated.psk.trim() != cfg.psk.trim()
+                                            cfg = updated
+                                            onSave(updated)
+                                            Toast.makeText(context, "Access key saved", Toast.LENGTH_SHORT).show()
+                                            if (pskChanged && telemetry.running) {
+                                                reconnectTunnel(updated)
+                                            }
+                                        }
+                                    )
+
+                                    MenuRoute.BYPASS_APPS -> Unit
+                                }
+                                Spacer(Modifier.height(104.dp))
+                                Spacer(Modifier.navigationBarsPadding())
+                            }
+                        }
                     }
                 }
             }
 
-            // Soft bottom scrim so scrolling content dissolves cleanly under the floating dock
+            // Soft bottom scrim so content dissolves cleanly under the floating dock
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(108.dp)
+                    .height(102.dp)
                     .align(Alignment.BottomCenter)
                     .background(
                         Brush.verticalGradient(
@@ -478,38 +862,48 @@ private fun AetherApp(
                     )
             )
 
-            // Floating Pill Bottom Navigation Dock
+            // 2-Tab Floating Pill Bottom Dock: Tunnel | Menu
             FloatingNavDock(
                 selectedTab = tab,
-                onSelect = { tab = it },
+                onSelect = { target ->
+                    if (target == 1 && tab == 1 && menuSubPage != null) {
+                        menuSubPage = null
+                    } else {
+                        tab = target
+                    }
+                },
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .navigationBarsPadding()
-                    .padding(horizontal = 20.dp)
+                    .padding(horizontal = 24.dp)
                     .padding(bottom = 12.dp)
             )
         }
     }
 }
 
+// ---------------------------------------------------------------------------
+// TOP BRAND BAR, SUB-PAGE BAR & FLOATING 2-TAB DOCK
+// ---------------------------------------------------------------------------
+
 @Composable
 private fun TopBrandBar(running: Boolean) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 20.dp, vertical = 12.dp),
+            .padding(horizontal = 20.dp, vertical = 10.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             BrandMarkIcon(
                 active = running,
-                modifier = Modifier.size(28.dp)
+                modifier = Modifier.size(26.dp)
             )
             Spacer(Modifier.width(10.dp))
             Text(
                 text = "Aether",
-                fontSize = 20.sp,
+                fontSize = 19.sp,
                 fontWeight = FontWeight.Bold,
                 letterSpacing = (-0.5).sp,
                 color = TextPrimary
@@ -523,15 +917,58 @@ private fun TopBrandBar(running: Boolean) {
                     .padding(horizontal = 6.dp, vertical = 2.dp)
             ) {
                 Text(
-                    text = "v3.2",
+                    text = "v4.0",
                     fontSize = 10.sp,
                     fontFamily = FontFamily.Monospace,
                     fontWeight = FontWeight.Medium,
-                    color = TextSecondary
+                    color = SignalEmeraldBright
                 )
             }
         }
         StatusBadge(running = running)
+    }
+}
+
+@Composable
+private fun SubPageTopBar(
+    title: String,
+    onBack: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp)
+            .padding(bottom = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(10.dp))
+                .background(SurfaceCard)
+                .border(1.dp, BorderHairline, RoundedCornerShape(10.dp))
+                .clickable(onClick = onBack)
+                .padding(horizontal = 10.dp, vertical = 7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp)
+        ) {
+            ChevronLeftIcon(color = SignalEmeraldBright, modifier = Modifier.size(14.dp))
+            Text(
+                text = "Menu",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = TextPrimary
+            )
+        }
+        Text(
+            text = title,
+            fontSize = 16.sp,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = (-0.3).sp,
+            color = TextPrimary,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
     }
 }
 
@@ -569,7 +1006,7 @@ private fun StatusBadge(running: Boolean) {
             .clip(RoundedCornerShape(999.dp))
             .background(bg)
             .border(1.dp, border, RoundedCornerShape(999.dp))
-            .padding(horizontal = 11.dp, vertical = 6.dp),
+            .padding(horizontal = 11.dp, vertical = 5.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(7.dp)
     ) {
@@ -596,7 +1033,7 @@ private fun FloatingNavDock(
     onSelect: (Int) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val tabs = listOf("Tunnel", "Routes", "Settings")
+    val tabs = listOf("Tunnel", "Menu")
     Row(
         modifier = modifier
             .fillMaxWidth()
@@ -604,18 +1041,18 @@ private fun FloatingNavDock(
             .background(SurfaceCard)
             .border(1.dp, BorderHairline, RoundedCornerShape(28.dp))
             .padding(6.dp),
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         tabs.forEachIndexed { idx, label ->
             val selected = selectedTab == idx
             val pillBg by animateColorAsState(
-                targetValue = if (selected) SignalEmerald.copy(alpha = 0.14f) else Color.Transparent,
+                targetValue = if (selected) SignalEmerald.copy(alpha = 0.15f) else Color.Transparent,
                 animationSpec = tween(220),
                 label = "pillBg$idx"
             )
             val pillBorder by animateColorAsState(
-                targetValue = if (selected) SignalEmerald.copy(alpha = 0.28f) else Color.Transparent,
+                targetValue = if (selected) SignalEmerald.copy(alpha = 0.34f) else Color.Transparent,
                 animationSpec = tween(220),
                 label = "pillBorder$idx"
             )
@@ -638,13 +1075,12 @@ private fun FloatingNavDock(
             ) {
                 when (idx) {
                     0 -> TunnelTabIcon(color = contentColor, modifier = Modifier.size(18.dp))
-                    1 -> RoutesTabIcon(color = contentColor, modifier = Modifier.size(18.dp))
-                    else -> SettingsTabIcon(color = contentColor, modifier = Modifier.size(18.dp))
+                    else -> MenuHubIcon(color = contentColor, modifier = Modifier.size(18.dp))
                 }
-                Spacer(Modifier.width(7.dp))
+                Spacer(Modifier.width(8.dp))
                 Text(
                     text = label,
-                    fontSize = 12.sp,
+                    fontSize = 13.sp,
                     fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
                     color = contentColor,
                     maxLines = 1
@@ -655,15 +1091,16 @@ private fun FloatingNavDock(
 }
 
 // ---------------------------------------------------------------------------
-// TAB 0: TUNNEL (Hero Instrument Screen)
+// TAB 0: TUNNEL (Zero-Scroll Hero Instrument Screen)
 // ---------------------------------------------------------------------------
 
 @Composable
 private fun TunnelTab(
+    cfg: AetherConfig,
     telemetry: LiveTelemetry,
-    speedHistory: List<Float>,
+    downHistory: List<Float>,
+    upHistory: List<Float>,
     peakMbps: Double,
-    targetCarriers: Int,
     errorText: String?,
     onToggle: () -> Unit
 ) {
@@ -676,24 +1113,22 @@ private fun TunnelTab(
     Column(
         modifier = Modifier.fillMaxWidth(),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(16.dp)
+        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Spacer(Modifier.height(2.dp))
-
-        // Machined 220dp Hero Power Dial
+        // Machined 200dp Hero Power Dial
         MachinedPowerDial(
             running = telemetry.running,
             onToggle = onToggle
         )
 
-        // Status Headline + Mono Telemetry Chip
+        // Status Headline + Active Cipher / Transport Telemetry Chip
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(8.dp)
+            verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             Text(
                 text = if (telemetry.running) "Tunnel Protected" else "Ready to Connect",
-                fontSize = 20.sp,
+                fontSize = 19.sp,
                 fontWeight = FontWeight.Bold,
                 letterSpacing = (-0.4).sp,
                 color = titleColor
@@ -715,11 +1150,11 @@ private fun TunnelTab(
                 )
                 Text(
                     text = if (telemetry.running) {
-                        "${telemetry.endpoint} · ${fmtDuration(telemetry.connectedSec)}"
+                        "${telemetry.endpoint} · ${shortCipherName(cfg.cipher)} · ${transportLabel(cfg.transport)} · ${fmtDuration(telemetry.connectedSec)}"
                     } else {
-                        "X25519 · XChaCha20-Poly1305 · uTLS"
+                        "${shortCipherName(cfg.cipher)} · ${transportLabel(cfg.transport)} · uTLS ${fingerprintLabel(cfg.fingerprint)}"
                     },
-                    fontSize = 11.sp,
+                    fontSize = 10.5.sp,
                     fontFamily = FontFamily.Monospace,
                     color = if (telemetry.running) TextSecondary else TextDim,
                     maxLines = 1,
@@ -733,39 +1168,40 @@ private fun TunnelTab(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(14.dp))
+                    .clip(RoundedCornerShape(12.dp))
                     .background(SignalRose.copy(alpha = 0.10f))
-                    .border(1.dp, SignalRose.copy(alpha = 0.42f), RoundedCornerShape(14.dp))
-                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                    .border(1.dp, SignalRose.copy(alpha = 0.42f), RoundedCornerShape(12.dp))
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Box(
                     modifier = Modifier
-                        .size(8.dp)
+                        .size(7.dp)
                         .clip(CircleShape)
                         .background(SignalRose)
                 )
                 Text(
                     text = errorText,
                     color = Color(0xFFFDA4AF),
-                    fontSize = 12.sp,
-                    lineHeight = 17.sp
+                    fontSize = 11.5.sp,
+                    lineHeight = 16.sp
                 )
             }
         }
 
-        // Live 30-Second Throughput Sparkline Card
+        // Dual-Series Live 30-Second Throughput Sparkline Card (Down Emerald + Up Silver)
         ThroughputSparklineCard(
             telemetry = telemetry,
-            samples = speedHistory,
+            downSamples = downHistory,
+            upSamples = upHistory,
             peakMbps = peakMbps
         )
 
-        // Live Carrier Matrix Bar
+        // Compact 4-Carrier Health Matrix Bar
         CarrierMatrixBar(
             activeCarriers = telemetry.carriers,
-            targetCarriers = targetCarriers,
+            targetCarriers = cfg.carriers,
             streams = telemetry.streams,
             failovers = telemetry.failovers,
             running = telemetry.running
@@ -828,10 +1264,9 @@ private fun MachinedPowerDial(
     )
 
     Box(
-        modifier = Modifier.size(220.dp),
+        modifier = Modifier.size(200.dp),
         contentAlignment = Alignment.Center
     ) {
-        // Outer precision chronometer ticks, rotating sweep arc & radar wave
         Canvas(modifier = Modifier.fillMaxSize()) {
             val center = Offset(size.width / 2f, size.height / 2f)
             val tickOuterR = size.minDimension * 0.475f
@@ -839,7 +1274,6 @@ private fun MachinedPowerDial(
             val tickInnerMajor = size.minDimension * 0.422f
             val sweepRadius = size.minDimension * 0.392f
 
-            // Subtle expanding radar wave when connected
             if (running) {
                 val baseR = size.minDimension * 0.34f
                 val maxR = size.minDimension * 0.495f
@@ -852,7 +1286,6 @@ private fun MachinedPowerDial(
                 )
             }
 
-            // 36 precision radial ticks around the circumference
             val totalTicks = 36
             for (i in 0 until totalTicks) {
                 val angleDeg = i * (360.0 / totalTicks) - 90.0
@@ -877,7 +1310,6 @@ private fun MachinedPowerDial(
                 )
             }
 
-            // Recessed track ring
             drawCircle(
                 color = if (running) SignalEmerald.copy(alpha = 0.14f) else BorderHairline.copy(alpha = 0.7f),
                 radius = sweepRadius,
@@ -885,7 +1317,6 @@ private fun MachinedPowerDial(
                 style = Stroke(width = 2.dp.toPx())
             )
 
-            // Rotating emerald sweep arc when connected
             if (running) {
                 val arcTopLeft = Offset(center.x - sweepRadius, center.y - sweepRadius)
                 val arcSize = Size(sweepRadius * 2f, sweepRadius * 2f)
@@ -910,19 +1341,17 @@ private fun MachinedPowerDial(
             }
         }
 
-        // Recessed machined well
         Box(
             modifier = Modifier
-                .size(156.dp)
+                .size(142.dp)
                 .clip(CircleShape)
                 .background(SurfaceRecessed)
                 .border(1.dp, BorderHairline, CircleShape),
             contentAlignment = Alignment.Center
         ) {
-            // Center 144dp tactile dark machined power button
             Box(
                 modifier = Modifier
-                    .size(144.dp)
+                    .size(130.dp)
                     .clip(CircleShape)
                     .background(Brush.verticalGradient(listOf(coreTop, coreBottom)))
                     .border(
@@ -940,9 +1369,9 @@ private fun MachinedPowerDial(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.Center
                 ) {
-                    Canvas(modifier = Modifier.size(40.dp)) {
-                        val strokeW = 3.2.dp.toPx()
-                        val inset = 5.dp.toPx()
+                    Canvas(modifier = Modifier.size(36.dp)) {
+                        val strokeW = 3.dp.toPx()
+                        val inset = 4.5.dp.toPx()
                         drawArc(
                             color = glyphColor,
                             startAngle = -55f,
@@ -960,7 +1389,7 @@ private fun MachinedPowerDial(
                             cap = StrokeCap.Round
                         )
                     }
-                    Spacer(Modifier.height(6.dp))
+                    Spacer(Modifier.height(5.dp))
                     Text(
                         text = if (running) "ACTIVE" else "ENGAGE",
                         fontSize = 9.sp,
@@ -978,7 +1407,8 @@ private fun MachinedPowerDial(
 @Composable
 private fun ThroughputSparklineCard(
     telemetry: LiveTelemetry,
-    samples: List<Float>,
+    downSamples: List<Float>,
+    upSamples: List<Float>,
     peakMbps: Double
 ) {
     Column(
@@ -988,46 +1418,75 @@ private fun ThroughputSparklineCard(
             .background(SurfaceCard)
             .border(1.dp, BorderHairline, RoundedCornerShape(18.dp))
     ) {
-        // Header Row: Live Mbps + RTT & Peak mono pills
+        // Header Row: Live ↓ Down & ↑ Up Mbps + RTT & Peak mono pills
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 8.dp),
+                .padding(start = 15.dp, end = 15.dp, top = 12.dp, bottom = 6.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.Top
         ) {
-            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
                 Text(
                     text = "LIVE THROUGHPUT",
-                    fontSize = 10.sp,
+                    fontSize = 9.5.sp,
                     fontWeight = FontWeight.SemiBold,
                     letterSpacing = 1.sp,
                     color = TextDim
                 )
-                Row(verticalAlignment = Alignment.Bottom) {
-                    Text(
-                        text = String.format(Locale.US, "%.1f", telemetry.liveMbps),
-                        fontSize = 26.sp,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace,
-                        letterSpacing = (-0.8).sp,
-                        color = if (telemetry.running) TextPrimary else TextSecondary
-                    )
-                    Spacer(Modifier.width(5.dp))
-                    Text(
-                        text = "Mbps",
-                        fontSize = 12.sp,
-                        fontFamily = FontFamily.Monospace,
-                        color = TextDim,
-                        modifier = Modifier.padding(bottom = 4.dp)
-                    )
+                Row(
+                    verticalAlignment = Alignment.Bottom,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.Bottom) {
+                        Text(
+                            text = "↓",
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (telemetry.running) SignalEmeraldBright else TextDim,
+                            modifier = Modifier.padding(bottom = 2.dp, end = 2.dp)
+                        )
+                        Text(
+                            text = String.format(Locale.US, "%.1f", telemetry.downMbps),
+                            fontSize = 20.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace,
+                            letterSpacing = (-0.6).sp,
+                            color = if (telemetry.running) TextPrimary else TextSecondary
+                        )
+                    }
+                    Row(verticalAlignment = Alignment.Bottom) {
+                        Text(
+                            text = "↑",
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (telemetry.running) CoolSilver else TextDim,
+                            modifier = Modifier.padding(bottom = 2.dp, end = 2.dp)
+                        )
+                        Text(
+                            text = String.format(Locale.US, "%.1f", telemetry.upMbps),
+                            fontSize = 17.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            fontFamily = FontFamily.Monospace,
+                            letterSpacing = (-0.4).sp,
+                            color = if (telemetry.running) CoolSilver else TextDim
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text(
+                            text = "Mbps",
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = TextDim,
+                            modifier = Modifier.padding(bottom = 2.dp)
+                        )
+                    }
                 }
             }
 
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                 MonoTelemetryPill(
                     label = "RTT",
-                    value = if (telemetry.running && telemetry.rttMs > 0) "${telemetry.rttMs} ms" else "--"
+                    value = if (telemetry.running && telemetry.rttMs > 0) "${telemetry.rttMs}ms" else "--"
                 )
                 MonoTelemetryPill(
                     label = "Peak",
@@ -1036,12 +1495,12 @@ private fun ThroughputSparklineCard(
             }
         }
 
-        // 72dp Custom Canvas Area Sparkline
+        // 62dp Dual-Series Canvas Sparkline (Down = Emerald Filled Area, Up = Cool Silver Line)
         Canvas(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(72.dp)
-                .padding(horizontal = 16.dp, vertical = 6.dp)
+                .height(62.dp)
+                .padding(horizontal = 15.dp, vertical = 4.dp)
         ) {
             val w = size.width
             val h = size.height
@@ -1050,7 +1509,6 @@ private fun ThroughputSparklineCard(
             val drawH = (baseY - topPad).coerceAtLeast(1f)
 
             val dash = PathEffect.dashPathEffect(floatArrayOf(6f, 6f), 0f)
-            // Midline guide
             drawLine(
                 color = BorderHairline.copy(alpha = 0.5f),
                 start = Offset(0f, topPad + drawH * 0.5f),
@@ -1058,7 +1516,6 @@ private fun ThroughputSparklineCard(
                 strokeWidth = 1.dp.toPx(),
                 pathEffect = dash
             )
-            // Baseline rule
             drawLine(
                 color = BorderHairline,
                 start = Offset(0f, baseY),
@@ -1067,33 +1524,37 @@ private fun ThroughputSparklineCard(
                 pathEffect = dash
             )
 
-            val count = samples.size
-            if (count >= 2) {
-                val maxVal = max(1f, (samples.maxOrNull() ?: 0f) * 1.15f)
+            val count = downSamples.size
+            if (count >= 2 && upSamples.size == count) {
+                val maxDown = downSamples.maxOrNull() ?: 0f
+                val maxUp = upSamples.maxOrNull() ?: 0f
+                val maxVal = max(1f, max(maxDown, maxUp) * 1.18f)
                 val stepX = w / (count - 1).toFloat()
 
-                val points = List(count) { idx ->
-                    val ratio = (samples[idx] / maxVal).coerceIn(0f, 1f)
-                    Offset(
-                        x = idx * stepX,
-                        y = baseY - (ratio * drawH)
-                    )
+                fun buildSmoothPath(series: List<Float>): Pair<Path, List<Offset>> {
+                    val pts = List(count) { idx ->
+                        val ratio = (series[idx] / maxVal).coerceIn(0f, 1f)
+                        Offset(x = idx * stepX, y = baseY - (ratio * drawH))
+                    }
+                    val path = Path().apply {
+                        moveTo(pts.first().x, pts.first().y)
+                        for (i in 0 until pts.lastIndex) {
+                            val p0 = pts[i]
+                            val p1 = pts[i + 1]
+                            val midX = (p0.x + p1.x) / 2f
+                            cubicTo(midX, p0.y, midX, p1.y, p1.x, p1.y)
+                        }
+                    }
+                    return path to pts
                 }
 
-                val linePath = Path().apply {
-                    moveTo(points.first().x, points.first().y)
-                    for (i in 0 until points.lastIndex) {
-                        val p0 = points[i]
-                        val p1 = points[i + 1]
-                        val midX = (p0.x + p1.x) / 2f
-                        cubicTo(midX, p0.y, midX, p1.y, p1.x, p1.y)
-                    }
-                }
+                val (downPath, downPts) = buildSmoothPath(downSamples)
+                val (upPath, upPts) = buildSmoothPath(upSamples)
 
                 val fillPath = Path().apply {
-                    addPath(linePath)
-                    lineTo(points.last().x, baseY)
-                    lineTo(points.first().x, baseY)
+                    addPath(downPath)
+                    lineTo(downPts.last().x, baseY)
+                    lineTo(downPts.first().x, baseY)
                     close()
                 }
 
@@ -1108,8 +1569,20 @@ private fun ThroughputSparklineCard(
                     )
                 }
 
+                // Upload crisp silver line
                 drawPath(
-                    path = linePath,
+                    path = upPath,
+                    color = if (telemetry.running) CoolSilver.copy(alpha = 0.85f) else TextDim.copy(alpha = 0.30f),
+                    style = Stroke(
+                        width = 1.5.dp.toPx(),
+                        cap = StrokeCap.Round,
+                        join = StrokeJoin.Round
+                    )
+                )
+
+                // Download primary Signal Emerald line
+                drawPath(
+                    path = downPath,
                     color = if (telemetry.running) SignalEmeraldBright else TextDim.copy(alpha = 0.45f),
                     style = Stroke(
                         width = 2.dp.toPx(),
@@ -1118,58 +1591,63 @@ private fun ThroughputSparklineCard(
                     )
                 )
 
-                // Live terminal beacon at newest sample
+                // Live terminal beacons
                 if (telemetry.running) {
-                    val last = points.last()
+                    val lastUp = upPts.last()
                     drawCircle(
-                        color = SignalEmerald.copy(alpha = 0.30f),
-                        radius = 6.dp.toPx(),
-                        center = last
+                        color = CoolSilver,
+                        radius = 2.2.dp.toPx(),
+                        center = lastUp
+                    )
+                    val lastDown = downPts.last()
+                    drawCircle(
+                        color = SignalEmerald.copy(alpha = 0.32f),
+                        radius = 5.5.dp.toPx(),
+                        center = lastDown
                     )
                     drawCircle(
                         color = SignalEmeraldBright,
-                        radius = 2.8.dp.toPx(),
-                        center = last
+                        radius = 2.6.dp.toPx(),
+                        center = lastDown
                     )
                 }
             }
         }
 
-        Spacer(Modifier.height(4.dp))
         HorizontalDivider(color = BorderHairline, thickness = 1.dp)
 
-        // Footer Split Row: Download | Upload
+        // Footer Split Row: Total Download | Total Upload
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 12.dp),
+                .padding(horizontal = 15.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Row(
                 modifier = Modifier.weight(1f),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                horizontalArrangement = Arrangement.spacedBy(9.dp)
             ) {
                 Box(
                     modifier = Modifier
-                        .size(30.dp)
+                        .size(28.dp)
                         .clip(RoundedCornerShape(8.dp))
                         .background(SignalEmerald.copy(alpha = 0.12f)),
                     contentAlignment = Alignment.Center
                 ) {
-                    DownloadArrowIcon(color = SignalEmeraldBright, modifier = Modifier.size(15.dp))
+                    DownloadArrowIcon(color = SignalEmeraldBright, modifier = Modifier.size(14.dp))
                 }
                 Column {
                     Text(
                         text = "DOWNLOAD",
-                        fontSize = 9.sp,
+                        fontSize = 8.5.sp,
                         fontWeight = FontWeight.SemiBold,
                         letterSpacing = 0.8.sp,
                         color = TextDim
                     )
                     Text(
                         text = fmtBytes(telemetry.rxBytes),
-                        fontSize = 14.sp,
+                        fontSize = 13.sp,
                         fontWeight = FontWeight.SemiBold,
                         fontFamily = FontFamily.Monospace,
                         color = TextPrimary,
@@ -1182,37 +1660,37 @@ private fun ThroughputSparklineCard(
             Box(
                 modifier = Modifier
                     .width(1.dp)
-                    .height(28.dp)
+                    .height(24.dp)
                     .background(BorderHairline)
             )
 
-            Spacer(Modifier.width(14.dp))
+            Spacer(Modifier.width(12.dp))
 
             Row(
                 modifier = Modifier.weight(1f),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                horizontalArrangement = Arrangement.spacedBy(9.dp)
             ) {
                 Box(
                     modifier = Modifier
-                        .size(30.dp)
+                        .size(28.dp)
                         .clip(RoundedCornerShape(8.dp))
                         .background(SurfaceElevated),
                     contentAlignment = Alignment.Center
                 ) {
-                    UploadArrowIcon(color = TextSecondary, modifier = Modifier.size(15.dp))
+                    UploadArrowIcon(color = CoolSilver, modifier = Modifier.size(14.dp))
                 }
                 Column {
                     Text(
                         text = "UPLOAD",
-                        fontSize = 9.sp,
+                        fontSize = 8.5.sp,
                         fontWeight = FontWeight.SemiBold,
                         letterSpacing = 0.8.sp,
                         color = TextDim
                     )
                     Text(
                         text = fmtBytes(telemetry.txBytes),
-                        fontSize = 14.sp,
+                        fontSize = 13.sp,
                         fontWeight = FontWeight.SemiBold,
                         fontFamily = FontFamily.Monospace,
                         color = TextPrimary,
@@ -1232,19 +1710,19 @@ private fun MonoTelemetryPill(label: String, value: String) {
             .clip(RoundedCornerShape(8.dp))
             .background(SurfaceElevated)
             .border(1.dp, BorderHairline, RoundedCornerShape(8.dp))
-            .padding(horizontal = 8.dp, vertical = 4.dp),
+            .padding(horizontal = 7.dp, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp)
     ) {
         Text(
             text = label,
-            fontSize = 10.sp,
+            fontSize = 9.5.sp,
             fontFamily = FontFamily.Monospace,
             color = TextDim
         )
         Text(
             text = value,
-            fontSize = 10.sp,
+            fontSize = 9.5.sp,
             fontFamily = FontFamily.Monospace,
             fontWeight = FontWeight.SemiBold,
             color = TextPrimary
@@ -1267,8 +1745,8 @@ private fun CarrierMatrixBar(
             .clip(RoundedCornerShape(16.dp))
             .background(SurfaceCard)
             .border(1.dp, BorderHairline, RoundedCornerShape(16.dp))
-            .padding(horizontal = 16.dp, vertical = 13.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
+            .padding(horizontal = 15.dp, vertical = 11.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -1277,7 +1755,7 @@ private fun CarrierMatrixBar(
         ) {
             Text(
                 text = "CARRIER MATRIX",
-                fontSize = 10.sp,
+                fontSize = 9.5.sp,
                 fontWeight = FontWeight.SemiBold,
                 letterSpacing = 1.sp,
                 color = TextDim
@@ -1310,7 +1788,7 @@ private fun CarrierMatrixBar(
                 Box(
                     modifier = Modifier
                         .weight(1f)
-                        .height(8.dp)
+                        .height(7.dp)
                         .clip(RoundedCornerShape(4.dp))
                         .background(segColor)
                         .border(
@@ -1325,26 +1803,182 @@ private fun CarrierMatrixBar(
 }
 
 // ---------------------------------------------------------------------------
-// TAB 1: ROUTES (Nodes & Config)
+// TAB 1: MENU HUB (Zero-Scroll 6-Item Control Center)
 // ---------------------------------------------------------------------------
 
 @Composable
-private fun RoutesTab(
-    primaryUrl: String,
-    onPrimaryChange: (String) -> Unit,
-    fallbackUrl: String,
-    onFallbackChange: (String) -> Unit,
-    cfCleanIp: String,
-    onCleanIpChange: (String) -> Unit,
-    transport: String,
-    onTransportChange: (String) -> Unit,
-    carriers: Int,
-    onCarriersChange: (Int) -> Unit,
-    onSwapRoutes: () -> Unit,
+private fun MenuHubTab(
+    cfg: AetherConfig,
+    onOpen: (MenuRoute) -> Unit
+) {
+    val bypassCount = cfg.bypassSet().size
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 2.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    text = "CONTROL CENTER",
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.1.sp,
+                    color = TextDim
+                )
+                Text(
+                    text = "Configuration & Control",
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = (-0.4).sp,
+                    color = TextPrimary
+                )
+            }
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(999.dp))
+                    .background(if (cfg.autoSync) SignalEmerald.copy(alpha = 0.12f) else SurfaceCard)
+                    .border(
+                        1.dp,
+                        if (cfg.autoSync) SignalEmerald.copy(alpha = 0.35f) else BorderHairline,
+                        RoundedCornerShape(999.dp)
+                    )
+                    .padding(horizontal = 9.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(5.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(6.dp)
+                        .clip(CircleShape)
+                        .background(if (cfg.autoSync) SignalEmeraldBright else TextDim)
+                )
+                Text(
+                    text = if (cfg.autoSync) "SYNC LIVE" else "LOCAL",
+                    fontSize = 9.5.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold,
+                    color = if (cfg.autoSync) SignalEmeraldBright else TextDim
+                )
+            }
+        }
+
+        MenuHubRow(
+            title = "Server & Routes",
+            subtitle = "${extractHost(cfg.primaryUrl)} → ${extractHost(cfg.fallbackUrl)}",
+            icon = { RoutesTabIcon(color = SignalEmeraldBright, modifier = Modifier.size(18.dp)) },
+            onClick = { onOpen(MenuRoute.ROUTES) }
+        )
+        MenuHubRow(
+            title = "Protocol & Transport",
+            subtitle = "${transportLabel(cfg.transport)} · ${cfg.carriers} Carriers",
+            icon = { ProtocolIcon(color = SignalEmeraldBright, modifier = Modifier.size(18.dp)) },
+            onClick = { onOpen(MenuRoute.PROTOCOL) }
+        )
+        MenuHubRow(
+            title = "Encryption & Stealth",
+            subtitle = "${shortCipherName(cfg.cipher)} · ${fingerprintLabel(cfg.fingerprint)} · ${paddingLabel(cfg.paddingMode)}",
+            icon = { ShieldLockIcon(color = SignalEmeraldBright, modifier = Modifier.size(18.dp)) },
+            onClick = { onOpen(MenuRoute.ENCRYPTION) }
+        )
+        MenuHubRow(
+            title = "DNS & Shield",
+            subtitle = "${dnsLabel(cfg.dnsPreset)} · ${if (cfg.blockDot) "DoT Blocked" else "DoT Open"} · ${if (cfg.autoSync) "Sync ON" else "Sync OFF"}",
+            icon = { DnsGlobeIcon(color = SignalEmeraldBright, modifier = Modifier.size(18.dp)) },
+            onClick = { onOpen(MenuRoute.DNS_SHIELD) }
+        )
+        MenuHubRow(
+            title = "Split Tunneling & Bypass Apps",
+            subtitle = "LAN Bypass ${if (cfg.bypassLan) "ON" else "OFF"} · $bypassCount ${if (bypassCount == 1) "app" else "apps"} excluded",
+            icon = { AppsGridIcon(color = SignalEmeraldBright, modifier = Modifier.size(18.dp)) },
+            onClick = { onOpen(MenuRoute.BYPASS_APPS) }
+        )
+        MenuHubRow(
+            title = "Access Key & Engine",
+            subtitle = "${if (cfg.psk.isNotBlank()) "PSK Configured" else "PSK Missing"} · Aether v4.0",
+            icon = { KeyIcon(color = SignalEmeraldBright, modifier = Modifier.size(18.dp)) },
+            onClick = { onOpen(MenuRoute.ACCESS_KEY) }
+        )
+    }
+}
+
+@Composable
+private fun MenuHubRow(
+    title: String,
+    subtitle: String,
+    icon: @Composable () -> Unit,
+    onClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(SurfaceCard)
+            .border(1.dp, BorderHairline, RoundedCornerShape(16.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .size(38.dp)
+                .clip(RoundedCornerShape(11.dp))
+                .background(SignalEmerald.copy(alpha = 0.11f))
+                .border(1.dp, SignalEmerald.copy(alpha = 0.24f), RoundedCornerShape(11.dp)),
+            contentAlignment = Alignment.Center
+        ) {
+            icon()
+        }
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            Text(
+                text = title,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = TextPrimary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = subtitle,
+                fontSize = 11.sp,
+                fontFamily = FontFamily.Monospace,
+                color = TextSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        ChevronRightIcon(color = TextDim, modifier = Modifier.size(15.dp))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SUB-SCREEN 1: SERVER & ROUTES
+// ---------------------------------------------------------------------------
+
+@Composable
+private fun RoutesSubScreen(
+    cfg: AetherConfig,
     onImport: () -> Unit,
     onCopy: () -> Unit,
-    onSave: () -> Unit
+    onSwap: (AetherConfig) -> Unit,
+    onSaveAndSync: (AetherConfig) -> Unit
 ) {
+    val scope = rememberCoroutineScope()
+    var primaryUrl by remember(cfg.primaryUrl) { mutableStateOf(cfg.primaryUrl) }
+    var fallbackUrl by remember(cfg.fallbackUrl) { mutableStateOf(cfg.fallbackUrl) }
+    var cfCleanIp by remember(cfg.cfCleanIp) { mutableStateOf(cfg.cfCleanIp) }
+
+    var pinging by remember { mutableStateOf(false) }
+    var primaryPingMs by remember { mutableStateOf<Long?>(null) }
+    var fallbackPingMs by remember { mutableStateOf<Long?>(null) }
+
     Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
         // 1-Tap Provisioning Row
         Row(
@@ -1355,21 +1989,22 @@ private fun RoutesTab(
                 onClick = onImport,
                 modifier = Modifier
                     .weight(1f)
-                    .height(46.dp),
-                shape = RoundedCornerShape(14.dp),
+                    .height(44.dp),
+                shape = RoundedCornerShape(13.dp),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = TextPrimary,
                     contentColor = BgCarbon
                 ),
-                contentPadding = PaddingValues(horizontal = 14.dp)
+                contentPadding = PaddingValues(horizontal = 12.dp)
             ) {
-                ClipboardImportIcon(color = BgCarbon, modifier = Modifier.size(16.dp))
-                Spacer(Modifier.width(8.dp))
+                ClipboardImportIcon(color = BgCarbon, modifier = Modifier.size(15.dp))
+                Spacer(Modifier.width(7.dp))
                 Text(
-                    text = "Import Link",
-                    fontSize = 13.sp,
+                    text = "Import aether://",
+                    fontSize = 12.sp,
                     fontWeight = FontWeight.Bold,
-                    color = BgCarbon
+                    color = BgCarbon,
+                    maxLines = 1
                 )
             }
 
@@ -1377,27 +2012,28 @@ private fun RoutesTab(
                 onClick = onCopy,
                 modifier = Modifier
                     .weight(1f)
-                    .height(46.dp),
-                shape = RoundedCornerShape(14.dp),
+                    .height(44.dp),
+                shape = RoundedCornerShape(13.dp),
                 border = BorderStroke(1.dp, BorderHairline),
                 colors = ButtonDefaults.outlinedButtonColors(
                     containerColor = SurfaceElevated,
                     contentColor = TextPrimary
                 ),
-                contentPadding = PaddingValues(horizontal = 14.dp)
+                contentPadding = PaddingValues(horizontal = 12.dp)
             ) {
-                ShareCopyIcon(color = TextPrimary, modifier = Modifier.size(16.dp))
-                Spacer(Modifier.width(8.dp))
+                ShareCopyIcon(color = TextPrimary, modifier = Modifier.size(15.dp))
+                Spacer(Modifier.width(7.dp))
                 Text(
-                    text = "Copy Link",
-                    fontSize = 13.sp,
+                    text = "Copy Share Link",
+                    fontSize = 12.sp,
                     fontWeight = FontWeight.SemiBold,
-                    color = TextPrimary
+                    color = TextPrimary,
+                    maxLines = 1
                 )
             }
         }
 
-        // Active Failover Route Summary Card
+        // Visual PRIMARY → FALLBACK Route Card + Swap & Ping
         SectionCard(title = "ACTIVE FAILOVER ROUTE") {
             Row(
                 modifier = Modifier
@@ -1410,7 +2046,7 @@ private fun RoutesTab(
             ) {
                 Column(
                     modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(3.dp)
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
@@ -1433,12 +2069,13 @@ private fun RoutesTab(
                     }
                     Text(
                         text = extractHost(primaryUrl),
-                        fontSize = 12.sp,
+                        fontSize = 11.5.sp,
                         fontFamily = FontFamily.Monospace,
                         color = TextPrimary,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
+                    PingBadge(ms = primaryPingMs, pinging = pinging)
                 }
 
                 Text(
@@ -1450,7 +2087,7 @@ private fun RoutesTab(
 
                 Column(
                     modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(3.dp)
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
@@ -1473,36 +2110,107 @@ private fun RoutesTab(
                     }
                     Text(
                         text = extractHost(fallbackUrl),
-                        fontSize = 12.sp,
+                        fontSize = 11.5.sp,
                         fontFamily = FontFamily.Monospace,
                         color = TextSecondary,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
+                    PingBadge(ms = fallbackPingMs, pinging = pinging)
                 }
             }
 
-            OutlinedButton(
-                onClick = onSwapRoutes,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(40.dp),
-                shape = RoundedCornerShape(10.dp),
-                border = BorderStroke(1.dp, BorderHairline),
-                colors = ButtonDefaults.outlinedButtonColors(
-                    containerColor = SurfaceElevated,
-                    contentColor = TextPrimary
-                ),
-                contentPadding = PaddingValues(horizontal = 12.dp)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                SwapArrowsIcon(color = SignalEmeraldBright, modifier = Modifier.size(15.dp))
-                Spacer(Modifier.width(8.dp))
-                Text(
-                    text = "Swap Primary ↔ Fallback",
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = TextPrimary
-                )
+                OutlinedButton(
+                    onClick = {
+                        val oldP = primaryUrl
+                        primaryUrl = fallbackUrl
+                        fallbackUrl = oldP
+                        val oldPing = primaryPingMs
+                        primaryPingMs = fallbackPingMs
+                        fallbackPingMs = oldPing
+                        onSwap(
+                            cfg.copy(
+                                primaryUrl = primaryUrl,
+                                fallbackUrl = fallbackUrl,
+                                cfCleanIp = cfCleanIp
+                            )
+                        )
+                    },
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(40.dp),
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, BorderHairline),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        containerColor = SurfaceElevated,
+                        contentColor = TextPrimary
+                    ),
+                    contentPadding = PaddingValues(horizontal = 10.dp)
+                ) {
+                    SwapArrowsIcon(color = SignalEmeraldBright, modifier = Modifier.size(14.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = "Swap",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = TextPrimary
+                    )
+                }
+
+                OutlinedButton(
+                    enabled = !pinging,
+                    onClick = {
+                        pinging = true
+                        scope.launch {
+                            val (pMs, fMs) = withContext(Dispatchers.IO) {
+                                coroutineScope {
+                                    val d1 = async {
+                                        try {
+                                            Aethermobile.pingEndpoint(primaryUrl)
+                                        } catch (_: Throwable) {
+                                            -1L
+                                        }
+                                    }
+                                    val d2 = async {
+                                        try {
+                                            Aethermobile.pingEndpoint(fallbackUrl)
+                                        } catch (_: Throwable) {
+                                            -1L
+                                        }
+                                    }
+                                    d1.await() to d2.await()
+                                }
+                            }
+                            primaryPingMs = pMs
+                            fallbackPingMs = fMs
+                            pinging = false
+                        }
+                    },
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(40.dp),
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, SignalEmerald.copy(alpha = 0.42f)),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        containerColor = SignalEmerald.copy(alpha = 0.10f),
+                        contentColor = SignalEmeraldBright
+                    ),
+                    contentPadding = PaddingValues(horizontal = 10.dp)
+                ) {
+                    PulseIcon(color = SignalEmeraldBright, modifier = Modifier.size(14.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = if (pinging) "Testing..." else "Test Latency",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = SignalEmeraldBright,
+                        maxLines = 1
+                    )
+                }
             }
         }
 
@@ -1510,91 +2218,109 @@ private fun RoutesTab(
         SectionCard(title = "ENDPOINTS") {
             AetherTextField(
                 value = primaryUrl,
-                onValueChange = onPrimaryChange,
+                onValueChange = { primaryUrl = it },
                 label = "Primary Endpoint URL",
-                placeholder = "wss://node.example.com/ws/sync"
+                placeholder = "wss://aether-server-production.up.railway.app/ws/sync"
             )
             AetherTextField(
                 value = fallbackUrl,
-                onValueChange = onFallbackChange,
+                onValueChange = { fallbackUrl = it },
                 label = "Fallback Endpoint URL",
-                placeholder = "wss://backup.example.com/ws/sync"
+                placeholder = "wss://sync.novv.tech/ws/sync"
             )
             AetherTextField(
                 value = cfCleanIp,
-                onValueChange = onCleanIpChange,
+                onValueChange = { cfCleanIp = it },
                 label = "Optional Cloudflare Clean IP",
                 placeholder = "Leave blank for automatic DNS"
             )
         }
 
-        // Transport & Parallel Carriers Card
-        SectionCard(title = "TRANSPORT & PARALLEL CARRIERS") {
-            Text(
-                text = "Transport Mode",
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Medium,
-                color = TextSecondary
-            )
-
-            // 3-Way Segmented Control inside recessed track
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(SurfaceRecessed)
-                    .border(1.dp, BorderHairline, RoundedCornerShape(12.dp))
-                    .padding(4.dp),
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                listOf("auto" to "AUTO", "ws" to "WebSocket", "h2" to "HTTP/2").forEach { (key, label) ->
-                    val sel = transport.equals(key, ignoreCase = true)
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .clip(RoundedCornerShape(9.dp))
-                            .background(if (sel) SignalEmerald.copy(alpha = 0.16f) else Color.Transparent)
-                            .border(
-                                width = 1.dp,
-                                color = if (sel) SignalEmerald.copy(alpha = 0.50f) else Color.Transparent,
-                                shape = RoundedCornerShape(9.dp)
-                            )
-                            .clickable { onTransportChange(key) }
-                            .padding(vertical = 9.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = label,
-                            fontSize = 12.sp,
-                            fontWeight = if (sel) FontWeight.Bold else FontWeight.Medium,
-                            color = if (sel) SignalEmeraldBright else TextDim
-                        )
-                    }
-                }
-            }
-
-            Spacer(Modifier.height(2.dp))
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "Parallel Carriers",
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = TextSecondary
+        PrimaryActionButton(
+            label = "Save & Sync",
+            onClick = {
+                onSaveAndSync(
+                    cfg.copy(
+                        primaryUrl = primaryUrl.trim(),
+                        fallbackUrl = fallbackUrl.trim(),
+                        cfCleanIp = cfCleanIp.trim()
+                    )
                 )
+            }
+        )
+    }
+}
+
+@Composable
+private fun PingBadge(ms: Long?, pinging: Boolean) {
+    val (text, color) = when {
+        pinging -> "Pinging..." to TextDim
+        ms == null -> "Untested" to TextDim
+        ms < 0L -> "Unreachable" to SignalRose
+        ms <= 120L -> "$ms ms" to SignalEmeraldBright
+        ms <= 280L -> "$ms ms" to SignalAmber
+        else -> "$ms ms" to SignalRose
+    }
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(color.copy(alpha = 0.12f))
+            .border(1.dp, color.copy(alpha = 0.30f), RoundedCornerShape(6.dp))
+            .padding(horizontal = 7.dp, vertical = 2.dp)
+    ) {
+        Text(
+            text = text,
+            fontSize = 9.5.sp,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.SemiBold,
+            color = color
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SUB-SCREEN 2: PROTOCOL & TRANSPORT
+// ---------------------------------------------------------------------------
+
+@Composable
+private fun ProtocolSubScreen(
+    cfg: AetherConfig,
+    onApplyAndSync: (AetherConfig) -> Unit
+) {
+    var selectedTransport by remember(cfg.transport) { mutableStateOf(cfg.transport.ifBlank { "auto" }) }
+    var selectedCarriers by remember(cfg.carriers) { mutableIntStateOf(cfg.carriers.coerceIn(1, 6)) }
+
+    val transports = listOf(
+        Triple("auto", "AUTO", "Smart fallback (WS → XHTTP → gRPC → H2)"),
+        Triple("ws", "WebSocket", "Fastest primary on Railway & Cloudflare"),
+        Triple("xhttp", "XHTTP", "Xray-style SplitHTTP (bypasses strict WS blocks)"),
+        Triple("grpc", "gRPC", "HTTP/2 gRPC binary stream disguise"),
+        Triple("h2", "HTTP/2", "Direct HTTP/2 duplex tunnel")
+    )
+
+    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        SectionCard(title = "TRANSPORT PROTOCOL") {
+            transports.forEach { (key, title, desc) ->
+                SelectableOptionCard(
+                    title = title,
+                    description = desc,
+                    selected = selectedTransport.equals(key, ignoreCase = true),
+                    onClick = { selectedTransport = key }
+                )
+            }
+        }
+
+        SectionCard(
+            title = "PARALLEL CARRIERS",
+            trailing = {
                 Text(
-                    text = "$carriers active pool",
+                    text = "$selectedCarriers active pool",
                     fontSize = 11.sp,
                     fontFamily = FontFamily.Monospace,
-                    color = TextDim
+                    color = SignalEmeraldBright
                 )
             }
-
-            // 4 Selectable Carrier Chips (2, 3, 4 optimal, 6)
+        ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -1605,7 +2331,7 @@ private fun RoutesTab(
                     4 to "OPTIMAL",
                     6 to "MAX"
                 ).forEach { (count, tag) ->
-                    val sel = carriers == count
+                    val sel = selectedCarriers == count
                     Column(
                         modifier = Modifier
                             .weight(1f)
@@ -1616,7 +2342,7 @@ private fun RoutesTab(
                                 color = if (sel) SignalEmerald else BorderHairline,
                                 shape = RoundedCornerShape(12.dp)
                             )
-                            .clickable { onCarriersChange(count) }
+                            .clickable { selectedCarriers = count }
                             .padding(vertical = 10.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.spacedBy(2.dp)
@@ -1641,47 +2367,617 @@ private fun RoutesTab(
             }
         }
 
-        // Primary Save CTA (WCAG AAA dark-on-emerald contrast)
-        Button(
-            onClick = onSave,
+        PrimaryActionButton(
+            label = "Apply & Sync",
+            onClick = {
+                onApplyAndSync(
+                    cfg.copy(
+                        transport = selectedTransport,
+                        carriers = selectedCarriers.coerceIn(1, 6)
+                    )
+                )
+            }
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SUB-SCREEN 3: ENCRYPTION & STEALTH
+// ---------------------------------------------------------------------------
+
+@Composable
+private fun EncryptionSubScreen(
+    cfg: AetherConfig,
+    onApplyAndSync: (AetherConfig) -> Unit
+) {
+    var selectedCipher by remember(cfg.cipher) { mutableStateOf(cfg.cipher.ifBlank { "xchacha20-poly1305" }) }
+    var selectedFingerprint by remember(cfg.fingerprint) { mutableStateOf(cfg.fingerprint.ifBlank { "chrome" }) }
+    var selectedPadding by remember(cfg.paddingMode) { mutableStateOf(cfg.paddingMode.ifBlank { "balanced" }) }
+
+    val ciphers = listOf(
+        Triple("xchacha20-poly1305", "XChaCha20-Poly1305", "Default, balanced ARM64 speed"),
+        Triple("aes-256-gcm", "AES-256-GCM", "Hardware-accelerated AES-NI / ARMv8"),
+        Triple("aes-128-gcm", "AES-128-GCM", "Ultra-low-latency hardware AEAD"),
+        Triple("chacha20-poly1305", "ChaCha20-Poly1305", "Standard RFC 8439 AEAD"),
+        Triple("none", "TLS-Only (VLESS)", "Zero double-encryption, max speed over uTLS 1.3")
+    )
+
+    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        SectionCard(title = "CIPHER SUITE") {
+            ciphers.forEach { (key, title, desc) ->
+                SelectableOptionCard(
+                    title = title,
+                    description = desc,
+                    selected = selectedCipher.equals(key, ignoreCase = true),
+                    onClick = { selectedCipher = key }
+                )
+            }
+        }
+
+        SectionCard(title = "uTLS BROWSER FINGERPRINT") {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                listOf("chrome" to "Chrome", "firefox" to "Firefox", "safari" to "Safari").forEach { (key, label) ->
+                    SelectableChip(
+                        label = label,
+                        selected = selectedFingerprint.equals(key, ignoreCase = true),
+                        onClick = { selectedFingerprint = key },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                listOf("ios" to "iOS", "randomized" to "Random").forEach { (key, label) ->
+                    SelectableChip(
+                        label = label,
+                        selected = selectedFingerprint.equals(key, ignoreCase = true),
+                        onClick = { selectedFingerprint = key },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+        }
+
+        SectionCard(title = "ANTI-DPI PADDING") {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                listOf(
+                    "balanced" to "Balanced",
+                    "stealth" to "Stealth",
+                    "off" to "Off"
+                ).forEach { (key, label) ->
+                    SelectableChip(
+                        label = label,
+                        selected = selectedPadding.equals(key, ignoreCase = true),
+                        onClick = { selectedPadding = key },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+        }
+
+        PrimaryActionButton(
+            label = "Apply & Sync",
+            onClick = {
+                onApplyAndSync(
+                    cfg.copy(
+                        cipher = selectedCipher,
+                        fingerprint = selectedFingerprint,
+                        paddingMode = selectedPadding
+                    )
+                )
+            }
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SUB-SCREEN 4: DNS & SHIELD
+// ---------------------------------------------------------------------------
+
+@Composable
+private fun DnsShieldSubScreen(
+    cfg: AetherConfig,
+    onSyncToRailway: (AetherConfig) -> Unit,
+    onPullFromRailway: (onDone: () -> Unit) -> Unit
+) {
+    var selectedDns by remember(cfg.dnsPreset) { mutableStateOf(cfg.dnsPreset.ifBlank { "adguard" }) }
+    var customDns by remember(cfg.customDns) { mutableStateOf(cfg.customDns) }
+    var blockDot by remember(cfg.blockDot) { mutableStateOf(cfg.blockDot) }
+    var adblockSni by remember(cfg.adblockSni) { mutableStateOf(cfg.adblockSni) }
+    var autoSync by remember(cfg.autoSync) { mutableStateOf(cfg.autoSync) }
+    var pulling by remember { mutableStateOf(false) }
+
+    val dnsPresets = listOf(
+        Triple("adguard", "AdGuard DNS", "94.140.14.14 · Ad & tracker blocking"),
+        Triple("cloudflare", "Cloudflare", "1.1.1.1 · Ultra-low-latency resolver"),
+        Triple("google", "Google", "8.8.8.8 · Global Anycast resolver"),
+        Triple("custom", "Custom", "Use your own upstream DNS server(s)")
+    )
+
+    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        SectionCard(title = "UPSTREAM DNS PRESET") {
+            dnsPresets.forEach { (key, title, desc) ->
+                SelectableOptionCard(
+                    title = title,
+                    description = desc,
+                    selected = selectedDns.equals(key, ignoreCase = true),
+                    onClick = { selectedDns = key }
+                )
+            }
+
+            if (selectedDns.equals("custom", ignoreCase = true)) {
+                AetherTextField(
+                    value = customDns,
+                    onValueChange = { customDns = it },
+                    label = "Custom DNS Servers",
+                    placeholder = "9.9.9.9:53, 149.112.112.112:53"
+                )
+            }
+        }
+
+        SectionCard(title = "SHIELD & LIVE SYNC") {
+            SwitchSettingRow(
+                title = "Block DoT (Port 853)",
+                subtitle = "Force apps through tunnel DNS without silent bypass",
+                checked = blockDot,
+                onCheckedChange = { blockDot = it }
+            )
+            HorizontalDivider(color = BorderHairline, thickness = 1.dp)
+            SwitchSettingRow(
+                title = "SNI AdBlock",
+                subtitle = "Drop ad & tracker TLS handshakes on Railway server",
+                checked = adblockSni,
+                onCheckedChange = { adblockSni = it }
+            )
+            HorizontalDivider(color = BorderHairline, thickness = 1.dp)
+            SwitchSettingRow(
+                title = "Auto-Sync with Railway",
+                subtitle = "Auto-apply live config changes pushed from dashboard",
+                checked = autoSync,
+                onCheckedChange = { autoSync = it }
+            )
+        }
+
+        PrimaryActionButton(
+            label = "Sync to Railway",
+            onClick = {
+                onSyncToRailway(
+                    cfg.copy(
+                        dnsPreset = selectedDns,
+                        customDns = customDns.trim(),
+                        blockDot = blockDot,
+                        adblockSni = adblockSni,
+                        autoSync = autoSync
+                    )
+                )
+            }
+        )
+
+        OutlinedButton(
+            enabled = !pulling,
+            onClick = {
+                pulling = true
+                onPullFromRailway { pulling = false }
+            },
             modifier = Modifier
                 .fillMaxWidth()
-                .height(50.dp),
+                .height(48.dp),
             shape = RoundedCornerShape(14.dp),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = SignalEmerald,
-                contentColor = OnEmeraldDark
+            border = BorderStroke(1.dp, BorderHairline),
+            colors = ButtonDefaults.outlinedButtonColors(
+                containerColor = SurfaceElevated,
+                contentColor = TextPrimary
             )
         ) {
+            SyncArrowsIcon(color = SignalEmeraldBright, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(8.dp))
             Text(
-                text = "Save Routes",
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Bold,
-                color = OnEmeraldDark
+                text = if (pulling) "Pulling from Railway..." else "Pull from Railway",
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = TextPrimary
             )
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// TAB 2: SETTINGS
+// SUB-SCREEN 5: SPLIT TUNNELING & BYPASS APPS (120 FPS LazyColumn)
 // ---------------------------------------------------------------------------
 
 @Composable
-private fun SettingsTab(
-    psk: String,
-    onPskChange: (String) -> Unit,
-    onCopyPsk: () -> Unit,
-    bypassLan: Boolean,
-    onBypassLanChange: (Boolean) -> Unit,
-    bypassApps: String,
-    onBypassAppsChange: (String) -> Unit,
-    onSave: () -> Unit
+private fun BypassAppsSubScreen(
+    cfg: AetherConfig,
+    running: Boolean,
+    onUpdateBypass: (AetherConfig) -> Unit,
+    onReconnectNow: (AetherConfig) -> Unit,
+    modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
+    var searchQuery by remember { mutableStateOf("") }
+    var showSystemApps by remember { mutableStateOf(false) }
+    var loading by remember { mutableStateOf(true) }
+    var installedApps by remember { mutableStateOf<List<InstalledAppItem>>(emptyList()) }
+    var dirtyWhileConnected by remember { mutableStateOf(false) }
+
+    val bypassedSet = remember(cfg.bypassApps) { cfg.bypassSet() }
+
+    LaunchedEffect(Unit) {
+        val loaded = withContext(Dispatchers.IO) {
+            val pm = context.packageManager
+            val selfPkg = context.packageName
+            val rawApps = try {
+                pm.getInstalledApplications(PackageManager.GET_META_DATA)
+            } catch (_: Throwable) {
+                emptyList()
+            }
+            rawApps
+                .asSequence()
+                .filter { it.packageName != selfPkg }
+                .map { appInfo ->
+                    val label = try {
+                        pm.getApplicationLabel(appInfo)?.toString()?.ifBlank { appInfo.packageName }
+                            ?: appInfo.packageName
+                    } catch (_: Throwable) {
+                        appInfo.packageName
+                    }
+                    val isSys = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0 &&
+                        (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0
+                    val iconBmp: ImageBitmap? = try {
+                        val drawable = pm.getApplicationIcon(appInfo)
+                        val bmp = Bitmap.createBitmap(72, 72, Bitmap.Config.ARGB_8888)
+                        val c = AndroidCanvas(bmp)
+                        drawable.setBounds(0, 0, 72, 72)
+                        drawable.draw(c)
+                        bmp.asImageBitmap()
+                    } catch (_: Throwable) {
+                        null
+                    }
+                    InstalledAppItem(
+                        packageName = appInfo.packageName,
+                        label = label,
+                        isSystem = isSys,
+                        icon = iconBmp
+                    )
+                }
+                .toList()
+        }
+        installedApps = loaded
+        loading = false
+    }
+
+    val filteredApps = remember(installedApps, searchQuery, showSystemApps, bypassedSet) {
+        val q = searchQuery.trim().lowercase(Locale.US)
+        installedApps
+            .filter { item ->
+                val visOk = showSystemApps || !item.isSystem || (item.packageName in bypassedSet)
+                val qOk = q.isEmpty() ||
+                    item.label.lowercase(Locale.US).contains(q) ||
+                    item.packageName.lowercase(Locale.US).contains(q)
+                visOk && qOk
+            }
+            .sortedWith(
+                compareByDescending<InstalledAppItem> { it.packageName in bypassedSet }
+                    .thenBy { it.label.lowercase(Locale.US) }
+            )
+    }
+
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        // Compact LAN Bypass Switch Card
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(15.dp))
+                .background(SurfaceCard)
+                .border(1.dp, BorderHairline, RoundedCornerShape(15.dp))
+                .padding(horizontal = 14.dp, vertical = 10.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(end = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                Text(
+                    text = "Bypass Local LAN",
+                    fontSize = 13.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = TextPrimary
+                )
+                Text(
+                    text = "Keep local Wi-Fi devices direct",
+                    fontSize = 11.sp,
+                    color = TextDim
+                )
+            }
+            Switch(
+                checked = cfg.bypassLan,
+                onCheckedChange = { checked ->
+                    onUpdateBypass(cfg.copy(bypassLan = checked))
+                    if (running) dirtyWhileConnected = true
+                },
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = OnEmeraldDark,
+                    checkedTrackColor = SignalEmerald,
+                    checkedBorderColor = SignalEmerald,
+                    uncheckedThumbColor = TextSecondary,
+                    uncheckedTrackColor = SurfaceRecessed,
+                    uncheckedBorderColor = BorderHairline
+                )
+            )
+        }
+
+        if (running && dirtyWhileConnected) {
+            PrimaryActionButton(
+                label = "Apply Bypass (Reconnect Tunnel)",
+                onClick = {
+                    dirtyWhileConnected = false
+                    onReconnectNow(cfg)
+                }
+            )
+        }
+
+        // Search Bar
+        AetherTextField(
+            value = searchQuery,
+            onValueChange = { searchQuery = it },
+            label = "Search installed apps...",
+            placeholder = "App name or package",
+            trailingIcon = if (searchQuery.isNotEmpty()) {
+                {
+                    TextButton(onClick = { searchQuery = "" }) {
+                        Text(
+                            text = "Clear",
+                            fontSize = 11.sp,
+                            color = TextSecondary
+                        )
+                    }
+                }
+            } else {
+                null
+            }
+        )
+
+        // Filter & Excluded Count Strip
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(9.dp))
+                        .background(if (showSystemApps) SignalEmerald.copy(alpha = 0.14f) else SurfaceCard)
+                        .border(
+                            1.dp,
+                            if (showSystemApps) SignalEmerald.copy(alpha = 0.55f) else BorderHairline,
+                            RoundedCornerShape(9.dp)
+                        )
+                        .clickable { showSystemApps = !showSystemApps }
+                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                ) {
+                    Text(
+                        text = "System Apps",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (showSystemApps) SignalEmeraldBright else TextSecondary
+                    )
+                }
+
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(9.dp))
+                        .background(SignalEmerald.copy(alpha = 0.12f))
+                        .border(1.dp, SignalEmerald.copy(alpha = 0.35f), RoundedCornerShape(9.dp))
+                        .padding(horizontal = 9.dp, vertical = 6.dp)
+                ) {
+                    Text(
+                        text = "Excluded: ${bypassedSet.size}",
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.SemiBold,
+                        color = SignalEmeraldBright
+                    )
+                }
+            }
+
+            if (bypassedSet.isNotEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(9.dp))
+                        .background(SignalRose.copy(alpha = 0.12f))
+                        .border(1.dp, SignalRose.copy(alpha = 0.35f), RoundedCornerShape(9.dp))
+                        .clickable {
+                            onUpdateBypass(cfg.copy(bypassApps = ""))
+                            if (running) dirtyWhileConnected = true
+                        }
+                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                ) {
+                    Text(
+                        text = "Clear",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color(0xFFFDA4AF)
+                    )
+                }
+            }
+        }
+
+        // High-FPS App List
+        if (loading) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "Scanning installed apps...",
+                    fontSize = 12.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = TextDim
+                )
+            }
+        } else if (filteredApps.isEmpty()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "No matching apps found",
+                    fontSize = 12.sp,
+                    color = TextDim
+                )
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+                contentPadding = PaddingValues(top = 2.dp, bottom = 116.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(filteredApps, key = { it.packageName }) { app ->
+                    val excluded = app.packageName in bypassedSet
+                    AppBypassRow(
+                        app = app,
+                        excluded = excluded,
+                        onToggle = {
+                            val next = bypassedSet.toMutableSet()
+                            if (excluded) next.remove(app.packageName) else next.add(app.packageName)
+                            val csv = next.sorted().joinToString(",")
+                            onUpdateBypass(cfg.copy(bypassApps = csv))
+                            if (running) dirtyWhileConnected = true
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AppBypassRow(
+    app: InstalledAppItem,
+    excluded: Boolean,
+    onToggle: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(if (excluded) SignalEmerald.copy(alpha = 0.09f) else SurfaceCard)
+            .border(
+                width = 1.dp,
+                color = if (excluded) SignalEmerald.copy(alpha = 0.45f) else BorderHairline,
+                shape = RoundedCornerShape(14.dp)
+            )
+            .clickable(onClick = onToggle)
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(11.dp)
+    ) {
+        if (app.icon != null) {
+            Image(
+                bitmap = app.icon,
+                contentDescription = app.label,
+                modifier = Modifier
+                    .size(36.dp)
+                    .clip(RoundedCornerShape(9.dp))
+            )
+        } else {
+            Box(
+                modifier = Modifier
+                    .size(36.dp)
+                    .clip(RoundedCornerShape(9.dp))
+                    .background(SurfaceElevated)
+                    .border(1.dp, BorderHairline, RoundedCornerShape(9.dp)),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = app.label.firstOrNull()?.uppercaseChar()?.toString() ?: "A",
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = SignalEmeraldBright
+                )
+            }
+        }
+
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(1.dp)
+        ) {
+            Text(
+                text = app.label,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = TextPrimary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = app.packageName,
+                fontSize = 10.sp,
+                fontFamily = FontFamily.Monospace,
+                color = TextDim,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+
+        // Crisp custom checkbox badge
+        Box(
+            modifier = Modifier
+                .size(22.dp)
+                .clip(RoundedCornerShape(6.dp))
+                .background(if (excluded) SignalEmerald else SurfaceRecessed)
+                .border(
+                    width = 1.2.dp,
+                    color = if (excluded) SignalEmeraldBright else BorderHairline,
+                    shape = RoundedCornerShape(6.dp)
+                ),
+            contentAlignment = Alignment.Center
+        ) {
+            if (excluded) {
+                CheckmarkIcon(color = OnEmeraldDark, modifier = Modifier.size(13.dp))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SUB-SCREEN 6: ACCESS KEY & ENGINE
+// ---------------------------------------------------------------------------
+
+@Composable
+private fun AccessKeySubScreen(
+    cfg: AetherConfig,
+    onCopyPsk: (String) -> Unit,
+    onSaveKey: (AetherConfig) -> Unit
+) {
+    var pskDraft by remember(cfg.psk) { mutableStateOf(cfg.psk) }
     var showKey by remember { mutableStateOf(false) }
 
     Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-        // Authentication Card
         SectionCard(
             title = "AUTHENTICATION",
             trailing = {
@@ -1690,7 +2986,7 @@ private fun SettingsTab(
                         .clip(RoundedCornerShape(8.dp))
                         .background(SurfaceElevated)
                         .border(1.dp, BorderHairline, RoundedCornerShape(8.dp))
-                        .clickable(onClick = onCopyPsk)
+                        .clickable { onCopyPsk(pskDraft) }
                         .padding(horizontal = 9.dp, vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(5.dp)
@@ -1706,8 +3002,8 @@ private fun SettingsTab(
             }
         ) {
             AetherTextField(
-                value = psk,
-                onValueChange = onPskChange,
+                value = pskDraft,
+                onValueChange = { pskDraft = it },
                 label = "Secret Key (AETHER_PSK)",
                 placeholder = "Paste shared tunnel key",
                 visualTransformation = if (showKey) VisualTransformation.None else PasswordVisualTransformation(),
@@ -1722,73 +3018,31 @@ private fun SettingsTab(
                     }
                 }
             )
-        }
 
-        // Split Tunneling Card
-        SectionCard(title = "SPLIT TUNNELING") {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column(
-                    modifier = Modifier
-                        .weight(1f)
-                        .padding(end = 12.dp),
-                    verticalArrangement = Arrangement.spacedBy(2.dp)
-                ) {
-                    Text(
-                        text = "Bypass Local LAN",
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = TextPrimary
-                    )
-                    Text(
-                        text = "Keep local Wi-Fi devices direct (saves server quota)",
-                        fontSize = 11.sp,
-                        color = TextDim
-                    )
+            PrimaryActionButton(
+                label = "Save Key",
+                onClick = {
+                    onSaveKey(cfg.copy(psk = pskDraft.trim()))
                 }
-                Switch(
-                    checked = bypassLan,
-                    onCheckedChange = onBypassLanChange,
-                    colors = SwitchDefaults.colors(
-                        checkedThumbColor = OnEmeraldDark,
-                        checkedTrackColor = SignalEmerald,
-                        checkedBorderColor = SignalEmerald,
-                        uncheckedThumbColor = TextSecondary,
-                        uncheckedTrackColor = SurfaceRecessed,
-                        uncheckedBorderColor = BorderHairline
-                    )
-                )
-            }
-
-            HorizontalDivider(color = BorderHairline, thickness = 1.dp)
-
-            AetherTextField(
-                value = bypassApps,
-                onValueChange = onBypassAppsChange,
-                label = "Bypass Apps (comma-separated packages)",
-                placeholder = "com.example.bank, com.local.app"
             )
         }
 
-        // Protocol & Engine Spec Card (Structured 2-column rows)
-        SectionCard(title = "PROTOCOL & ENGINE") {
+        SectionCard(title = "ENGINE SPECIFICATION") {
             val specs = listOf(
-                "Protocol" to "Aether v2 · 0-RTT",
-                "Encryption" to "X25519 · XChaCha20-Poly1305",
-                "Stealth" to "uTLS Chrome · Anti-DPI",
-                "DNS Engine" to "AdGuard Hedged · 60s Cache",
+                "Protocol" to "Aether v4 · 0-RTT",
+                "Active Cipher" to fullCipherName(cfg.cipher),
+                "Transport" to "${transportLabel(cfg.transport)} · ${cfg.carriers} Carriers",
+                "Stealth uTLS" to "${fingerprintLabel(cfg.fingerprint)} · ${paddingLabel(cfg.paddingMode)}",
+                "DNS Cache" to "${dnsLabel(cfg.dnsPreset)} · 60s Hedged",
                 "UDP / QUIC" to "Full-Cone · MTU 1500",
-                "Build" to "v3.2.0 (13)"
+                "Build" to "v4.0.0 (14)"
             )
             Column {
                 specs.forEachIndexed { idx, (key, value) ->
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(vertical = 9.dp),
+                            .padding(vertical = 8.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -1800,7 +3054,7 @@ private fun SettingsTab(
                         Spacer(Modifier.width(12.dp))
                         Text(
                             text = value,
-                            fontSize = 12.sp,
+                            fontSize = 11.5.sp,
                             fontFamily = FontFamily.Monospace,
                             fontWeight = FontWeight.Medium,
                             color = TextPrimary,
@@ -1816,26 +3070,6 @@ private fun SettingsTab(
                     }
                 }
             }
-        }
-
-        // Primary Save CTA (WCAG AAA dark-on-emerald contrast)
-        Button(
-            onClick = onSave,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(50.dp),
-            shape = RoundedCornerShape(14.dp),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = SignalEmerald,
-                contentColor = OnEmeraldDark
-            )
-        ) {
-            Text(
-                text = "Save Settings",
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Bold,
-                color = OnEmeraldDark
-            )
         }
     }
 }
@@ -1856,8 +3090,8 @@ private fun SectionCard(
             .clip(RoundedCornerShape(18.dp))
             .background(SurfaceCard)
             .border(1.dp, BorderHairline, RoundedCornerShape(18.dp))
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+            .padding(15.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -1878,6 +3112,169 @@ private fun SectionCard(
 }
 
 @Composable
+private fun SelectableOptionCard(
+    title: String,
+    description: String,
+    selected: Boolean,
+    onClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(13.dp))
+            .background(if (selected) SignalEmerald.copy(alpha = 0.11f) else SurfaceRecessed)
+            .border(
+                width = 1.dp,
+                color = if (selected) SignalEmerald.copy(alpha = 0.75f) else BorderHairline,
+                shape = RoundedCornerShape(13.dp)
+            )
+            .clickable(onClick = onClick)
+            .padding(horizontal = 13.dp, vertical = 11.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(11.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .size(18.dp)
+                .clip(CircleShape)
+                .border(
+                    width = 1.8.dp,
+                    color = if (selected) SignalEmeraldBright else TextDim,
+                    shape = CircleShape
+                ),
+            contentAlignment = Alignment.Center
+        ) {
+            if (selected) {
+                Box(
+                    modifier = Modifier
+                        .size(9.dp)
+                        .clip(CircleShape)
+                        .background(SignalEmeraldBright)
+                )
+            }
+        }
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            Text(
+                text = title,
+                fontSize = 13.5.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = if (selected) SignalEmeraldBright else TextPrimary
+            )
+            Text(
+                text = description,
+                fontSize = 11.sp,
+                color = TextSecondary,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+@Composable
+private fun SelectableChip(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(11.dp))
+            .background(if (selected) SignalEmerald.copy(alpha = 0.14f) else SurfaceRecessed)
+            .border(
+                width = 1.dp,
+                color = if (selected) SignalEmerald else BorderHairline,
+                shape = RoundedCornerShape(11.dp)
+            )
+            .clickable(onClick = onClick)
+            .padding(vertical = 10.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = label,
+            fontSize = 12.sp,
+            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+            color = if (selected) SignalEmeraldBright else TextSecondary,
+            maxLines = 1
+        )
+    }
+}
+
+@Composable
+private fun SwitchSettingRow(
+    title: String,
+    subtitle: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .padding(end = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            Text(
+                text = title,
+                fontSize = 13.5.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = TextPrimary
+            )
+            Text(
+                text = subtitle,
+                fontSize = 11.sp,
+                color = TextDim
+            )
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            colors = SwitchDefaults.colors(
+                checkedThumbColor = OnEmeraldDark,
+                checkedTrackColor = SignalEmerald,
+                checkedBorderColor = SignalEmerald,
+                uncheckedThumbColor = TextSecondary,
+                uncheckedTrackColor = SurfaceRecessed,
+                uncheckedBorderColor = BorderHairline
+            )
+        )
+    }
+}
+
+@Composable
+private fun PrimaryActionButton(
+    label: String,
+    onClick: () -> Unit
+) {
+    Button(
+        onClick = onClick,
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(48.dp),
+        shape = RoundedCornerShape(14.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = SignalEmerald,
+            contentColor = OnEmeraldDark
+        )
+    ) {
+        Text(
+            text = label,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.Bold,
+            color = OnEmeraldDark
+        )
+    }
+}
+
+@Composable
 private fun AetherTextField(
     value: String,
     onValueChange: (String) -> Unit,
@@ -1891,12 +3288,12 @@ private fun AetherTextField(
         onValueChange = onValueChange,
         label = { Text(label, fontSize = 12.sp) },
         placeholder = if (placeholder.isNotEmpty()) {
-            { Text(placeholder, fontSize = 13.sp, color = TextDim) }
+            { Text(placeholder, fontSize = 12.5.sp, color = TextDim) }
         } else {
             null
         },
         textStyle = TextStyle(
-            fontSize = 13.sp,
+            fontSize = 12.5.sp,
             fontFamily = FontFamily.Monospace,
             color = TextPrimary
         ),
@@ -1943,7 +3340,6 @@ private fun BrandMarkIcon(active: Boolean, modifier: Modifier = Modifier) {
         val h = size.height
         val stroke = Stroke(width = 1.8.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round)
 
-        // Minimal geometric shield silhouette
         val shield = Path().apply {
             moveTo(w * 0.50f, h * 0.10f)
             lineTo(w * 0.86f, h * 0.24f)
@@ -1955,7 +3351,6 @@ private fun BrandMarkIcon(active: Boolean, modifier: Modifier = Modifier) {
         }
         drawPath(path = shield, color = strokeColor, style = stroke)
 
-        // Inner pulse node + subtle halo
         val center = Offset(w * 0.50f, h * 0.50f)
         drawCircle(
             color = nodeColor.copy(alpha = 0.25f),
@@ -1997,28 +3392,7 @@ private fun TunnelTabIcon(color: Color, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun RoutesTabIcon(color: Color, modifier: Modifier = Modifier) {
-    Canvas(modifier = modifier) {
-        val w = size.width
-        val h = size.height
-        val sw = 1.8.dp.toPx()
-        val stroke = Stroke(width = sw, cap = StrokeCap.Round, join = StrokeJoin.Round)
-
-        val n1 = Offset(w * 0.24f, h * 0.28f)
-        val n2 = Offset(w * 0.24f, h * 0.74f)
-        val n3 = Offset(w * 0.78f, h * 0.51f)
-        val r = w * 0.115f
-
-        drawLine(color = color, start = Offset(n1.x + r, n1.y + r * 0.35f), end = Offset(n3.x - r, n3.y - r * 0.35f), strokeWidth = sw, cap = StrokeCap.Round)
-        drawLine(color = color, start = Offset(n2.x + r, n2.y - r * 0.35f), end = Offset(n3.x - r, n3.y + r * 0.35f), strokeWidth = sw, cap = StrokeCap.Round)
-        drawCircle(color = color, radius = r, center = n1, style = stroke)
-        drawCircle(color = color, radius = r, center = n2, style = stroke)
-        drawCircle(color = color, radius = r, center = n3, style = stroke)
-    }
-}
-
-@Composable
-private fun SettingsTabIcon(color: Color, modifier: Modifier = Modifier) {
+private fun MenuHubIcon(color: Color, modifier: Modifier = Modifier) {
     Canvas(modifier = modifier) {
         val w = size.width
         val h = size.height
@@ -2044,6 +3418,283 @@ private fun SettingsTabIcon(color: Color, modifier: Modifier = Modifier) {
             }
             drawCircle(color = color, radius = knobR, center = Offset(kx, y), style = stroke)
         }
+    }
+}
+
+@Composable
+private fun RoutesTabIcon(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val sw = 1.8.dp.toPx()
+        val stroke = Stroke(width = sw, cap = StrokeCap.Round, join = StrokeJoin.Round)
+
+        val n1 = Offset(w * 0.24f, h * 0.28f)
+        val n2 = Offset(w * 0.24f, h * 0.74f)
+        val n3 = Offset(w * 0.78f, h * 0.51f)
+        val r = w * 0.115f
+
+        drawLine(color = color, start = Offset(n1.x + r, n1.y + r * 0.35f), end = Offset(n3.x - r, n3.y - r * 0.35f), strokeWidth = sw, cap = StrokeCap.Round)
+        drawLine(color = color, start = Offset(n2.x + r, n2.y - r * 0.35f), end = Offset(n3.x - r, n3.y + r * 0.35f), strokeWidth = sw, cap = StrokeCap.Round)
+        drawCircle(color = color, radius = r, center = n1, style = stroke)
+        drawCircle(color = color, radius = r, center = n2, style = stroke)
+        drawCircle(color = color, radius = r, center = n3, style = stroke)
+    }
+}
+
+@Composable
+private fun ProtocolIcon(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val sw = 1.8.dp.toPx()
+        val stroke = Stroke(width = sw, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        // Stacked parallel stream layers
+        val topLayer = Path().apply {
+            moveTo(w * 0.50f, h * 0.14f)
+            lineTo(w * 0.88f, h * 0.34f)
+            lineTo(w * 0.50f, h * 0.54f)
+            lineTo(w * 0.12f, h * 0.34f)
+            close()
+        }
+        drawPath(path = topLayer, color = color, style = stroke)
+        val midLayer = Path().apply {
+            moveTo(w * 0.14f, h * 0.55f)
+            lineTo(w * 0.50f, h * 0.74f)
+            lineTo(w * 0.86f, h * 0.55f)
+        }
+        drawPath(path = midLayer, color = color, style = stroke)
+        val botLayer = Path().apply {
+            moveTo(w * 0.18f, h * 0.73f)
+            lineTo(w * 0.50f, h * 0.90f)
+            lineTo(w * 0.82f, h * 0.73f)
+        }
+        drawPath(path = botLayer, color = color, style = stroke)
+    }
+}
+
+@Composable
+private fun ShieldLockIcon(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val sw = 1.8.dp.toPx()
+        val stroke = Stroke(width = sw, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawRoundRect(
+            color = color,
+            topLeft = Offset(w * 0.20f, h * 0.44f),
+            size = Size(w * 0.60f, h * 0.44f),
+            cornerRadius = CornerRadius(3.dp.toPx(), 3.dp.toPx()),
+            style = stroke
+        )
+        drawArc(
+            color = color,
+            startAngle = 180f,
+            sweepAngle = 180f,
+            useCenter = false,
+            topLeft = Offset(w * 0.31f, h * 0.16f),
+            size = Size(w * 0.38f, h * 0.44f),
+            style = stroke
+        )
+        drawLine(
+            color = color,
+            start = Offset(w * 0.31f, h * 0.38f),
+            end = Offset(w * 0.31f, h * 0.44f),
+            strokeWidth = sw,
+            cap = StrokeCap.Round
+        )
+        drawLine(
+            color = color,
+            start = Offset(w * 0.69f, h * 0.38f),
+            end = Offset(w * 0.69f, h * 0.44f),
+            strokeWidth = sw,
+            cap = StrokeCap.Round
+        )
+        drawCircle(
+            color = color,
+            radius = w * 0.06f,
+            center = Offset(w * 0.50f, h * 0.66f)
+        )
+    }
+}
+
+@Composable
+private fun DnsGlobeIcon(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val sw = 1.8.dp.toPx()
+        val stroke = Stroke(width = sw, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        val r = size.minDimension * 0.38f
+        val c = Offset(w * 0.50f, h * 0.50f)
+        drawCircle(color = color, radius = r, center = c, style = stroke)
+        drawOval(
+            color = color,
+            topLeft = Offset(c.x - r * 0.46f, c.y - r),
+            size = Size(r * 0.92f, r * 2f),
+            style = stroke
+        )
+        drawLine(
+            color = color,
+            start = Offset(c.x - r, c.y),
+            end = Offset(c.x + r, c.y),
+            strokeWidth = sw,
+            cap = StrokeCap.Round
+        )
+    }
+}
+
+@Composable
+private fun AppsGridIcon(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val sw = 1.8.dp.toPx()
+        val stroke = Stroke(width = sw, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        val cell = w * 0.30f
+        val cr = CornerRadius(2.2.dp.toPx(), 2.2.dp.toPx())
+        drawRoundRect(color = color, topLeft = Offset(w * 0.14f, h * 0.14f), size = Size(cell, cell), cornerRadius = cr, style = stroke)
+        drawRoundRect(color = color, topLeft = Offset(w * 0.56f, h * 0.14f), size = Size(cell, cell), cornerRadius = cr, style = stroke)
+        drawRoundRect(color = color, topLeft = Offset(w * 0.14f, h * 0.56f), size = Size(cell, cell), cornerRadius = cr, style = stroke)
+        drawRoundRect(color = color, topLeft = Offset(w * 0.56f, h * 0.56f), size = Size(cell, cell), cornerRadius = cr, style = stroke)
+    }
+}
+
+@Composable
+private fun KeyIcon(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val sw = 1.8.dp.toPx()
+        val stroke = Stroke(width = sw, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        val headCenter = Offset(w * 0.31f, h * 0.50f)
+        val headR = w * 0.17f
+        drawCircle(color = color, radius = headR, center = headCenter, style = stroke)
+        drawLine(
+            color = color,
+            start = Offset(headCenter.x + headR, h * 0.50f),
+            end = Offset(w * 0.88f, h * 0.50f),
+            strokeWidth = sw,
+            cap = StrokeCap.Round
+        )
+        drawLine(
+            color = color,
+            start = Offset(w * 0.72f, h * 0.50f),
+            end = Offset(w * 0.72f, h * 0.67f),
+            strokeWidth = sw,
+            cap = StrokeCap.Round
+        )
+        drawLine(
+            color = color,
+            start = Offset(w * 0.86f, h * 0.50f),
+            end = Offset(w * 0.86f, h * 0.64f),
+            strokeWidth = sw,
+            cap = StrokeCap.Round
+        )
+    }
+}
+
+@Composable
+private fun ChevronRightIcon(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val sw = 1.8.dp.toPx()
+        val path = Path().apply {
+            moveTo(w * 0.36f, h * 0.20f)
+            lineTo(w * 0.68f, h * 0.50f)
+            lineTo(w * 0.36f, h * 0.80f)
+        }
+        drawPath(path = path, color = color, style = Stroke(width = sw, cap = StrokeCap.Round, join = StrokeJoin.Round))
+    }
+}
+
+@Composable
+private fun ChevronLeftIcon(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val sw = 1.8.dp.toPx()
+        val path = Path().apply {
+            moveTo(w * 0.66f, h * 0.20f)
+            lineTo(w * 0.34f, h * 0.50f)
+            lineTo(w * 0.66f, h * 0.80f)
+        }
+        drawPath(path = path, color = color, style = Stroke(width = sw, cap = StrokeCap.Round, join = StrokeJoin.Round))
+    }
+}
+
+@Composable
+private fun CheckmarkIcon(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val sw = 2.1.dp.toPx()
+        val path = Path().apply {
+            moveTo(w * 0.16f, h * 0.52f)
+            lineTo(w * 0.42f, h * 0.78f)
+            lineTo(w * 0.86f, h * 0.24f)
+        }
+        drawPath(path = path, color = color, style = Stroke(width = sw, cap = StrokeCap.Round, join = StrokeJoin.Round))
+    }
+}
+
+@Composable
+private fun PulseIcon(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val sw = 1.8.dp.toPx()
+        val path = Path().apply {
+            moveTo(w * 0.10f, h * 0.54f)
+            lineTo(w * 0.30f, h * 0.54f)
+            lineTo(w * 0.42f, h * 0.20f)
+            lineTo(w * 0.58f, h * 0.82f)
+            lineTo(w * 0.70f, h * 0.54f)
+            lineTo(w * 0.90f, h * 0.54f)
+        }
+        drawPath(path = path, color = color, style = Stroke(width = sw, cap = StrokeCap.Round, join = StrokeJoin.Round))
+    }
+}
+
+@Composable
+private fun SyncArrowsIcon(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val sw = 1.8.dp.toPx()
+        val stroke = Stroke(width = sw, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        val inset = w * 0.18f
+        drawArc(
+            color = color,
+            startAngle = -150f,
+            sweepAngle = 140f,
+            useCenter = false,
+            topLeft = Offset(inset, inset),
+            size = Size(w - inset * 2f, h - inset * 2f),
+            style = stroke
+        )
+        drawArc(
+            color = color,
+            startAngle = 30f,
+            sweepAngle = 140f,
+            useCenter = false,
+            topLeft = Offset(inset, inset),
+            size = Size(w - inset * 2f, h - inset * 2f),
+            style = stroke
+        )
+        val topHead = Path().apply {
+            moveTo(w * 0.72f, h * 0.22f)
+            lineTo(w * 0.84f, h * 0.36f)
+            lineTo(w * 0.68f, h * 0.38f)
+        }
+        drawPath(path = topHead, color = color, style = stroke)
+        val botHead = Path().apply {
+            moveTo(w * 0.28f, h * 0.78f)
+            lineTo(w * 0.16f, h * 0.64f)
+            lineTo(w * 0.32f, h * 0.62f)
+        }
+        drawPath(path = botHead, color = color, style = stroke)
     }
 }
 
@@ -2088,7 +3739,6 @@ private fun SwapArrowsIcon(color: Color, modifier: Modifier = Modifier) {
         val h = size.height
         val sw = 1.8.dp.toPx()
         val stroke = Stroke(width = sw, cap = StrokeCap.Round, join = StrokeJoin.Round)
-        // Top arrow pointing right
         drawLine(color = color, start = Offset(w * 0.16f, h * 0.34f), end = Offset(w * 0.84f, h * 0.34f), strokeWidth = sw, cap = StrokeCap.Round)
         val rightHead = Path().apply {
             moveTo(w * 0.66f, h * 0.18f)
@@ -2096,7 +3746,6 @@ private fun SwapArrowsIcon(color: Color, modifier: Modifier = Modifier) {
             lineTo(w * 0.66f, h * 0.50f)
         }
         drawPath(path = rightHead, color = color, style = stroke)
-        // Bottom arrow pointing left
         drawLine(color = color, start = Offset(w * 0.84f, h * 0.68f), end = Offset(w * 0.16f, h * 0.68f), strokeWidth = sw, cap = StrokeCap.Round)
         val leftHead = Path().apply {
             moveTo(w * 0.34f, h * 0.52f)
@@ -2114,7 +3763,6 @@ private fun ClipboardImportIcon(color: Color, modifier: Modifier = Modifier) {
         val h = size.height
         val sw = 1.8.dp.toPx()
         val stroke = Stroke(width = sw, cap = StrokeCap.Round, join = StrokeJoin.Round)
-        // Clipboard body
         drawRoundRect(
             color = color,
             topLeft = Offset(w * 0.18f, h * 0.22f),
@@ -2122,7 +3770,6 @@ private fun ClipboardImportIcon(color: Color, modifier: Modifier = Modifier) {
             cornerRadius = CornerRadius(2.5.dp.toPx(), 2.5.dp.toPx()),
             style = stroke
         )
-        // Top clip
         drawRoundRect(
             color = color,
             topLeft = Offset(w * 0.36f, h * 0.10f),
@@ -2130,7 +3777,6 @@ private fun ClipboardImportIcon(color: Color, modifier: Modifier = Modifier) {
             cornerRadius = CornerRadius(1.5.dp.toPx(), 1.5.dp.toPx()),
             style = stroke
         )
-        // Downward import arrow inside clipboard
         drawLine(color = color, start = Offset(w * 0.50f, h * 0.42f), end = Offset(w * 0.50f, h * 0.72f), strokeWidth = sw, cap = StrokeCap.Round)
         val chev = Path().apply {
             moveTo(w * 0.36f, h * 0.58f)
@@ -2148,7 +3794,6 @@ private fun ShareCopyIcon(color: Color, modifier: Modifier = Modifier) {
         val h = size.height
         val sw = 1.8.dp.toPx()
         val stroke = Stroke(width = sw, cap = StrokeCap.Round, join = StrokeJoin.Round)
-        // Front card
         drawRoundRect(
             color = color,
             topLeft = Offset(w * 0.34f, h * 0.34f),
@@ -2156,7 +3801,6 @@ private fun ShareCopyIcon(color: Color, modifier: Modifier = Modifier) {
             cornerRadius = CornerRadius(2.5.dp.toPx(), 2.5.dp.toPx()),
             style = stroke
         )
-        // Back overlapping frame
         val back = Path().apply {
             moveTo(w * 0.24f, h * 0.64f)
             lineTo(w * 0.18f, h * 0.64f)

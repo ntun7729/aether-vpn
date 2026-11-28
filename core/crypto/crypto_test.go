@@ -70,3 +70,51 @@ func TestPSKMismatchFailsDecryption(t *testing.T) {
 		t.Fatal("expected decryption failure with mismatched PSK")
 	}
 }
+
+func TestAllCipherSuitesSealOpenAndInPlace(t *testing.T) {
+	psk := []byte("aether-v4-all-ciphers-psk")
+	var sid [16]byte
+	copy(sid[:], []byte("fedcba9876543210"))
+	ckp, _ := GenerateKeyPair()
+	skp, _ := GenerateKeyPair()
+
+	ciphers := []string{"xchacha20-poly1305", "aes-256-gcm", "aes-128-gcm", "chacha20-poly1305", "none"}
+	msg := []byte("AetherVPN v4 multi-cipher payload verification 0123456789abcdef")
+
+	for _, name := range ciphers {
+		id := ParseCipher(name)
+		cc, err := DeriveSessionCipherWithID(psk, ckp.Private, skp.Public, sid, false, id)
+		if err != nil {
+			t.Fatalf("%s client derive: %v", name, err)
+		}
+		sc, err := DeriveSessionCipherWithID(psk, skp.Private, ckp.Public, sid, true, id)
+		if err != nil {
+			t.Fatalf("%s server derive: %v", name, err)
+		}
+
+		// Standard Seal / Open
+		sealed := cc.Seal(msg)
+		plain, err := sc.Open(sealed)
+		if err != nil || !bytes.Equal(plain, msg) {
+			t.Fatalf("%s Seal/Open failed: err=%v got=%q", name, err, plain)
+		}
+
+		// In-place SealInPlace / OpenInPlace
+		buf := make([]byte, 8+len(msg), 8+len(msg)+TagSize)
+		copy(buf[8:], msg)
+		wire := cc.SealInPlace(buf, len(msg))
+		plain2, err := sc.OpenInPlace(wire)
+		if err != nil || !bytes.Equal(plain2, msg) {
+			t.Fatalf("%s InPlace failed: err=%v got=%q", name, err, plain2)
+		}
+
+		// Tamper check for AEAD modes
+		if id != CipherNone {
+			tampered := append([]byte(nil), sealed...)
+			tampered[len(tampered)-1] ^= 0x55
+			if _, err := sc.Open(tampered); err == nil {
+				t.Fatalf("%s failed to reject tampered packet", name)
+			}
+		}
+	}
+}

@@ -31,6 +31,8 @@ const (
 	ServerHelloSize = 1 + 1 + 32 + 32          // 66 bytes
 
 	MaxClockSkew = 120 * time.Second
+
+	defaultUserAgent = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
 )
 
 var (
@@ -38,7 +40,7 @@ var (
 	ErrHandshakeFail  = errors.New("aether/carrier: handshake failed")
 )
 
-// Conn is the transport-agnostic interface implemented by WebSocket and HTTP/2 carriers.
+// Conn is the transport-agnostic interface implemented by WebSocket, XHTTP, gRPC, and HTTP/2 carriers.
 type Conn interface {
 	CarrierID() uint64
 	GetEndpoint() Endpoint
@@ -49,6 +51,7 @@ type Conn interface {
 	IsClosed() bool
 	Degraded() bool
 	QueueLen() int
+	SetOnWritten(fn func(int))
 }
 
 // Endpoint describes a server URL (Railway, Render, or Cloudflare Worker relay).
@@ -56,7 +59,8 @@ type Endpoint struct {
 	Name          string `json:"name"`
 	URL           string `json:"url"`                      // e.g. wss://my-app.up.railway.app/ws/sync
 	ResolveIP     string `json:"resolve_ip,omitempty"`     // Optional Cloudflare clean IP override
-	Transport     string `json:"transport,omitempty"`      // "auto" (default), "ws", or "h2"
+	Transport     string `json:"transport,omitempty"`      // "auto" (default), "ws", "xhttp", "grpc", or "h2"
+	Fingerprint   string `json:"fingerprint,omitempty"`    // "chrome" (default), "firefox", "safari", "ios", "randomized"
 	Priority      int    `json:"priority,omitempty"`       // Lower = preferred (0=primary, 1=fallback)
 	BindInterface string `json:"bind_interface,omitempty"` // Optional Linux interface (e.g. "eth0") to bypass local TUN
 }
@@ -64,7 +68,8 @@ type Endpoint struct {
 // ClientHello is the first binary message sent on a newly established carrier.
 type ClientHello struct {
 	Version   byte
-	Mode      byte
+	Mode      byte // Low nibble: ModeNewSession (0) or ModeAttachCarrier (1)
+	CipherID  byte // High nibble of wire Mode byte: 0=XChaCha20, 1=AES256GCM, 2=AES128GCM, 3=ChaCha20, 4=None
 	SessionID [16]byte
 	PubKey    [acrypto.KeySize]byte
 	Timestamp int64
@@ -74,7 +79,7 @@ type ClientHello struct {
 func EncodeClientHello(h ClientHello, psk []byte) []byte {
 	buf := make([]byte, ClientHelloSize)
 	buf[0] = h.Version
-	buf[1] = h.Mode
+	buf[1] = (h.CipherID << 4) | (h.Mode & 0x0F)
 	copy(buf[2:18], h.SessionID[:])
 	copy(buf[18:50], h.PubKey[:])
 	binary.BigEndian.PutUint64(buf[50:58], uint64(h.Timestamp))
@@ -106,7 +111,8 @@ func DecodeClientHello(data, psk []byte) (ClientHello, error) {
 	}
 	var h ClientHello
 	h.Version = data[0]
-	h.Mode = data[1]
+	h.Mode = data[1] & 0x0F
+	h.CipherID = (data[1] >> 4) & 0x0F
 	copy(h.SessionID[:], data[2:18])
 	copy(h.PubKey[:], data[18:50])
 	h.Timestamp = ts
@@ -150,16 +156,17 @@ func DecodeServerHello(data []byte, sessionID [16]byte, psk []byte) (ServerHello
 // Carrier wraps a WebSocket connection with an async priority writer queue (zero bufferbloat)
 // and a 5-second Pong timeout for fast wake-from-sleep recovery.
 type Carrier struct {
-	ID       uint64
-	Endpoint Endpoint
-	conn     *websocket.Conn
-	highCh   chan []byte
-	bulkCh   chan []byte
-	pongCh   chan struct{}
-	degraded atomic.Bool
-	closed   atomic.Bool
-	closeOne sync.Once
-	closeCh  chan struct{}
+	ID        uint64
+	Endpoint  Endpoint
+	conn      *websocket.Conn
+	highCh    chan []byte
+	bulkCh    chan []byte
+	pongCh    chan struct{}
+	onWritten atomic.Value // func(int)
+	degraded  atomic.Bool
+	closed    atomic.Bool
+	closeOne  sync.Once
+	closeCh   chan struct{}
 }
 
 var nextCarrierID atomic.Uint64
@@ -168,6 +175,12 @@ func (c *Carrier) CarrierID() uint64     { return c.ID }
 func (c *Carrier) GetEndpoint() Endpoint { return c.Endpoint }
 func (c *Carrier) Degraded() bool        { return c.degraded.Load() }
 func (c *Carrier) QueueLen() int         { return len(c.bulkCh) }
+
+func (c *Carrier) SetOnWritten(fn func(int)) {
+	if fn != nil {
+		c.onWritten.Store(fn)
+	}
+}
 
 // WrapConn creates a Carrier with high-throughput async priority write lanes.
 func WrapConn(conn *websocket.Conn, ep Endpoint) *Carrier {
@@ -210,6 +223,9 @@ func (c *Carrier) writerLoop() {
 			_ = c.Close()
 			return false
 		}
+		if fn, ok := c.onWritten.Load().(func(int)); ok && fn != nil {
+			fn(len(data))
+		}
 		c.degraded.Store(time.Since(t0) > 800*time.Millisecond)
 		return true
 	}
@@ -242,23 +258,81 @@ func (c *Carrier) writerLoop() {
 	}
 }
 
-// Dial connects a carrier using Endpoint.Transport ("auto", "ws", or "h2").
+// dialUTLS performs a TLS handshake impersonating the selected browser fingerprint (chrome/firefox/safari/ios/randomized).
+func dialUTLS(ctx context.Context, rawConn net.Conn, serverName, fingerprint string, alpn []string) (net.Conn, error) {
+	var helloID utls.ClientHelloID
+	switch fingerprint {
+	case "firefox":
+		helloID = utls.HelloFirefox_Auto
+	case "safari":
+		helloID = utls.HelloSafari_Auto
+	case "ios":
+		helloID = utls.HelloIOS_Auto
+	case "randomized", "random":
+		helloID = utls.HelloRandomizedALPN
+	default:
+		helloID = utls.HelloChrome_Auto
+	}
+
+	if helloID == utls.HelloRandomizedALPN {
+		uConn := utls.UClient(rawConn, &utls.Config{ServerName: serverName, NextProtos: alpn}, helloID)
+		if err := uConn.HandshakeContext(ctx); err != nil {
+			_ = rawConn.Close()
+			return nil, err
+		}
+		return uConn, nil
+	}
+
+	spec, err := utls.UTLSIdToSpec(helloID)
+	if err != nil {
+		_ = rawConn.Close()
+		return nil, err
+	}
+	if len(alpn) > 0 {
+		for _, ext := range spec.Extensions {
+			if a, ok := ext.(*utls.ALPNExtension); ok {
+				a.AlpnProtocols = alpn
+			}
+		}
+	}
+	uConn := utls.UClient(rawConn, &utls.Config{ServerName: serverName}, utls.HelloCustom)
+	if err := uConn.ApplyPreset(&spec); err != nil {
+		_ = rawConn.Close()
+		return nil, err
+	}
+	if err := uConn.HandshakeContext(ctx); err != nil {
+		_ = rawConn.Close()
+		return nil, err
+	}
+	return uConn, nil
+}
+
+// Dial connects a carrier using Endpoint.Transport ("auto", "ws", "xhttp", "grpc", or "h2").
 func Dial(ctx context.Context, ep Endpoint, timeout time.Duration) (Conn, error) {
 	switch ep.Transport {
+	case "xhttp":
+		return DialXHTTP(ctx, ep, timeout)
+	case "grpc":
+		return DialGRPC(ctx, ep, timeout)
 	case "h2":
 		return DialH2(ctx, ep, timeout)
 	case "ws":
 		return DialWS(ctx, ep, timeout)
-	default: // "auto"
-		c, err := DialWS(ctx, ep, timeout)
-		if err == nil {
+	default: // "auto": WS -> XHTTP (SplitHTTP) -> gRPC -> H2
+		if c, err := DialWS(ctx, ep, timeout); err == nil {
 			return c, nil
+		}
+		if xc, err := DialXHTTP(ctx, ep, timeout); err == nil {
+			return xc, nil
+		}
+		if gc, err := DialGRPC(ctx, ep, timeout); err == nil {
+			return gc, nil
 		}
 		h2c, h2Err := DialH2(ctx, ep, timeout)
 		if h2Err == nil {
 			return h2c, nil
 		}
-		return nil, fmt.Errorf("ws (%v) and h2 (%v) both failed", err, h2Err)
+		return nil, fmt.Errorf("all transports (ws, xhttp, grpc, h2) failed: %w", h2Err)
 	}
 }
 
@@ -312,31 +386,12 @@ func DialWS(ctx context.Context, ep Endpoint, timeout time.Duration) (*Carrier, 
 			if tc, ok := rawConn.(*net.TCPConn); ok {
 				_ = tc.SetNoDelay(true)
 			}
-			spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
-			if err != nil {
-				_ = rawConn.Close()
-				return nil, err
-			}
-			for _, ext := range spec.Extensions {
-				if alpn, ok := ext.(*utls.ALPNExtension); ok {
-					alpn.AlpnProtocols = []string{"http/1.1"}
-				}
-			}
-			uConn := utls.UClient(rawConn, &utls.Config{ServerName: host}, utls.HelloCustom)
-			if err := uConn.ApplyPreset(&spec); err != nil {
-				_ = rawConn.Close()
-				return nil, err
-			}
-			if err := uConn.HandshakeContext(dctx); err != nil {
-				_ = rawConn.Close()
-				return nil, err
-			}
-			return uConn, nil
+			return dialUTLS(dctx, rawConn, host, ep.Fingerprint, []string{"http/1.1"})
 		},
 	}
 
 	headers := http.Header{
-		"User-Agent":      []string{"Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"},
+		"User-Agent":      []string{defaultUserAgent},
 		"Accept-Language": []string{"en-US,en;q=0.9"},
 	}
 
