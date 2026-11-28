@@ -125,8 +125,6 @@ func (g *Guard) DialTCP(ctx context.Context, host string, port uint16, timeout t
 		if err == nil {
 			if tc, ok := conn.(*net.TCPConn); ok {
 				_ = tc.SetNoDelay(true)
-				_ = tc.SetReadBuffer(2 << 20)
-				_ = tc.SetWriteBuffer(2 << 20)
 			}
 			return conn, nil
 		}

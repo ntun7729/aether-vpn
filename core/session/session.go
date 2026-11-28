@@ -18,12 +18,12 @@ import (
 )
 
 const (
-	StreamChunkSize       = 32 * 1024 // 32 KB chunks (2 exact TLS 1.3 records — ideal for multi-carrier striping)
+	StreamChunkSize       = 60 * 1024 // 60 KB bulk chunks (minimizes WS framing & TLS record overhead)
 	DefaultMaxPad         = 24
-	InitialStreamWindow   = 8 << 20   // 8 MB per-stream flow control window (high BDP across 3-4 carriers)
+	InitialStreamWindow   = 8 << 20   // 8 MB per-stream flow control window (saturates high-BDP links)
 	WindowUpdateThreshold = 256 << 10 // Send WINDOW_UPDATE every 256 KB drained
-	MaxStreamBuffer       = 12 << 20  // 12 MB hard cap per stream (ringBuffer + reorderBuf)
-	ReorderStallTimeout   = 3500 * time.Millisecond
+	MaxStreamBuffer       = 12 << 20  // 12 MB hard cap per stream ring buffer
+	ReorderStallTimeout   = 15 * time.Second
 )
 
 // CopyBufPool provides reusable 64 KB buffers for io.CopyBuffer across server, desktop, & mobile.
@@ -264,20 +264,17 @@ func (s *Session) removeCarrier(c carrier.Conn) {
 			break
 		}
 	}
-	var replacement carrier.Conn
-	if len(s.carriers) > 0 {
-		replacement = s.carriers[0]
-	}
 	s.carrierMu.Unlock()
 	_ = c.Close()
 
-	// Re-pin surviving streams to an active carrier if one remains; reset only if no carriers survive.
+	// Reset streams pinned to this dead carrier so they fail fast instead of hanging.
 	s.streamMu.RLock()
 	var dead []*Stream
 	for _, st := range s.streams {
-		if replacement != nil {
-			st.repinIfMatch(c.CarrierID(), replacement)
-		} else {
+		st.pinMu.RLock()
+		isPinned := st.pinned != nil && st.pinned.CarrierID() == c.CarrierID()
+		st.pinMu.RUnlock()
+		if isPinned {
 			dead = append(dead, st)
 		}
 	}
@@ -287,7 +284,7 @@ func (s *Session) removeCarrier(c carrier.Conn) {
 	}
 }
 
-// pickHealthyCarrier selects a healthy non-degraded carrier round-robin.
+// pickHealthyCarrier selects the least-loaded, healthy, non-degraded carrier (tie-broken round-robin).
 func (s *Session) pickHealthyCarrier() carrier.Conn {
 	s.carrierMu.RLock()
 	defer s.carrierMu.RUnlock()
@@ -296,11 +293,24 @@ func (s *Session) pickHealthyCarrier() carrier.Conn {
 		return nil
 	}
 	start := s.pickIdx.Add(1) % uint64(n)
+	var best carrier.Conn
+	bestScore := int(1 << 30)
 	for offset := 0; offset < n; offset++ {
 		c := s.carriers[(start+uint64(offset))%uint64(n)]
-		if !c.IsClosed() && !c.Degraded() {
-			return c
+		if c.IsClosed() {
+			continue
 		}
+		score := c.QueueLen()
+		if c.Degraded() {
+			score += 1000
+		}
+		if score < bestScore {
+			bestScore = score
+			best = c
+		}
+	}
+	if best != nil {
+		return best
 	}
 	return s.carriers[start]
 }
@@ -514,12 +524,12 @@ func (s *Session) OpenStream(ctx context.Context, host string, port uint16) (*St
 	}
 
 	id := s.nextStreamID.Add(1)
-	st := s.registerStream(id, c, true)
+	st := s.registerStream(id, c, false) // Strictly pinned to least-loaded carrier: zero cross-carrier HoL blocking!
 
 	err := s.sendOnCarrier(c, &proto.Frame{
 		Type:     proto.FrameStreamOpen,
 		StreamID: id,
-		Seq:      1, // Signals ordered multi-carrier striping capability to server
+		Seq:      0,
 		Payload:  proto.EncodeAddress(host, port),
 	}, s.MaxPad, false)
 	if err != nil {

@@ -295,6 +295,7 @@ func (m *ClientManager) attachExtraCarrierWithID(s *Session, ep carrier.Endpoint
 	}
 
 	s.AttachCarrier(c, m.onCarrierDetach(s, ep))
+	log.Printf("[aether] carrier #%d attached to %s (active=%d/%d)", c.CarrierID(), ep.Name, s.ActiveCarriers(), m.cfg.Carriers)
 	return c.CarrierID(), nil
 }
 

@@ -48,6 +48,7 @@ type Conn interface {
 	Close() error
 	IsClosed() bool
 	Degraded() bool
+	QueueLen() int
 }
 
 // Endpoint describes a server URL (Railway, Render, or Cloudflare Worker relay).
@@ -166,21 +167,20 @@ var nextCarrierID atomic.Uint64
 func (c *Carrier) CarrierID() uint64     { return c.ID }
 func (c *Carrier) GetEndpoint() Endpoint { return c.Endpoint }
 func (c *Carrier) Degraded() bool        { return c.degraded.Load() }
+func (c *Carrier) QueueLen() int         { return len(c.bulkCh) }
 
 // WrapConn creates a Carrier with high-throughput async priority write lanes.
 func WrapConn(conn *websocket.Conn, ep Endpoint) *Carrier {
 	conn.SetReadLimit(256 * 1024)
 	if tc, ok := conn.UnderlyingConn().(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
-		_ = tc.SetReadBuffer(2 << 20)
-		_ = tc.SetWriteBuffer(2 << 20)
 	}
 	c := &Carrier{
 		ID:       nextCarrierID.Add(1),
 		Endpoint: ep,
 		conn:     conn,
 		highCh:   make(chan []byte, 256),
-		bulkCh:   make(chan []byte, 128),
+		bulkCh:   make(chan []byte, 48),
 		pongCh:   make(chan struct{}, 1),
 		closeCh:  make(chan struct{}),
 	}
@@ -202,8 +202,8 @@ func (c *Carrier) writerLoop() {
 	var lastDeadline time.Time
 	writeBin := func(data []byte) bool {
 		t0 := time.Now()
-		if t0.Sub(lastDeadline) > 2*time.Second {
-			_ = c.conn.SetWriteDeadline(t0.Add(15 * time.Second))
+		if t0.Sub(lastDeadline) > time.Second {
+			_ = c.conn.SetWriteDeadline(t0.Add(30 * time.Second))
 			lastDeadline = t0
 		}
 		if err := c.conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
@@ -297,8 +297,6 @@ func DialWS(ctx context.Context, ep Endpoint, timeout time.Duration) (*Carrier, 
 			conn, err := netDialer.DialContext(dctx, network, target)
 			if tc, ok := conn.(*net.TCPConn); ok {
 				_ = tc.SetNoDelay(true)
-				_ = tc.SetReadBuffer(2 << 20)
-				_ = tc.SetWriteBuffer(2 << 20)
 			}
 			return conn, err
 		},
@@ -313,8 +311,6 @@ func DialWS(ctx context.Context, ep Endpoint, timeout time.Duration) (*Carrier, 
 			}
 			if tc, ok := rawConn.(*net.TCPConn); ok {
 				_ = tc.SetNoDelay(true)
-				_ = tc.SetReadBuffer(2 << 20)
-				_ = tc.SetWriteBuffer(2 << 20)
 			}
 			spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
 			if err != nil {

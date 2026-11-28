@@ -84,8 +84,6 @@ func (p *ProxyServer) HandleConn(conn net.Conn) {
 	defer conn.Close()
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
-		_ = tc.SetReadBuffer(2 << 20)
-		_ = tc.SetWriteBuffer(2 << 20)
 	}
 	br := bufio.NewReaderSize(conn, 64*1024)
 	first, err := br.Peek(1)
